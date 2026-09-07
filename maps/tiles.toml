@@ -1,0 +1,83 @@
+[meta]
+subdiv = 8
+metres_per_char = 1.0
+
+[tiles."."]
+name = "floor"
+blocks_move = false
+blocks_sight = false
+blocks_bullets = false
+sound_cost = 1.0
+footstep_mult = 1.0
+colour = [216, 214, 205]
+
+[tiles."#"]
+name = "wall"
+blocks_move = true
+blocks_sight = true
+blocks_bullets = true
+sound_cost = 40.0
+footstep_mult = 1.0
+pen_cost = 3.5
+colour = [92, 90, 84]
+
+[tiles."'"]
+name = "thin wall"
+blocks_move = true
+blocks_sight = true
+blocks_bullets = false
+sound_cost = 16.0
+footstep_mult = 1.0
+pen_cost = 0.9
+colour = [132, 128, 118]
+
+[tiles."o"]
+name = "pillar"
+blocks_move = true
+blocks_sight = true
+blocks_bullets = true
+sound_cost = 40.0
+footstep_mult = 1.0
+pen_cost = 3.5
+colour = [104, 100, 92]
+
+[tiles."n"]
+name = "low cover"
+blocks_move = true
+blocks_sight = false
+blocks_bullets = true
+sound_cost = 2.2
+footstep_mult = 1.0
+pen_cost = 1.2
+colour = [168, 158, 138]
+
+[tiles.","]
+name = "grating"
+blocks_move = false
+blocks_sight = false
+blocks_bullets = false
+sound_cost = 1.0
+footstep_mult = 1.8
+colour = [196, 188, 170]
+
+[tiles."="]
+name = "window"
+blocks_move = true
+blocks_sight = false
+blocks_bullets = true
+sound_cost = 6.0
+footstep_mult = 1.0
+pen_cost = 0.3
+glass = true
+colour = [176, 198, 206]
+
+[tiles."+"]
+name = "door"
+blocks_move = true
+blocks_sight = true
+blocks_bullets = true
+sound_cost = 10.0
+footstep_mult = 1.0
+pen_cost = 1.8
+door = true
+colour = [150, 118, 78]

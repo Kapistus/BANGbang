@@ -1,0 +1,41 @@
+grid = "arena.grid"
+name = "CQB test arena"
+
+player_spawn = [3.5, 15.5]
+
+[[guards]]
+id = "g1"
+patrol = [[16.5, 8.5], [26.5, 8.5], [26.5, 15.5], [16.5, 15.5]]
+identify_deg = 20.0
+recognise_deg = 100.0
+peripheral_deg = 170.0
+
+[[guards]]
+id = "g2"
+patrol = [[15.5, 1.5], [27.5, 1.5], [27.5, 4.5], [15.5, 4.5]]
+identify_deg = 20.0
+recognise_deg = 100.0
+peripheral_deg = 170.0
+
+[[idle_spots]]
+pos = [22.5, 9.5]
+facing_deg = 180.0
+tag = "watching"
+dwell = [4.0, 12.0]
+
+[[idle_spots]]
+pos = [26.5, 10.5]
+facing_deg = 270.0
+tag = "smoking"
+dwell = [8.0, 20.0]
+distraction = 0.5
+
+[[lights]]
+pos = [20.0, 4.0]
+radius = 7.0
+intensity = 1.0
+
+[[lights]]
+pos = [6.0, 8.0]
+radius = 5.0
+intensity = 0.6
