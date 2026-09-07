@@ -1,0 +1,30 @@
+# Requires Python 3.11+ (tomllib is stdlib from 3.11).
+#
+#   pip install -r requirements.txt
+#
+# Check which sound backend you got with:
+#   python -c "from sim import sound; print(sound.backend_report())"
+
+numpy>=1.26
+pygame>=2.5
+
+# JIT-compiles the sound solver to machine code. 25-30x faster than the pure
+# Python fallback: a pistol field drops from ~115 ms to ~4 ms. Output matches
+# the pure solver to within 1e-5.
+#
+# Wheels exist for every platform including cp314, so no compiler is needed.
+# First run compiles (~2 s) and caches to disk; later runs load in ~0.3 s.
+#
+# Optional. sim/sound.py detects it at import and falls back cleanly.
+numba>=0.60
+
+
+# ---------------------------------------------------------------------------
+# Also optional, and now largely superseded by numba: scikit-fmm, a C
+# fast-marching solver. It ships WINDOWS WHEELS ONLY and only up to cp313, so
+# on Python 3.14 or on Linux/macOS pip falls back to a source build needing a
+# C++ toolchain. It is also slower than numba here, because it has no early
+# termination and must run twice (attenuation and travel).
+#
+# scikit-fmm>=2024.5
+# ---------------------------------------------------------------------------
