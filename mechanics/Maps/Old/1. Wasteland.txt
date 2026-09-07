@@ -1,0 +1,22 @@
+Background:
+	Wastelands surround more or less civilized areas of the new world.
+	It is often dangerous to venture into the wastes alone, or even in groups,
+	as they are full of mutants, beasts, radiation hotspots and other hazards.
+	Nevertheless, those willing to risk their lives may find secrets and valuable
+	equipment among the ruined remnants of the old world.
+
+Encounters:
+	***Mutants
+	**Beasts
+	**Bandits
+
+Points of interest:
+	Entrance to the sewers
+	Bandit camp
+	Rad pools
+NPC:
+	none	
+
+Transitions:
+	Wasteland-Sewers
+	Wasteland-Darktown

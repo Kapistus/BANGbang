@@ -1,0 +1,13 @@
+Starting stat values:
+Strenght:	10.0
+Conditioning:	17.5
+Agility:	15.0
+Logic:		17.5
+Perception:	20.0
+
++1 stat point upon level up.
+
+Health:		150 + ( character_level * 1.15 * Conditioning ). 
+Shields:	0 + ( gear bonuses ) + ( skill bonuses ) + ( character_level * 1.15 * Logic ).
+Speed:		1.25 * ( character level * ( ( 0.1 * Agility ) + (0.1 * Conditioning ).
+Damage:		( Weapon damage ).

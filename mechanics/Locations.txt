@@ -1,0 +1,22 @@
+Locations:
+
+	
+Player ships:
+	- Civilian transport vessel
+	- Mercenary frigate
+Earth:
+	- Space port
+	- Criminal organization cruiser
+	- Criminal loading site
+	- Scavenger camp
+
+Moon:
+	- Moon base
+
+Jupiter
+	- Ganymede
+Mars research station
+Pluto research station
+Asteroid belt
+	- Ceres mining outpost
+Derelict cruiser

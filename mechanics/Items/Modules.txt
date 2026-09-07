@@ -1,0 +1,62 @@
+Listed weapons represent base values.
+Items found in-game may include variables.
+
+* Cannot be removed once attached.
+
+<<< = done
+<<  = WIP
+
+-------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------
+--------
+WEAPONS:
+--------
+
+Ballistic weapons:
+------------------
+Red-dot sight: + 0.05 to accuracy,
+	Weight: 0.5 kg
+Scope: + 5 units to range, + 0.075 to accuracy.
+	Weight: 0.5 kg
+Flashlight: Activates a cone of light, range 8 units ( Toggle )
+	Weight: 0.5 kg
+Lasersight ( Green ) : + 0.03 to accuracy. Shows as a line of light ( Toggle ) 
+	Weight: 0.5 kg
+Lasersight ( Red ) : + 0.03 to accuracy. Shows a line of light( Toggle ) 
+	Weight: 0.5 kg
+
+Energy weapons:
+---------------
+*Rewired coils: + 7.5 % to weapon damage. 
+	Weight: 0.75 kg
+*Fast-wiring: halves reload time.
+	Weight: 0.1 kg
+*Wide-bored projection breach: Halves effective range, -25% to accuracy,  + 50% to weapon damage.
+	Weight: 0.5 kg
+
+Heavy weapons:
+--------------
+*Stabilizer: accuracy = ( accuracy * 1.1 ).
+	Weight: 0.5 kg
+*Heatsinks: rate of fire = ( rate_of_fire * 1.1 )
+	Weight: 1.0 kg
+*Ergonomic handle & trigger system and stock: - 2% to movement speed penalty, + 0.02% to accuracy.
+	Weight: 1.5 kg
+
+------
+ARMOR:
+------
+
+Ballistic plating: + 1 to armor value, + 1% to movement speed penalty.
+	Weight: 1.5 kg
+*Over-charged capacitors: if the armor has shields, + 50 to shields. Otherwise does nothing.
+	Weight: 1.2 kg
+*Ammunition belt: Halves reload time, increases ammo by 10%.
+	Weight 1 kg
+
+------
+OTHER:
+------
+
+Weapon rails: If a weapon has no module slots, adds up to 1 module slot to target weapon.
+Equipment straps: If an armor has no module slots, adds a module slot to target armor.

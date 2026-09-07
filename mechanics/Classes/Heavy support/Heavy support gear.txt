@@ -1,0 +1,31 @@
+Starting equipment:
+- Pistol
+- Metal armor
+- Riot visor
+
+Available weapons:
+
+- Pistol
+- Assault rifle
+- Sub-machinegun
+- Combat shotgun
+
+After specialization:
+- Minigun
+- Heavy rifle
+- Flak cannon
+- Rocket launcher
+
+Available gear:
+- Clothes
+- Leather armor
+- Riot armor
+- Plate carrier MkI
+- Metal armor
+- Plate armor
+- Battle armor
+
+After specialization:
+- Powered armor
+- Exoskeleton
+

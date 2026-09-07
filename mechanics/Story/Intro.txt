@@ -1,0 +1,39 @@
+INTRO
+-----
+
+Players assume control of a band of mercenaries who were recruited by a well-known criminal organization for
+a number of missions it takes to track down their old member and retrieve some items that were stolen from them.
+
+The group's first mission is to meet with the organization's people on a ship orbiting Earth
+and get the intel for the mission. They find out the person they are looking for has stolen one of the organization's
+transport ships, but the transponder on the ship has been disabled, so the piece of information is the ship's last known
+location, a off-city loading site on Earth.
+
+After this the party is transported to the loading site on Earth by the organization's pilot and sets off to find the transporter.
+The party is ambushed by a group of scanvengers on the way and after dealing with them they can go wipe out the scavenger camp nearby.
+
+After the ambush the group advances to the loading site and notices the organization's mercs have been killed and it is now held by another group
+of armed soldiers. After dealing with the initial defenders the base goes on lockdown. The group has to find the command center and lift the lockdown to gain
+access to the hangar bay. There they find out the transport ship has been modified with a new transponder ID and the target is nowhere to be seen. They check the ship's
+nav computer and find out the ship made a stop on the Moon base before landing on Earth.
+
+After departing for Moon the group spot members of the other mercenary group outside a bar and decide to enter after dealing with them.
+The group enters the bar and sees the target leaning against a counter, having a drink. The target spots them and a shootout takes place.
+During the shootout some civilians may get shot and once the target is down, he drops a suitcase with a codelock.
+After picking it up, the group returns to the transport and gets returned to the organization's ship.
+
+OBJECTIVES:
+
+1: Meet up with your employer.
+2: Board the transport ship to Earth.
+3: <upon traveling along the road for a while> *Deal with the ambushers*
+OPTIONAL: Find the scavenger camp and take out the rest of the scavengers.
+4: Enter the loading site.
+5: Deal with the mercenaries
+6: <After the final mercenary is dead 4/4>
+7: Disable the lockdown.
+8: <after the lockdown is disabled>
+9: Find the transport and retrieve the stolen items.
+10: <upon finding out about the transponder ID>
+11: Return to the transporter and board the ship.
+12: 

@@ -1,0 +1,16 @@
+Level 1:
+	MEDIGEL APPLICATION: Target is healed for ( target_missing_health / ( intelligence * level ) )
+			     Up to full health. Target gains "Healing"* for 1 minute.
+			     Cooldowns: 10 seconds.
+Level 5:	
+	
+Level 10:
+	
+Level 15:
+	
+Level 20:
+
+
+
+----------------------------------------------------------------------------------
+*Treated: Medical abilities cannot be used on this target until Healing wears off.

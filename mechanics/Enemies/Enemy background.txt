@@ -1,0 +1,31 @@
+Consortium:
+	People who want to unite flesh and circuit. Obsessive over technology and biological material.
+	- High shields, low health, medium armor.
+	- Employ energy-based weapons.
+Imperium:
+	
+	- Well-trained soldiers with good training and equipment.
+	- Balanced shields, health and armor.
+Mutants:
+	Degenerates, freaks of nature, irradiated people.
+	- Medium health, regenerate health. No shields, low to medium armor.
+Pirates:
+	Outlaws. Attack lone vessels and leave no survivors while taking anything worth a credit with them.
+	- Medium health, low to medium shields, low to high armor.
+	
+Scavengers:
+	"Scavs" pick up anything worth hauling with them, some are violent, while others are merely trying to survive.
+	- Medium health, low shields, low to medium armor.
+
+
+IMPLEMENTATION NOTES
+--------------------
+Prototype enemy stats (sim/combat.py ENEMY_PROFILES): human factions
+(Imperium, Pirates, Scavengers) run on trimmed health and shield pools so
+fights are decisive - see each unit file and Mechanics/Damage model.txt.
+The Consortium keeps its large shield pools (drone 200, controller 360) on
+purpose: that archetype exists to push the player onto energy weapons, which
+carry a 1.9x shield multiplier.
+
+Enemy behaviour (sim/ai.py) is a four-mode state machine - see
+Enemies/Behaviour.txt.

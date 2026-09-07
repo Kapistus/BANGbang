@@ -1,0 +1,21 @@
+Easy:
+Enemies have 75% health.
+Enemies deal 75% damage.
+Loot value is 100%.
+
+Normal:
+Enemies have 100% health.
+Enemies deal 100% damage.
+Loot value is 100%.
+
+Hard:
+Enemies have 125% health.
+Enemies deal 125% damage.
+Loot value is 125%.
+
+Black Ops:
+Regular enemies have 150% health.
+Regular enemies deal 150% damage.
+Bosses have 175% health.
+Bosses deal 175% damage.
+Loot value is 150%.

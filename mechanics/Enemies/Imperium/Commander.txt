@@ -1,0 +1,10 @@
+Base health:	     220
+Base shields:	     350
+Base armor:			   18-35
+Base speed: 0.85 units / second.
+
+LEVEL UP:
+Health = base health + ( 1.25 * Conditioning )
+Shields = base shields + ( 1.5 * Logic )
+Armor = base armor
+Speed = base speed + ( 0.1 * Speed )

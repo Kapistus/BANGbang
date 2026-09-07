@@ -1,0 +1,18 @@
+Background:
+	Abandoned shelter from the old times. (no lights)
+
+Encounters:
+	***Mutants
+
+Points of interest:
+	Armory
+	Infirmary
+	Storage
+	Radiation pool	
+	Cave-in
+
+NPC:
+	none	
+
+Transitions:
+	Old city

@@ -1,0 +1,30 @@
+Starting equipment:
+- Pistol
+- Leather armor
+- Gas mask
+
+Available weapons:
+
+- Pistol
+- Assault rifle
+- Sub-machinegun
+- Combat shotgun
+- Flak cannon
+- Rocket Launcher
+
+After specialization:
+
+
+
+Available gear:
+- Clothes
+- Leather armor
+- Metal armor
+- Plate armor
+- Battle armor
+- Powered armor
+- Exoskeleton
+
+After specialization:
+
+

@@ -1,0 +1,58 @@
+ENEMY BEHAVIOUR  (as implemented - sim/ai.py)
+=============================================
+
+Every guard runs a four-mode state machine: IDLE, PATROL, SEARCH, COMBAT.
+The guard does not snap between modes. A single "alert" value in 0..1 drives
+which mode is active and also scales movement speed, turn rate and how far
+the head sweeps, so transitions read as gradual.
+
+
+ALERT
+-----
+alert rises on stimulus and decays otherwise:
+  - identified the player in the narrow cone   fast rise
+  - player in peripheral vision                medium rise
+  - heard a player sound                       slow rise, scaled by loudness
+  - nothing seen or heard                      decay
+
+Mode is chosen from alert with a hysteresis dead band, so a guard winding
+down from a chase eases PATROL <- ... <- SEARCH rather than cutting straight
+back to patrol.
+
+
+MODES
+-----
+IDLE     Standing still, sweeping its head. PATROL drops into this for a few
+         seconds at random points along the route, then carries on - guards
+         are not always walking.
+
+PATROL   Walks its waypoint loop. Pauses briefly at each waypoint.
+
+SEARCH   Moves to its best guess of where the stimulus was and pokes around
+         nearby, scanning, for a while. The guard is NEVER told the true
+         source of a sound - it hears a bearing and a loudness and walks a
+         guess along that bearing (louder = closer), so it can be baited.
+         Losing sight of the player drops the guard here, not straight to
+         patrol, and it keeps hunting for about 25 seconds before giving up.
+         Any fresh contact resets that timer.
+
+COMBAT  Holds a firing distance from the player (advances if too far, backs
+         off if too close), fires its weapon when it has line of sight.
+         Reloads between fights. Loses sight -> SEARCH at the last known
+         position with alert still high.
+
+
+PERCEPTION
+----------
+Sight is a single line-of-sight ray plus a cone angle/range test (identify
+cone is narrow and long; peripheral is wide and short). Hearing samples the
+same sound-propagation field the player's own hearing uses, so a guard only
+reacts to a noise once the wavefront actually reaches it, and only if enough
+energy survives the trip.
+
+
+TUNING NUMBERS (sim/ai.py, subject to change)
+  view range 17 m; identify cone 40 deg half-angle to 15 m; peripheral cone
+  95 deg half-angle to 7 m
+  base speed from the enemy profile (~0.85 m/s), up to ~1.9x at full alert
+  search hold ~26 s after last contact

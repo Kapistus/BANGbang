@@ -1,0 +1,27 @@
+Listed supplies represent base values.
+Items found in-game may include variables.
+
+
+-----------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------
+-----------------
+Medical supplies:
+-----------------
+Properties:
+
+Bandages: 
+	Restores ( target_missing_health / ( intelligence * ( level / 2 ) ) health to target. Cannot be used in combat.
+	Gives target "Treated"* for 2 minutes.
+	Weight: 1 kg
+Traumapack: 
+	Restores ( target_missing_health / ( intelligence * level ) health to target. Cannot be used in combat.
+	Gives target "Treated"* for 2 minutes.
+	Weight: 1 kg
+Adrenaline pack: 
+	User gains + 10% movement speed and + 5% armor value for 30 seconds.
+	After the effect ends, user gains -10% movement speed for 20 seconds. 
+	Weight: 1 kg
+Hypo:
+	User gains +10% armor, +10% movement speed for 2 minutes, but takes 1% health damage every second for 10 seconds.
+-------------------------------------------------------------------------------------------
+*Treated: Medical equipment cannot be used on this target until Treated wears off.

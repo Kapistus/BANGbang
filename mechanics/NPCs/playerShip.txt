@@ -1,0 +1,17 @@
+CIVILIAN TRANSPORT VESSEL:
+
+Trader:
+	Trades items (medical supplies, consumables)
+
+MERCENARY FRIGATE:
+
+Quartermaster:
+	Offers storage services ( banking )
+	Trades items ( armor, weapons, ammo )
+		
+Medical officer:
+	Trades medical supplies
+	
+Engineer:
+	Offers upgrades and skills
+

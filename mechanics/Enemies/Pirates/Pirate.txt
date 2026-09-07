@@ -1,0 +1,14 @@
+Base health:	     100
+Base shields:	     60
+Base armor:			   11-23
+Base speed: 0.72 units / second.
+
+PROTOTYPE VALUES (sim/combat.py "pirate"):
+health 75, shields 40, armor 11-23, weapon SMG.
+See Mechanics/Damage model.txt.
+
+LEVEL UP:
+Health = base health + ( 1.05 * Conditioning )
+Shields = base shields + ( 1.4 * Logic )
+Armor = base armor
+Speed = base speed + ( 0.07 * Speed )

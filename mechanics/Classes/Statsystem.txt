@@ -1,0 +1,33 @@
+CHARACTER CREATION:
+
+Stat points to distribute: 5
+
+Strenght:	Unlocks better armor and weapon options. Allows brute forcing doors and lockers.
+		- 1 point increases carry weight by 6 kg.
+		
+Conditioning:	Increases health, slightly increases armor values.
+		- 1 point increases health by 10 points and individual item armor values by 1%.
+
+Logic:		Increases shield values and shield recharge rate.
+		- 1 point increases shield values by 10 points and recharge values by 1 point / second.
+		IMPLEMENTATION NOTE: shield recharge in the prototype is deliberately
+		slow and does not yet scale with Logic - a fixed 3.5/s for the player,
+		2/s for enemies, and only after a long lull with no damage taken
+		(player 6 s, enemies 7 s). Shields are a one-fight buffer, not
+		something you recover under fire. See Mechanics/Damage model.txt.
+
+Agility:	Increases movement speed, increases action point recovery.
+		- 1 point increases movement speed by 1% and action point recovery by 5%.
+
+Perception:	Gives more accurate information on enemies.
+		- 1 point increases accuracy further by 1% with all weapons.
+
+
+
+LEVEL UP:
+Health = base health + ( 1.15 * ( Conditioning + strenght) / 2  )
+Shields = base shields + ( 1.5 * Logic )
+
+PERKS:
+- 1 perk pick during character creation
+- 1 perk pick every 3 levels gained, starting at level 4.

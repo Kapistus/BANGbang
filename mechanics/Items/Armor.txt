@@ -1,0 +1,208 @@
+Listed protective gear represent base values.
+Items found in-game may include variables.
+
+armor value: The amount of protection the item provides, 1 point of armor = 1% of damage reduction
+	     against hits taken.
+
+vision penalty: Reduces line of sight to the sides and back.
+	       poor peripheral vision: no line of sight to the back or sides after 45-degrees each direction.
+	       none: no line of sight to the back.
+	       enhanced peripheral vision: ocular video feedback showing surrounding environment.
+movement speed penalty: Reduces movement speed.
+requirements: Required to wear.
+Module slots: Some items have room for upgrades and modules. Each item has 0-3 module slots.
+
+---------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------
+----------------
+PROTECTIVE GEAR:
+----------------
+
+HELMETS:
+--------
+Properties: Offer protection against attacks. May include vision-enhancing objectives
+	    and night-vision devices.
+
+Gas mask:
+	armor value: 0
+	vision penalty: poor peripheral vision. 
+	Module slots: 0
+	Weight: 1 kg
+	PASSIVE: Immune to breathable hazards.
+	Requires:
+	
+Riot visor:
+	armor value: 2
+	vision penalty: none
+	Module slots: 0
+	Weight: 2 kg
+	Requires:
+
+Ballistic helmet:
+	armor value: 3
+	vision penalty: none
+	Module slots: 1
+	Weight: 3.6 kg
+	Requires:
+
+Military helmet class I:
+	armor value: 4
+	vision penalty: none
+	Module slots: 1
+	Weight: 2.5 kg
+	Requires:
+
+Military helmet class II:
+	armor value: 5
+	vision penalty: mediocre peripheral vision.
+	Module slots: 1
+	Weight: 3.1 kg
+	Requires:
+Tech helmet:
+	armor value: 2
+	vision penalty: mediocre peripheral vision.
+	BONUS: + 25 shields.
+	Module slots: 3
+	Weight: 3.3 kg
+	Requires:
+
+Night-vision goggles:
+	armor value: 0
+	vision penalty: poor peripheral vision when toggled on. ( Toggle )
+	BONUS: normal nighttime vision when toggled on. ( Toggle )
+	Module slots: 0
+	Weight: 2.3 kg
+	Requires:
+
+Medic helm:
+	armor value: 2
+	vision penalty: none.
+	BONUS: Integrated flashlight. Halves nighttime accuracy penalty. ( Toggle )
+	Module slots: 1
+	Weight: 2.9 kg
+	Requires:
+
+BODY ARMOR:
+-----------
+Properties: Offer varying protection against attacks. May include life-support systems and
+	    emergency injection systems. House possible shielding systems.
+
+Clothes:
+	armor value:  1
+	movement speed penalty: 0%.
+	requirements: none.
+	Module slots: 0
+	Weight: 1 kg
+	Requires:
+
+Leather armor:
+	armor value: 3
+	movement speed penalty: 5%.
+	requirements: none.
+	Module slots: 0
+	Weight: 5.2 kg
+	Requires:
+
+Riot armor:
+	armor value: 6
+	movement speed penalty: 7%.
+	requirements: conditioning 10
+	Module slots: 0
+	Weight: 7.2 kg
+	Requires:
+
+Plate carrier MkI:
+	armor value: 12
+	movement speed penalty: 5%.
+	requirements: none.
+	Module slots: 1
+	Weight: 9 kg
+	Requires:
+
+Metal armor:
+	armor value: 16
+	movement speed penalty: 15%.
+	requirements: conditioning 15
+	Module slots: 1
+	Weight: 16 kg
+	Requires:
+
+Plate armor:
+	armor value: 20
+	movement speed penalty: 15%.
+	requirements: conditioning 15
+	Module slots: 1
+	Weight: 16 kg
+	Requires:
+
+Battle armor:
+	armor value: 25
+	requirements: conditioning 13
+	Shields: + 25 shields
+	Module slots: 2
+	Weight: 14 kg
+	Requires:
+
+Tesla armor:
+	armor value: 20
+	movement speed penalty: 10%.
+	requirements: Energy specialization ( Tech )
+	Shields: + 100 shields.
+	BONUS: Toggle 1: + 20% to shield recharge rate. disables RoF bonus ( Toggle ) 
+	BONUS: Toggle 2: + 20% to energy weapon rate of fire. Disables shield recharge bonus ( Toggle )
+	Module slots: 2
+	Weight: 38 kg
+	Requires:
+
+Powered armor:
+	armor value: 28
+	movement speed penalty: 15%.
+	requirements: conditioning 16, power armor training ( Heavy support )
+	Shields: + 50 shields.
+	Module slots: 2
+	Weight: 52 kg
+	Requires:
+
+Blacksuit:
+	armor value: 8
+	movement speed penalty: 0%
+	requirements: Agility 15
+	Shields: + 150 shields.
+	Module slots: 3
+	Weight: 10 kg
+	PASSIVE: Can pass over obstacles without being slowed
+	PASSIVE: + 3 agility, + 1 strenght, + 10% movement speed
+	Requires:
+
+Exoskeleton:
+	armor value: 35
+	movement speed penalty: 15%.
+	requirements: power armor training ( Heavy support )
+	PASSIVE: May fire heavy weapons on the move.
+	PASSIVE: No added weight from Exoskeleton when equipped.
+	Module slots: 1
+	Weight: 90 kg
+	Weight equipped: 0
+	Requires:
+	
+OTHER:
+-----------
+Properties: Offer varying protection against attacks. May include life-support systems and
+	    emergency injection systems. House possible shielding systems.
+		
+Assault shield:
+	armor value: 25
+	movement speed penalty: 25%
+	damageReduction;
+	base durability: 100
+	currentDurability;
+	requirements: Can only be used with a one-hand weapon.
+	PASSIVE: Blocks most ballistic weapon shots.
+	PASSIVE: Reduced damage taken from all other weapon types.
+	PASSIVE: Durability will deteriorate as damage is absorbed.
+		Reduction = (reduction - (currentDurability / 100)) 
+	module slots: 0
+	Weight: 15 kg
+	Requires: 
+		Perk: Breacher training
+

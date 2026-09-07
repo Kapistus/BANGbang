@@ -1,0 +1,20 @@
+Background:
+	Darktown, one of the few "civilized" areas left in this part of the wastes.
+	Inhabited by a group of people who fled a radiated bunker to the north.
+	They are wary of strangers, so do not expect a warm welcome.
+
+
+Encounters:
+	***Dwellers
+	*Merchant
+	
+
+Points of interest:
+	Merchant
+
+NPC:
+	Merchant
+	
+Transitions:
+	Darktown-Sewers
+	Darktown-Wasteland

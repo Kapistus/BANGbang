@@ -1,0 +1,15 @@
+Base health:	     70
+Base shields:	     0
+Base armor:			   0-11
+Base speed: 0.99 units / second.
+
+PROTOTYPE VALUES (sim/combat.py "scavenger"):
+health 35, shields 0, armor 0-11, weapon pistol. No shields and almost no
+armor - a scavenger drops to a single burst or a few pistol rounds.
+See Mechanics/Damage model.txt.
+
+LEVEL UP:
+Health = base health + ( 0.95 * Conditioning )
+Shields = base shields + ( 1.1 * Logic )
+Armor = base armor
+Speed = base speed + ( 0.09 * Speed )

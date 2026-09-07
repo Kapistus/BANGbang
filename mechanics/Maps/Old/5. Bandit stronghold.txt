@@ -1,0 +1,16 @@
+Background:
+	
+Encounters:
+	*Beasts
+	***Bandits
+
+Points of interest:
+	Entrance to the sewers
+	Bandit camp
+	Rad pools
+NPC:
+	none	
+
+Transitions:
+	Old City
+	Wasteland

@@ -1,0 +1,14 @@
+Base health:	     140
+Base shields:	     20
+Base armor:			   18-35
+Base speed: 0.85 units / second.
+
+PROTOTYPE VALUES (sim/combat.py "imperium_squad_leader"):
+health 95, shields 14, armor 18-35, weapon combat rifle.
+See Mechanics/Damage model.txt.
+
+LEVEL UP:
+Health = base health + ( 1.2 * Conditioning )
+Shields = base shields + ( 1.5 * Logic )
+Armor = base armor
+Speed = base speed + ( 0.1 * Speed )

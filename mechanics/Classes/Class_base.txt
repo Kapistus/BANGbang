@@ -1,0 +1,17 @@
+Base health:	      100
+Base shields:	      100
+Base armor:		1
+Base movement:		1 tile / second
+
+
+IMPLEMENTATION NOTE (sim/combat.py):
+The prototype runs a leaner Commando than the design baseline - health is a
+small core and armor + shields are the survival stats. As built, a level 1
+Commando with the debug starter kit (no loot system yet) is roughly:
+  ~78 health, ~57 shields, 20% armor, ~4.2 tiles/s.
+Shields regenerate 3.5/s but only after a 6 s lull (~20 s to refill). A
+stripped Commando (Leather 3% / ~17 shields) dies in about a second of fire.
+See mechanics/Mechanics/Damage model.txt.
+
+
+

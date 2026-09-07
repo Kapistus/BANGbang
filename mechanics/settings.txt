@@ -1,0 +1,28 @@
+Sound:
+------
+
+
+
+Music volume:
+0 ------------- 100
+Effects volume:
+0 ------------- 100
+
+
+Keybindings:
+------
+
+UP: 		W
+DOWN: 		S
+LEFT:		A
+RIGHT:		D
+FIRE1:		Mouse1
+AIM:		Mouse2
+Menu:		Esc
+Inventory: 	I
+Character:	C
+Reload:		R
+Switch weapon:	1-5 (knife, pistol, smg, shotgun, rifle)
+Save prompt:	F5
+Load prompt:	F8
+Show objectives: Tab

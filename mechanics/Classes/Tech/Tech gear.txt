@@ -1,0 +1,31 @@
+Starting equipment:
+- Pistol
+- Leather armor
+
+
+Available weapons:
+- Pistol
+- Assault rifle
+- Sub-machinegun
+- Combat shotgun
+
+After specialization:
+- Rail pistol
+- Rail rifle
+- Laser pistol
+- Laser rifle
+- Plasma pistol
+- Plasma pistol
+
+Available gear:
+- Clothes
+- Leather armor
+- Riot armor
+- Plate carrier MkI
+- Plate carrier Mk2
+- Metal armor
+- Plate armor
+- Battle armor
+
+After specialization:
+- Tesla armor

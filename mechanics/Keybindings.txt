@@ -1,0 +1,35 @@
+MOVEMENT:
+
+UP: 		W
+DOWN: 		S
+LEFT:		A
+RIGHT:		D
+FIRE1:		Mouse1
+AIM:		Mouse2
+Menu:		Esc
+Inventory: 	I
+Character:	C
+Reload:		R
+Switch weapon:	1-3 ( 1 = pistol, 2 = second weapon 3 = third weapon )
+Save prompt:	F5
+Load prompt:	F8
+Show objectives:Tab
+
+
+PROTOTYPE DEBUG CONTROLS (main.py - not the shipping scheme)
+-----------------------------------------------------------
+Move        WASD / arrows      Shift run, Ctrl crawl
+Aim         mouse
+Fire        Mouse1 (hold in full-auto mode)
+Fire mode   B      cycle primary / full-auto for the current weapon
+Weapon      mouse wheel, or 1-7 (debug loadout: pistol, combat rifle, SMG,
+                   shotgun, rail rifle, laser rifle, rocket launcher)
+Reload      R
+Interact    F      (doors)
+Knock       Space
+Mute audio  M
+Clear sounds C
+Overlays    F1-F8      F9 profiler   F10 own-sound view   F11 enemy-sound view
+Guard cones V
+Pause       P
+Quit        Esc

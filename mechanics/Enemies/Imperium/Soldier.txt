@@ -1,0 +1,16 @@
+Base health:	     100
+Base shields:	     20
+Base armor:			   18-35
+Base speed: 0.85 units / second.
+
+PROTOTYPE VALUES (sim/combat.py ENEMY_PROFILES "imperium_soldier"):
+health 70, shields 14, armor 18-35, speed 0.85, weapon combat rifle.
+Human-faction pools are trimmed from the baseline so a soldier is a
+couple of rifle bursts. Shield regen 2/s after a 7 s lull.
+See Mechanics/Damage model.txt.
+
+LEVEL UP:
+Health = base health + ( 1.15 * Conditioning )
+Shields = base shields + ( 1.5 * Logic )
+Armor = base armor
+Speed = base speed + ( 0.1 * Speed )

@@ -1,0 +1,26 @@
+General perks:
+--------------
+	+ 1 to all stat points. 
+	Buying and selling prices are 10% better.
+	Firearms deal 10% more damage.
+
+
+
+Level-restricted perks:
+-----------------------
+
+
+Stat-restricted perks:
+----------------------
+
+Class-restricted perks:
+-----------------------
+
+
+Commando:
+
+Support:
+
+Medic:
+
+Tech:
