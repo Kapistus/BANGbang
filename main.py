@@ -64,12 +64,35 @@ from pathlib import Path
 import numpy as np
 import pygame
 
-from sim import ai, audio, ballistics, combat, sound, weapons
+from sim import ai, audio, ballistics, combat, mapfile, sound, sprites, weapons
 from sim.tilemap import TileMap, load_map, validate_patrols, validate_spawns
+
+
+def load_any_map(path):
+    """Dispatch on extension: .map is the JSON editor format, anything else is
+    the legacy char-grid sidecar. Falls back to a .map sibling and gives a
+    readable error if nothing matches."""
+    p = Path(path)
+    if p.suffix == ".map":
+        return mapfile.load_map(p)
+    if p.exists():
+        return load_map(p)
+    alt = p.with_suffix(".map")
+    if alt.exists():
+        return mapfile.load_map(alt)
+    here = sorted(q.name for q in p.parent.glob("*.map")) \
+        + sorted(q.name for q in p.parent.glob("*.toml"))
+    raise SystemExit(f"map not found: {path}\n"
+                     f"available in {p.parent}/: {', '.join(here) or '(none)'}")
 from sim.vision import ConeSpec, VisibilityCache
 
-PX_PER_M = 32          # recomputed at load to fit MAX_VIEW
-MAX_VIEW = (1500, 900)
+PX_PER_M = 48          # pixels per world metre (fixed; the camera scrolls)
+VIEW_PPM = 48          # 1920x1080 sweet spot: readable characters (~49 px), the
+                       # whole vision cone visible when aiming sideways; aiming
+                       # straight up/down clips the outer identify/recognise cone
+MAX_VIEW = (1860, 776)    # largest on-screen viewport: near-full width on a
+                          # 1920x1080 display; 776 + 224 HUD = 1000 clears the
+                          # taskbar. The world is usually bigger -> camera pans.
 HUD_H = 224
 
 # A sound field depends only on origin and geometry, so consecutive
@@ -118,8 +141,9 @@ TRACER_FADE = 0.18
 BLAST_FADE = 0.32
 INTERACT_RANGE = 1.6
 
-VIS_SPEED = 70.0      # cells/sec for the ripple; real sound is ~1372, so
-                      # this is roughly 20x slow motion so you can watch it
+VIS_SPEED = 140.0    # fine-cells/sec: sound-propagation speed (gates the ripple
+                      # AND when actors hear a sound). ~17.5 m/s at cpm 8, about
+                      # 2x the old pace, still slow enough to watch.
 BODY_R = 0.28
 
 # Vision. Angles are full widths in degrees; ranges here are METRES and get
@@ -129,7 +153,7 @@ CONE_DEG = (44.0, 100.0, 180.0)      # identify, recognise, peripheral
 # identify, recognise, peripheral, near. There is no vision behind the player
 # at all - the peripheral band is a hard forward hemisphere and there is no
 # all-round near radius.
-CONE_RANGE_M = (29.3, 14.0, 8.0, 0.0)
+CONE_RANGE_M = (18.0, 14.0, 8.0, 0.0)   # identify shortened so it fits the viewport
 
 
 # Black overlay alpha per visibility state. 0 = fully lit, 255 = hidden.
@@ -139,7 +163,8 @@ FOG_BLUR_R = 3        # box-blur radius (fine cells) that feathers every fog edg
 
 GHOST = (150, 96, 72)
 BLIP = (200, 140, 90)
-RIPPLE_ENEMY = (29, 158, 117)
+RIPPLE_ENEMY = (231, 88, 60)   # enemy sound wavefront - same ripple style as the
+                               # player's, warm red instead of the player's amber
 
 # An arriving sound is drawn as an arc at the player's own position, in the
 # direction the wavefront came from. Width encodes confidence: a strong
@@ -204,7 +229,8 @@ def build_base_surface(m: TileMap) -> pygame.Surface:
         if mask.any():
             arr[mask] = t.colour
     small = pygame.surfarray.make_surface(np.transpose(arr, (1, 0, 2)))
-    return pygame.transform.scale(small, (cols * PX_PER_M, rows * PX_PER_M))
+    return pygame.transform.scale(
+        small, (round(m.width_m * PX_PER_M), round(m.height_m * PX_PER_M)))
 
 
 def field_surface(fine: np.ndarray, rgb, alpha: np.ndarray) -> pygame.Surface:
@@ -380,9 +406,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
     pygame.init()
     audio_on = audio.init()
     print("audio:", "on (procedural placeholders)" if audio_on else "off (no device)")
-    m = load_map(Path(map_path))
+    m = load_any_map(map_path)
     rows, cols = m.chars.shape
-    PX_PER_M = max(8, min(32, MAX_VIEW[0] // cols, MAX_VIEW[1] // rows))
+    # Fixed zoom (pixels per world metre); the viewport is a camera window
+    # onto a world that can be far larger than the screen.
+    PX_PER_M = VIEW_PPM
     cost = m.sound_cost.astype(np.float64)
 
     print(sound.backend_report())
@@ -396,12 +424,22 @@ def main(map_path: str = "maps/arena.toml") -> None:
     if not issues:
         print("map checks passed")
 
-    view_w = m.chars.shape[1] * PX_PER_M
-    view_h = m.chars.shape[0] * PX_PER_M
-    screen = pygame.display.set_mode((view_w, view_h + HUD_H))
+    world_w = round(m.width_m * PX_PER_M)
+    world_h = round(m.height_m * PX_PER_M)
+    view_w = min(world_w, MAX_VIEW[0])
+    view_h = min(world_h, MAX_VIEW[1])
+    window = pygame.display.set_mode((view_w, view_h + HUD_H))
+    world = pygame.Surface((world_w, world_h))   # the full map is drawn here,
+    screen = window                              # then a camera rect is blitted
+    cam_x = cam_y = 0
     pygame.display.set_caption(f"stealth debug \u2014 {m.name}")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("consolas,monospace", 13)
+
+    bank = sprites.SpriteBank()
+    bank.load()
+    bank.set_scale(PX_PER_M / sprites.ART_PPM)
+    print("sprites:", "on" if bank.ok else "off (circle fallback)")
 
     base = build_base_surface(m)
     overlays = {
@@ -471,12 +509,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
 
     _ov_h, _ov_w = m.blocks_sight.shape
     ov_surf = pygame.Surface((_ov_w, _ov_h), pygame.SRCALPHA)
-    ov_scaled = pygame.Surface((view_w, view_h), pygame.SRCALPHA)
+    ov_scaled = pygame.Surface((world_w, world_h), pygame.SRCALPHA)
 
     guards = [ai.Guard(g, cpm) for g in m.guards]
     memory: dict[str, tuple[float, float, float, float]] = {}
     show_own_sound = False   # player's own sound world is hidden until F10
-    enemy_mode = 1           # 0 off, 1 arcs, 2 full ripples
+    enemy_mode = 2           # 0 off, 1 arcs, 2 full ripples (F11 cycles)
     cues: list = []
 
     doors = find_doors(m)
@@ -485,6 +523,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
     fmode = [0] * len(loadout)     # index into each weapon's fire_modes()
     reload_t = 0.0
     fire_cd = 0.0
+    swap_t = 0.0                   # weapon-change animation timer
+    recoil_t = 0.0                 # gun-kick timer (player)
+    flash_t = 0.0                  # muzzle-flash timer (player)
+    flash_roll = 0.0               # per-shot flash spin, degrees
+    flash_scale = 1.0              # per-shot flash size jitter
     msg = ""
     msg_t = 0.0
 
@@ -497,6 +540,19 @@ def main(map_path: str = "maps/arena.toml") -> None:
     def sfx_fire(w, gain=1.0, pan=0.0):
         if not muted:
             audio.play_fire(w, gain, pan)
+
+    def draw_muzzle(art, cx, cy, facing, ft, roll, sc):
+        """Two-layer muzzle flash at a weapon's muzzle: big + small core early,
+        fading core late. `cx, cy` is the weapon sprite's blit centre."""
+        if ft <= 0.0 or not bank.ok or art not in sprites.MUZZLE_PX:
+            return
+        half = sprites.FLASH_TIME * 0.5
+        if ft > half:
+            bank.flash(screen, art, "big", cx, cy, facing, roll, sc * 1.15, 255)
+            bank.flash(screen, art, "small", cx, cy, facing, -roll * 1.7, sc, 255)
+        else:
+            bank.flash(screen, art, "small", cx, cy, facing, roll, sc * 0.8,
+                       int(210 * ft / half))
 
     def cur_weapon():
         return weapons.ROSTER[loadout[wi]]
@@ -545,7 +601,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
         plus a blast at impact for explosives. `acc` overrides the weapon's
         accuracy rating (full-auto passes the lower auto_accuracy)."""
         mxp, myp = pygame.mouse.get_pos()
-        ax, ay = mxp / PX_PER_M, myp / PX_PER_M
+        ax, ay = (mxp + cam_x) / PX_PER_M, (myp + cam_y) / PX_PER_M
         base = math.atan2(ay - py_, ax - px_)
         aim_d = math.hypot(ax - px_, ay - py_)
         live = [g for g in guards if g.alive]
@@ -570,6 +626,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
         dt = (clock.tick(FPS_CAP) if FPS_CAP else clock.tick()) / 1000.0
         if not paused:
             now += dt
+
+        # camera: keep the player centred, clamped to the world edges
+        cam_x = int(min(max(px_ * PX_PER_M - view_w * 0.5, 0), max(0, world_w - view_w)))
+        cam_y = int(min(max(py_ * PX_PER_M - view_h * 0.5, 0), max(0, world_h - view_h)))
 
         _t = time.perf_counter()
         for ev in pygame.event.get():
@@ -609,15 +669,16 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         msg, msg_t = f"{w.name}: no alt fire", now
                 elif ev.key == pygame.K_r:
                     w = weapons.ROSTER[loadout[wi]]
-                    if reload_t <= 0.0 and mags[wi] < w.mag:
+                    if reload_t <= 0.0 and swap_t <= 0.0 and mags[wi] < w.mag:
                         reload_t = w.reload_s
                         msg, msg_t = f"reloading {w.name}", now
                         sfx("reload")
                 elif pygame.K_1 <= ev.key <= pygame.K_9:
                     idx = ev.key - pygame.K_1
-                    if idx < len(loadout):
+                    if idx < len(loadout) and idx != wi and swap_t <= 0.0:
                         wi = idx
                         reload_t = 0.0
+                        swap_t = sprites.SWAP_TIME
                         msg, msg_t = f"switched to {weapons.ROSTER[loadout[wi]].name}", now
                 elif ev.key == pygame.K_f:
                     best, bd = None, INTERACT_RANGE
@@ -647,29 +708,42 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 elif ev.key in overlays:
                     active_ov = None if active_ov == ev.key else ev.key
             elif ev.type == pygame.MOUSEWHEEL:
-                if ev.y:
+                if ev.y and swap_t <= 0.0:
                     wi = (wi - (1 if ev.y > 0 else -1)) % len(loadout)
                     reload_t = 0.0
+                    swap_t = sprites.SWAP_TIME
                     msg, msg_t = f"switched to {weapons.ROSTER[loadout[wi]].name}", now
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                if pygame.mouse.get_pos()[1] < view_h and cur_fire_mode() != "auto":
+                if pygame.mouse.get_pos()[1] < view_h:
                     w = weapons.ROSTER[loadout[wi]]
-                    if reload_t > 0.0 or fire_cd > 0.0 or player.hp <= 0.0:
+                    auto = cur_fire_mode() == "auto"
+                    if reload_t > 0.0 or fire_cd > 0.0 or swap_t > 0.0 or player.hp <= 0.0:
                         pass
                     elif mags[wi] > 0:
-                        fire_cd = w.burst_time
+                        # a tap always fires one action; holding streams via the
+                        # auto poll below
+                        fire_cd = w.auto_refire if auto else w.burst_time
                         emit(m, cost, px_, py_, w.sound_reach_m * cpm, w.name,
                              sounds, now, jobs=jobs)
-                        player_fire(w, held_moving())
+                        player_fire(w, held_moving(),
+                                    acc=w.auto_accuracy if auto else None,
+                                    rounds=1 if auto else None)
                         sfx_fire(w)
-                    else:
-                        fire_cd = 0.35
-                        emit(m, cost, px_, py_, e_dry, "dry", sounds, now, jobs=jobs)
-                        sfx("dryfire")
-                        msg, msg_t = "empty - press r", now
+                        if w.blast_r <= 0.0:
+                            recoil_t = sprites.RECOIL_TIME
+                            flash_t = sprites.FLASH_TIME
+                            flash_roll = rng.uniform(-180.0, 180.0)
+                            flash_scale = rng.uniform(0.85, 1.25)
+                    elif reload_t <= 0.0 and mags[wi] < w.mag:
+                        reload_t = w.reload_s        # click on empty -> reload
+                        msg, msg_t = f"reloading {w.name}", now
+                        sfx("reload")
 
         if not paused:
             fire_cd = max(0.0, fire_cd - dt)
+            swap_t = max(0.0, swap_t - dt)
+            recoil_t = max(0.0, recoil_t - dt)
+            flash_t = max(0.0, flash_t - dt)
             if reload_t > 0.0:
                 reload_t -= dt
                 if reload_t <= 0.0:
@@ -680,7 +754,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     msg, msg_t = "reloaded", now
             # full-auto alternate fire: fire while the button is held down
             if (player.hp > 0.0 and cur_fire_mode() == "auto"
-                    and fire_cd <= 0.0 and reload_t <= 0.0 and mags[wi] > 0
+                    and fire_cd <= 0.0 and reload_t <= 0.0 and swap_t <= 0.0
+                    and mags[wi] > 0
                     and pygame.mouse.get_pressed()[0]
                     and pygame.mouse.get_pos()[1] < view_h):
                 w = cur_weapon()
@@ -689,6 +764,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
                      sounds, now, jobs=jobs)
                 player_fire(w, held_moving(), acc=w.auto_accuracy, rounds=1)
                 sfx_fire(w)
+                if w.blast_r <= 0.0:
+                    recoil_t = sprites.RECOIL_TIME
+                    flash_t = sprites.FLASH_TIME
+                    flash_roll = rng.uniform(-180.0, 180.0)
+                    flash_scale = rng.uniform(0.85, 1.25)
 
         keys = pygame.key.get_pressed()
         vx = (keys[pygame.K_d] or keys[pygame.K_RIGHT]) - (keys[pygame.K_a] or keys[pygame.K_LEFT])
@@ -716,7 +796,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 emit(m, cost, px_, py_, e, f"step/{gait}", sounds, now,
                      cache=step_cache, jobs=jobs)
                 if gait != "crawl":          # sneaking makes no audible step
-                    sfx("footstep", 0.20 if gait == "walk" else 0.32)
+                    sfx("footstep", 0.15 if gait == "walk" else 0.24)
 
         player.x, player.y = px_, py_
         if not paused and player.hp > 0.0:
@@ -757,10 +837,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
         prof["sim"] = (time.perf_counter() - _t) * 1000
 
         mx, my = pygame.mouse.get_pos()
+        wmx, wmy = (mx + cam_x) / PX_PER_M, (my + cam_y) / PX_PER_M   # world metres
         if my < view_h:
-            facing = math.atan2(my / PX_PER_M - py_, mx / PX_PER_M - px_)
-        probe = m.cell_of(min(mx, view_w - 1) / PX_PER_M,
-                          min(my, view_h - 1) / PX_PER_M)
+            facing = math.atan2(wmy - py_, wmx - px_)
+        probe = m.cell_of((min(mx, view_w - 1) + cam_x) / PX_PER_M,
+                          (min(my, view_h - 1) + cam_y) / PX_PER_M)
 
         if jobs:
             budget = max(200, SOLVE_BUDGET // len(jobs))
@@ -797,6 +878,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
         sounds = [s for s in sounds if not s.done(now)]
 
         _t = time.perf_counter()
+        screen = world                  # world-space draws target the full map
         screen.fill(BG)
         screen.blit(base, (0, 0))
         if active_ov is not None:
@@ -893,7 +975,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
             pxa[:, :] = np.transpose(
                 np.clip(ov_a * 255.0, 0, 255)).astype(np.uint8)
             del px3, pxa
-            pygame.transform.scale(ov_surf, (view_w, view_h), ov_scaled)
+            pygame.transform.scale(ov_surf, (world_w, world_h), ov_scaled)
             screen.blit(ov_scaled, (0, 0))
         prof["overlay"] = (time.perf_counter() - _t) * 1000
 
@@ -913,10 +995,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
 
         _t = time.perf_counter()
         if show_grid:
+            gpx = m.metres_per_char * PX_PER_M
             for c in range(m.chars.shape[1] + 1):
-                pygame.draw.line(screen, (60, 60, 58), (c * PX_PER_M, 0), (c * PX_PER_M, view_h))
+                pygame.draw.line(screen, (60, 60, 58), (c * gpx, 0), (c * gpx, world_h))
             for r in range(m.chars.shape[0] + 1):
-                pygame.draw.line(screen, (60, 60, 58), (0, r * PX_PER_M), (view_w, r * PX_PER_M))
+                pygame.draw.line(screen, (60, 60, 58), (0, r * gpx), (world_w, r * gpx))
 
         for lt in m.lights:
             c = (int(lt.pos[0] * PX_PER_M), int(lt.pos[1] * PX_PER_M))
@@ -941,7 +1024,9 @@ def main(map_path: str = "maps/arena.toml") -> None:
             band = vf.band_at(gcx, gcy, facing, cone)
             sx, sy = g.x * PX_PER_M, g.y * PX_PER_M
             if not g.alive:
-                pygame.draw.circle(screen, DEAD, (int(sx), int(sy)), 7)
+                if not (bank.ok and bank.blit(screen, "soldier_idle", sx, sy,
+                                              g.facing, tint=(70, 70, 70), alpha=200)):
+                    pygame.draw.circle(screen, DEAD, (int(sx), int(sy)), 7)
                 pygame.draw.line(screen, DEAD, (sx - 6, sy - 6), (sx + 6, sy + 6), 2)
                 pygame.draw.line(screen, DEAD, (sx - 6, sy + 6), (sx + 6, sy - 6), 2)
                 continue
@@ -949,13 +1034,30 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 live_n += 1
                 memory[g.id] = (g.x, g.y, g.facing, now)
                 col = MODE_COL[g.mode]
-                pygame.draw.circle(screen, col, (int(sx), int(sy)), 7)
-                pygame.draw.line(screen, (28, 28, 26), (sx, sy),
-                                 (sx + math.cos(g.facing) * 17,
-                                  sy + math.sin(g.facing) * 17), 3)
+                tense = g.mode in (ai.Mode.COMBAT, ai.Mode.SEARCH)
+                slung = g.reload_t > 0.0 or not tense   # reloading -> gun down
+                if bank.ok:
+                    bank.blit(screen, "soldier_idle" if slung else "soldier_ready",
+                              sx, sy, g.facing)
+                    gkick = (g.recoil_t / ai.RECOIL_TIME
+                             * sprites.RECOIL_M * PX_PER_M)
+                    gwx = sx - math.cos(g.facing) * gkick
+                    gwy = sy - math.sin(g.facing) * gkick
+                    bank.blit(screen,
+                              "weapon_sling" if slung else sprites.weapon_art_for(g.weapon),
+                              gwx, gwy, g.facing)
+                    if not slung:
+                        draw_muzzle(sprites.weapon_art_for(g.weapon), gwx, gwy,
+                                    g.facing, g.flash_t, g.flash_roll, g.flash_scale)
+                    pygame.draw.circle(screen, col, (int(sx), int(sy)), 12, 1)
+                else:
+                    pygame.draw.circle(screen, col, (int(sx), int(sy)), 7)
+                    pygame.draw.line(screen, (28, 28, 26), (sx, sy),
+                                     (sx + math.cos(g.facing) * 17,
+                                      sy + math.sin(g.facing) * 17), 3)
                 if g.alert > 0.02:
                     pygame.draw.circle(screen, col, (int(sx), int(sy)),
-                                       int(9 + 6 * g.alert), 1)
+                                       int(14 + 6 * g.alert), 1)
                 pygame.draw.rect(screen, (20, 20, 20), (sx - 9, sy - 14, 18, 3))
                 pygame.draw.rect(screen, (90, 200, 120),
                                  (sx - 9, sy - 14, int(18 * g.health / g.max_health), 3))
@@ -1028,10 +1130,39 @@ def main(map_path: str = "maps/arena.toml") -> None:
         _t = time.perf_counter()
         ppx, ppy = px_ * PX_PER_M, py_ * PX_PER_M
         down = player.hp <= 0.0
-        pygame.draw.line(screen, FACING, (ppx, ppy),
-                         (ppx + math.cos(facing) * 26, ppy + math.sin(facing) * 26), 2)
-        pygame.draw.circle(screen, DEAD if down else PLAYER,
-                           (int(ppx), int(ppy)), int(BODY_R * PX_PER_M))
+        drew = False
+        if bank.ok:
+            if down:
+                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing,
+                                 tint=(90, 90, 90))
+            elif swap_t > 0.0:
+                pose, wsprite = sprites.swap_frame(1.0 - swap_t / sprites.SWAP_TIME,
+                                                   loadout[wi])
+                drew = bank.blit(screen, pose, ppx, ppy, facing)
+                if wsprite:
+                    bank.blit(screen, wsprite, ppx, ppy, facing)
+            elif reload_t > 0.0:
+                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing)
+                bank.blit(screen, "weapon_sling", ppx, ppy, facing)
+            else:
+                drew = bank.blit(screen, "soldier_ready", ppx, ppy, facing)
+                kick = recoil_t / sprites.RECOIL_TIME * sprites.RECOIL_M * PX_PER_M
+                gwx = ppx - math.cos(facing) * kick
+                gwy = ppy - math.sin(facing) * kick
+                bank.blit(screen, sprites.weapon_art(loadout[wi]), gwx, gwy, facing)
+                draw_muzzle(sprites.weapon_art(loadout[wi]), gwx, gwy, facing,
+                            flash_t, flash_roll, flash_scale)
+        if not drew:
+            pygame.draw.line(screen, FACING, (ppx, ppy),
+                             (ppx + math.cos(facing) * 26,
+                              ppy + math.sin(facing) * 26), 2)
+            pygame.draw.circle(screen, DEAD if down else PLAYER,
+                               (int(ppx), int(ppy)), int(BODY_R * PX_PER_M))
+
+        # lift the camera window out of the world and back to the real screen
+        window.fill(BG)
+        window.blit(world, (-cam_x, -cam_y))
+        screen = window
 
         pygame.draw.rect(screen, HUD_BG, (0, view_h, view_w, HUD_H))
         cx, cy = m.cell_of(px_, py_)
