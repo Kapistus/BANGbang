@@ -1,41 +1,153 @@
 grid = "arena.grid"
-name = "CQB test arena"
+name = "CQB test arena x4"
 
 player_spawn = [3.5, 15.5]
 
 [[guards]]
-id = "g1"
+id = "g1q0"
 patrol = [[16.5, 8.5], [26.5, 8.5], [26.5, 15.5], [16.5, 15.5]]
-identify_deg = 20.0
-recognise_deg = 100.0
-peripheral_deg = 170.0
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
 
 [[guards]]
-id = "g2"
+id = "g2q0"
 patrol = [[15.5, 1.5], [27.5, 1.5], [27.5, 4.5], [15.5, 4.5]]
-identify_deg = 20.0
-recognise_deg = 100.0
-peripheral_deg = 170.0
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
 
 [[idle_spots]]
 pos = [22.5, 9.5]
-facing_deg = 180.0
+facing_deg = 180
 tag = "watching"
-dwell = [4.0, 12.0]
+dwell = [4, 12]
 
 [[idle_spots]]
 pos = [26.5, 10.5]
-facing_deg = 270.0
+facing_deg = 270
 tag = "smoking"
-dwell = [8.0, 20.0]
+dwell = [8, 20]
 distraction = 0.5
 
 [[lights]]
-pos = [20.0, 4.0]
-radius = 7.0
-intensity = 1.0
+pos = [20, 4]
+radius = 7
+intensity = 1
 
 [[lights]]
-pos = [6.0, 8.0]
-radius = 5.0
+pos = [6, 8]
+radius = 5
 intensity = 0.6
+
+[[guards]]
+id = "g1q1"
+patrol = [[46.5, 8.5], [56.5, 8.5], [56.5, 15.5], [46.5, 15.5]]
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
+
+[[guards]]
+id = "g2q1"
+patrol = [[45.5, 1.5], [57.5, 1.5], [57.5, 4.5], [45.5, 4.5]]
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
+
+[[idle_spots]]
+pos = [52.5, 9.5]
+facing_deg = 180
+tag = "watching"
+dwell = [4, 12]
+
+[[idle_spots]]
+pos = [56.5, 10.5]
+facing_deg = 270
+tag = "smoking"
+dwell = [8, 20]
+distraction = 0.5
+
+[[lights]]
+pos = [50, 4]
+radius = 7
+intensity = 1
+
+[[lights]]
+pos = [36, 8]
+radius = 5
+intensity = 0.6
+
+[[guards]]
+id = "g1q2"
+patrol = [[16.5, 26.5], [26.5, 26.5], [26.5, 33.5], [16.5, 33.5]]
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
+
+[[guards]]
+id = "g2q2"
+patrol = [[15.5, 19.5], [27.5, 19.5], [27.5, 22.5], [15.5, 22.5]]
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
+
+[[idle_spots]]
+pos = [22.5, 27.5]
+facing_deg = 180
+tag = "watching"
+dwell = [4, 12]
+
+[[idle_spots]]
+pos = [26.5, 28.5]
+facing_deg = 270
+tag = "smoking"
+dwell = [8, 20]
+distraction = 0.5
+
+[[lights]]
+pos = [20, 22]
+radius = 7
+intensity = 1
+
+[[lights]]
+pos = [6, 26]
+radius = 5
+intensity = 0.6
+
+[[guards]]
+id = "g1q3"
+patrol = [[46.5, 26.5], [56.5, 26.5], [56.5, 33.5], [46.5, 33.5]]
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
+
+[[guards]]
+id = "g2q3"
+patrol = [[45.5, 19.5], [57.5, 19.5], [57.5, 22.5], [45.5, 22.5]]
+identify_deg = 20
+recognise_deg = 100
+peripheral_deg = 170
+
+[[idle_spots]]
+pos = [52.5, 27.5]
+facing_deg = 180
+tag = "watching"
+dwell = [4, 12]
+
+[[idle_spots]]
+pos = [56.5, 28.5]
+facing_deg = 270
+tag = "smoking"
+dwell = [8, 20]
+distraction = 0.5
+
+[[lights]]
+pos = [50, 22]
+radius = 7
+intensity = 1
+
+[[lights]]
+pos = [36, 26]
+radius = 5
+intensity = 0.6
+

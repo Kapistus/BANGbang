@@ -1,0 +1,164 @@
+# Tile palette for the map editor and the game.
+#
+# Every entry has the four gameplay booleans the editor exposes:
+#   is_see_through  can the player/guards see THROUGH this cell (visually)
+#   is_walkable     can an actor stand/move here
+#   blocks_los      does it stop line-of-sight for the vision system
+#   blocks_shots    does it stop bullets
+#
+# Plus values the sim needs. If any of sound_cost / footstep_mult / pen_cost
+# are omitted, sim/tileset.py derives a sensible default from the booleans.
+#
+#   layer = "floor"   painted on the base layer (every cell has one)
+#   layer = "object"  painted on top (walls, doors, props); "" clears it
+#
+# Swap the placeholder PNGs in this folder for real art at the same size.
+
+[meta]
+tile_px = 32
+default_floor = "floor"
+
+# ---- floor layer -------------------------------------------------------
+
+[tiles.floor]
+png = "floor.png"
+layer = "floor"
+name = "Floor"
+is_see_through = true
+is_walkable = true
+blocks_los = false
+blocks_shots = false
+colour = [216, 214, 205]
+
+[tiles.concrete]
+png = "concrete.png"
+layer = "floor"
+name = "Concrete"
+is_see_through = true
+is_walkable = true
+blocks_los = false
+blocks_shots = false
+colour = [188, 186, 180]
+
+[tiles.dirt]
+png = "dirt.png"
+layer = "floor"
+name = "Dirt"
+is_see_through = true
+is_walkable = true
+blocks_los = false
+blocks_shots = false
+footstep_mult = 0.9
+colour = [150, 122, 92]
+
+[tiles.grating]
+png = "grating.png"
+layer = "floor"
+name = "Grating (loud)"
+is_see_through = true
+is_walkable = true
+blocks_los = false
+blocks_shots = false
+footstep_mult = 1.8
+colour = [196, 188, 170]
+
+# ---- object layer ----------------------------------------------------
+
+[tiles.wall]
+png = "wall.png"
+layer = "object"
+name = "Wall"
+is_see_through = false
+is_walkable = false
+blocks_los = true
+blocks_shots = true
+sound_cost = 40.0
+pen_cost = 3.5
+colour = [92, 90, 84]
+
+[tiles.thin_wall]
+png = "thin_wall.png"
+layer = "object"
+name = "Thin wall (penetrable)"
+is_see_through = false
+is_walkable = false
+blocks_los = true
+blocks_shots = false
+sound_cost = 16.0
+pen_cost = 0.9
+colour = [132, 128, 118]
+
+[tiles.pillar]
+png = "pillar.png"
+layer = "object"
+name = "Pillar"
+is_see_through = false
+is_walkable = false
+blocks_los = true
+blocks_shots = true
+sound_cost = 40.0
+pen_cost = 3.5
+colour = [104, 100, 92]
+
+[tiles.window]
+png = "window.png"
+layer = "object"
+name = "Window (glass)"
+is_see_through = true
+is_walkable = false
+blocks_los = false
+blocks_shots = true
+glass = true
+sound_cost = 6.0
+pen_cost = 0.3
+colour = [176, 198, 206]
+
+[tiles.door]
+png = "door.png"
+layer = "object"
+name = "Door"
+is_see_through = false
+is_walkable = false
+blocks_los = true
+blocks_shots = true
+door = true
+sound_cost = 10.0
+pen_cost = 1.8
+colour = [150, 118, 78]
+
+[tiles.low_cover]
+png = "low_cover.png"
+layer = "object"
+name = "Low cover (see over)"
+is_see_through = true
+is_walkable = false
+blocks_los = false
+blocks_shots = true
+sound_cost = 2.2
+pen_cost = 1.2
+colour = [168, 158, 138]
+
+[tiles.crate]
+png = "crate.png"
+layer = "object"
+name = "Crate"
+is_see_through = false
+is_walkable = false
+blocks_los = true
+blocks_shots = true
+sound_cost = 8.0
+pen_cost = 1.5
+colour = [156, 120, 74]
+
+[tiles.bush]
+png = "bush.png"
+layer = "object"
+name = "Bush (concealment)"
+is_see_through = false
+is_walkable = true
+blocks_los = true
+blocks_shots = false
+footstep_mult = 1.1
+sound_cost = 1.0
+pen_cost = 0.0
+colour = [86, 120, 66]
