@@ -36,8 +36,19 @@ SEARCH   Moves to its best guess of where the stimulus was and pokes around
          patrol, and it keeps hunting for about 25 seconds before giving up.
          Any fresh contact resets that timer.
 
-COMBAT  Holds a firing distance from the player (advances if too far, backs
-         off if too close), fires its weapon when it has line of sight.
+COMBAT  Prioritises solid cover. If a bullet-blocking tile (wall, pillar,
+         low cover, closed door) is within reach with an angle the guard can
+         lean out of, it moves behind it and alternates:
+           hunker - tucked fully behind cover, not firing (the sim stops the
+                    player's shots on the cover)
+           peek   - steps a little to the side to open a clean line, fires a
+                    burst, then tucks back
+         A guard already holding a clean shot in the open does not abandon it
+         to chase distant cover. A guard caught on the wrong side of cover
+         from the player flanks around it. A guard never fires into its own
+         cover. With no usable cover it fights in the open, holding a firing
+         distance (advance if far, back off if close - without turning its
+         aim off the player).
          Reloads between fights. Loses sight -> SEARCH at the last known
          position with alert still high.
 
