@@ -19,7 +19,8 @@ Weapons
 
 Sound
     footsteps emit automatically while moving, louder when running and
-    louder again on the grating
+    louder again on the grating; walking patters, running lands further
+    apart, crawling makes no audible step at all
     space           knock (medium)
     c               clear active sounds
     m               mute audio. Placeholder SFX are synthesised in sim/audio.py;
@@ -89,7 +90,12 @@ SOUND_RENDER_MAX_COST = 5.0
 FPS_CAP = 60          # 0 = uncapped
 
 SPEED_CRAWL, SPEED_WALK, SPEED_RUN = 0.9, 2.2, 4.6
-STRIDE = {"crawl": 1.20, "walk": 0.85, "run": 0.60}
+
+# Metres travelled per footstep - this sets both the sound-propagation
+# cadence and the audible step rhythm. Walking patters (short spacing),
+# running lands heavier and further apart, crawling is slow and, for the
+# player, produces no step SFX at all (see the sfx call below).
+STRIDE = {"crawl": 1.50, "walk": 0.70, "run": 1.10}
 
 # Sound energies are the METRES a sound carries in open air. Converted to
 # cell units at load, so changing subdiv no longer rescales how far
@@ -109,6 +115,7 @@ MAX_ACTIVE = 14
 # weapons.DEFAULT_LOADOUT; cycle with the wheel or keys 1-7.
 RESPAWN_DELAY = 1.2
 TRACER_FADE = 0.18
+BLAST_FADE = 0.32
 INTERACT_RANGE = 1.6
 
 VIS_SPEED = 70.0      # cells/sec for the ripple; real sound is ~1372, so
@@ -119,17 +126,16 @@ BODY_R = 0.28
 # converted to cells at load, so changing subdiv in tiles.toml no longer
 # silently rescales them.
 CONE_DEG = (44.0, 100.0, 180.0)      # identify, recognise, peripheral
-CONE_RANGE_M = (22.0, 14.0, 8.0, 2.0)  # identify, recognise, peripheral, near
+# identify, recognise, peripheral, near. There is no vision behind the player
+# at all - the peripheral band is a hard forward hemisphere and there is no
+# all-round near radius.
+CONE_RANGE_M = (29.3, 14.0, 8.0, 0.0)
 
 
 # Black overlay alpha per visibility state. 0 = fully lit, 255 = hidden.
 A_UNKNOWN = 248       # never seen: almost nothing shows
 A_REMEMBERED = 138    # seen before: geometry readable but clearly stale
-A_PERIPHERAL = 74     # motion only
-A_RECOGNISE = 32
-A_IDENTIFY = 0
-TINT_IDENTIFY = 26    # warm tint added inside the cone
-TINT_RECOGNISE = 13
+FOG_BLUR_R = 3        # box-blur radius (fine cells) that feathers every fog edge
 
 GHOST = (150, 96, 72)
 BLIP = (200, 140, 90)
@@ -227,6 +233,24 @@ def rgba_surface(rgb: np.ndarray, alpha: np.ndarray) -> pygame.Surface:
     return surf
 
 
+def box_blur(a: np.ndarray, radius: int = 2) -> np.ndarray:
+    """Separable box blur on a 2D float array - used to feather the hard
+    shadowcast edges of the vision field so the fog reads soft, not stencilled.
+    Edge cells get slightly less blur, which is fine here."""
+    out = a.astype(np.float32).copy()
+    src = out.copy()
+    for d in range(1, radius + 1):
+        out[:, d:] += src[:, :-d]
+        out[:, :-d] += src[:, d:]
+    out /= (2 * radius + 1)
+    src = out.copy()
+    for d in range(1, radius + 1):
+        out[d:, :] += src[:-d, :]
+        out[:-d, :] += src[d:, :]
+    out /= (2 * radius + 1)
+    return out
+
+
 def scale_to_view(surf, m: TileMap, cells_w: int, cells_h: int):
     ppc = PX_PER_M / m.cells_per_metre
     return pygame.transform.scale(surf, (int(cells_w * ppc), int(cells_h * ppc)))
@@ -283,19 +307,27 @@ def draw_cue(screen, cx, cy, ang, half_deg, alpha, ppm):
 
 
 def draw_guard_cone(screen, g, ppm):
-    """Debug wedges for a guard's identify and peripheral vision (key v)."""
+    """Soft debug wedges for a guard's identify and peripheral vision (key v).
+
+    Drawn as a stack of concentric wedge layers with the alpha fading out
+    toward the rim, so the cone reads as a gradient rather than a flat slab.
+    """
+    surf = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+    cx, cy = g.x * ppm, g.y * ppm
     for fov, rng_m, col in (
-        (ai.FOV_IDENT, ai.IDENT_RANGE_M, (70, 110, 150)),
         (ai.FOV_PERIPH, ai.PERIPH_RANGE_M, (60, 70, 95)),
+        (ai.FOV_IDENT, ai.IDENT_RANGE_M, (70, 110, 150)),
     ):
-        pts = [(g.x * ppm, g.y * ppm)]
-        for k in range(13):
-            a = g.facing - fov + 2.0 * fov * k / 12.0
-            pts.append(((g.x + math.cos(a) * rng_m) * ppm,
-                        (g.y + math.sin(a) * rng_m) * ppm))
-        surf = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-        pygame.draw.polygon(surf, (*col, 38), pts)
-        screen.blit(surf, (0, 0))
+        for i in range(7, 0, -1):
+            frac = i / 7.0
+            r = rng_m * ppm * frac
+            alpha = int(24 * (1.0 - frac) ** 1.3) + 3
+            pts = [(cx, cy)]
+            for k in range(17):
+                a = g.facing - fov + 2.0 * fov * k / 16.0
+                pts.append((cx + math.cos(a) * r, cy + math.sin(a) * r))
+            pygame.draw.polygon(surf, (*col, alpha), pts)
+    screen.blit(surf, (0, 0))
 
 
 def try_move(m: TileMap, x, y, dx, dy):
@@ -418,16 +450,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
     player = combat.player_commando(px_, py_)
     loadout = list(weapons.DEFAULT_LOADOUT)
     tracers: list = []          # (segments, t0)
+    blasts: list = []           # ((x, y), radius_m, t0) for explosion rings
     respawn_t = 0.0
     show_cones = False
 
-    fog_pal = np.array([
-        (0, 0, 0, A_UNKNOWN),
-        (0, 0, 0, A_REMEMBERED),
-        (0, 0, 0, A_PERIPHERAL),
-        (69, 46, 11, A_RECOGNISE + TINT_RECOGNISE),
-        (239, 159, 39, TINT_IDENTIFY),
-    ], dtype=np.uint8)
+    A_UNKNOWN_F = A_UNKNOWN / 255.0
+    A_REMEMBER_F = A_REMEMBERED / 255.0
     ripple_buf = np.zeros(m.blocks_sight.shape, dtype=np.float32)
     ripple_enemy = np.zeros(m.blocks_sight.shape, dtype=np.float32)
 
@@ -535,6 +563,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     break_glass(sh.shattered)
                 if w.blast_r > 0.0:
                     ballistics.blast(sh.impact, w.blast_r, w, live, rng, now)
+                    blasts.append((sh.impact, w.blast_r, now))
 
     running = True
     while running:
@@ -686,8 +715,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     step_cache.clear()
                 emit(m, cost, px_, py_, e, f"step/{gait}", sounds, now,
                      cache=step_cache, jobs=jobs)
-                sfx("footstep", 0.35 if gait == "walk" else
-                    (0.2 if gait == "crawl" else 0.5))
+                if gait != "crawl":          # sneaking makes no audible step
+                    sfx("footstep", 0.20 if gait == "walk" else 0.32)
 
         player.x, player.y = px_, py_
         if not paused and player.hp > 0.0:
@@ -704,6 +733,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         tracers.append((sh.segments, now))
                     if sh.shattered:
                         break_glass(sh.shattered)
+                    if g.weapon.blast_r > 0.0:
+                        blasts.append((sh.impact, g.weapon.blast_r, now))
             player.tick(dt, now)
 
         if not paused:
@@ -817,22 +848,25 @@ def main(map_path: str = "maps/arena.toml") -> None:
         _t = time.perf_counter()
         pcx, pcy = m.cell_of(px_, py_)
         vf = vis_cache.get(pcx, pcy, cone.max_range)
-        bands = vf.bands(facing, cone)
+        inten_raw = vf.cone_intensity(facing, cone)
         prof["vision"] = (time.perf_counter() - _t) * 1000
-        h_, w_ = bands.shape
-        known[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_] |= bands > 0
+        h_, w_ = inten_raw.shape
+        known[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_] |= inten_raw > 0.03
 
         _t = time.perf_counter()
         if show_fog:
-            idx = np.zeros(known.shape, dtype=np.uint8)
-            idx[known] = 1
-            sub = idx[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
-            sub[bands == 3] = 2
-            sub[bands == 2] = 3
-            sub[bands == 1] = 4
-            entry = fog_pal[idx]
-            ov_rgb = entry[:, :, :3].astype(np.float32)
-            ov_a = entry[:, :, 3].astype(np.float32) / 255.0
+            ov_a = np.where(known, A_REMEMBER_F, A_UNKNOWN_F).astype(np.float32)
+            ov_rgb = np.zeros(known.shape + (3,), dtype=np.float32)
+            # carve the cone into the veil from the crisp field: cells in view
+            # are lightened (never below their remembered level)
+            sub_a = ov_a[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
+            lit = inten_raw > 0.004
+            sub_a[lit] = np.minimum(sub_a[lit],
+                                    A_REMEMBER_F * (1.0 - inten_raw[lit]))
+            # then blur the whole alpha field once: this is what feathers the
+            # cone rim, the shadow edges AND the explored/fog boundary - every
+            # hard line between "seen now", "remembered" and "unknown" softens
+            ov_a = box_blur(ov_a, FOG_BLUR_R)
         else:
             ov_rgb = np.zeros(known.shape + (3,), dtype=np.float32)
             ov_a = np.zeros(known.shape, dtype=np.float32)
@@ -976,6 +1010,20 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     (p0[0] * PX_PER_M, p0[1] * PX_PER_M),
                     (p1[0] * PX_PER_M, p1[1] * PX_PER_M), 2 if air else 1)
         tracers = [tp for tp in tracers if now - tp[1] < TRACER_FADE]
+
+        for (bx, by), br, t0 in blasts:
+            age = (now - t0) / BLAST_FADE
+            if age >= 1.0:
+                continue
+            cxp, cyp = int(bx * PX_PER_M), int(by * PX_PER_M)
+            rpx = int(br * PX_PER_M * (0.45 + 0.55 * age))   # expands to full radius
+            bs = pygame.Surface((rpx * 2 + 4, rpx * 2 + 4), pygame.SRCALPHA)
+            pygame.draw.circle(bs, (255, 170, 70, int(120 * (1.0 - age) ** 2)),
+                               (rpx + 2, rpx + 2), rpx)
+            pygame.draw.circle(bs, (255, 230, 160, int(200 * (1.0 - age))),
+                               (rpx + 2, rpx + 2), rpx, 2)
+            screen.blit(bs, (cxp - rpx - 2, cyp - rpx - 2))
+        blasts = [b for b in blasts if now - b[2] < BLAST_FADE]
 
         _t = time.perf_counter()
         ppx, ppy = px_ * PX_PER_M, py_ * PX_PER_M
