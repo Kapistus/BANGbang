@@ -21,6 +21,11 @@ Band values in the returned array:
     1  identify    narrow, long range
     2  recognise   medium
     3  peripheral  wide, short range, motion only
+
+`bands` / `band_at` are the discrete, gameplay-facing classification (they
+decide how an enemy is drawn to the player - full readout, motion blip, or
+stale ghost). `cone_intensity` is the continuous version used only for
+rendering the player's own view as a single cone that feathers at its edges.
 """
 
 from __future__ import annotations
@@ -106,15 +111,43 @@ class VisionField:
         out = np.zeros(self.visible.shape, dtype=np.uint8)
         v = self.visible
 
-        per = v & (d <= math.radians(cone.peripheral_deg) * 0.5) & (self.dist <= cone.peripheral_range)
+        half_p = math.radians(cone.peripheral_deg) * 0.5
+        fwd = v & (d <= half_p)                       # forward hemisphere only
+        per = fwd & (self.dist <= cone.peripheral_range)
         out[per] = 3
-        rec = v & (d <= math.radians(cone.recognise_deg) * 0.5) & (self.dist <= cone.recognise_range)
+        rec = fwd & (d <= math.radians(cone.recognise_deg) * 0.5) & (self.dist <= cone.recognise_range)
         out[rec] = 2
-        near = v & (self.dist <= cone.near_range)
+        near = fwd & (self.dist <= cone.near_range)
         out[near] = np.maximum(out[near], 2)
         ide = v & (d <= math.radians(cone.identify_deg) * 0.5) & (self.dist <= cone.identify_range)
         out[ide] = 1
         return out
+
+    def cone_intensity(self, facing: float, cone: ConeSpec) -> np.ndarray:
+        """Smooth per-cell clarity in [0, 1] across the view cone.
+
+        Bright toward `facing`, feathering to zero at the peripheral edge and
+        at range. Optional `near_range` gives a short forward-only floor.
+        There is a hard cut at the peripheral half-angle - nothing behind the
+        player. Unlike `bands` this has no steps: it renders as one cone that
+        fades at its edges rather than labelled slices.
+
+        The effective range shrinks off-axis: full `identify_range` straight
+        ahead, down to `peripheral_range` at the edge.
+        """
+        d = np.abs((self.ang - facing + math.pi) % (2 * math.pi) - math.pi)
+        half_p = max(math.radians(cone.peripheral_deg) * 0.5, 1e-6)
+        k = np.clip(d / half_p, 0.0, 1.0)
+        ang_t = 0.5 + 0.5 * np.cos(np.pi * k)                # 1 on axis -> 0 at edge
+        reach = cone.identify_range + k * (cone.peripheral_range
+                                           - cone.identify_range)
+        rad_t = np.clip(1.0 - self.dist / np.maximum(reach, 1e-6), 0.0, 1.0)
+        rad_t = rad_t * rad_t * (3.0 - 2.0 * rad_t)          # smoothstep
+        near_t = np.clip((cone.near_range - self.dist)
+                         / max(cone.near_range, 1e-6), 0.0, 1.0)
+        inten = np.maximum(near_t * 0.9, ang_t * rad_t)
+        inten[d >= half_p] = 0.0                             # nothing behind, ever
+        return (self.visible * inten).astype(np.float32)
 
     def band_at(self, cx: int, cy: int, facing: float, cone: ConeSpec) -> int:
         """Band for a single cell without building the whole array."""
@@ -126,11 +159,13 @@ class VisionField:
         d = abs((float(self.ang[ly, lx]) - facing + math.pi) % (2 * math.pi) - math.pi)
         if d <= math.radians(cone.identify_deg) * 0.5 and dist <= cone.identify_range:
             return 1
+        if d > math.radians(cone.peripheral_deg) * 0.5:
+            return 0                                   # behind the player - blind
         if dist <= cone.near_range:
             return 2
         if d <= math.radians(cone.recognise_deg) * 0.5 and dist <= cone.recognise_range:
             return 2
-        if d <= math.radians(cone.peripheral_deg) * 0.5 and dist <= cone.peripheral_range:
+        if dist <= cone.peripheral_range:
             return 3
         return 0
 

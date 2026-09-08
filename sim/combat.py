@@ -42,6 +42,7 @@ class Combatant:
     shields: Optional[float] = None
     alive: bool = True
     last_hit_t: float = -1e9
+    hit_from: Optional[tuple] = None   # world (x, y) the last damage came from
     _regen_at: float = field(default=-1e9, repr=False)
 
     def __post_init__(self):
@@ -63,10 +64,13 @@ class Combatant:
         return self.shields > 0.0
 
     def take(self, dmg: float, now: float,
-             shield_mult: float = 1.0, health_mult: float = 1.0) -> None:
+             shield_mult: float = 1.0, health_mult: float = 1.0,
+             src: Optional[tuple] = None) -> None:
         if not self.alive or dmg <= 0.0:
             return
         self.last_hit_t = now
+        if src is not None:
+            self.hit_from = src
         self._regen_at = now + self.shield_delay
 
         remaining = dmg * self.incoming_mult

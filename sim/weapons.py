@@ -148,9 +148,10 @@ ROSTER: dict[str, Weapon] = {
         pen=2.0, burst=3, sound_reach_m=120.0, weight=9.7, str_req=17,
         module_slots=1),
     # bible lists 2 shots before reload; overridden per request - reload every shot.
+    # bible blast radius is "2-5 units"; 4 m radius = 8 m kill diameter.
     "rocket_launcher": Weapon(
         "rocket launcher", "heavy", 35, 120, 35, 0.3, 0.91, 1, 6.0,
-        pen=0.0, blast_r=3.5, sound_reach_m=140.0, weight=15.2, str_req=15,
+        pen=0.0, blast_r=4.0, sound_reach_m=140.0, weight=15.2, str_req=15,
         module_slots=1),
     "flamethrower": Weapon(
         "flamethrower", "heavy", 1, 3, 7, 10.0, 0.92, 200, 10.0,

@@ -28,6 +28,7 @@ from sim import weapons
 
 MIN_PEN_COST = 0.05
 STEP_C = 0.25          # march increment, fine-grid cells
+BLAST_FALLOFF_EXP = 0.55   # < 1 keeps the outer half of a blast dangerous
 
 
 @dataclass
@@ -170,7 +171,8 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
                 scale = pr
         had_sh = tgt.had_shields()
         dmg = weapons.roll_damage(weapon, rng) * scale
-        tgt.take(dmg, now, weapon.shield_mult, weapon.health_mult)
+        tgt.take(dmg, now, weapon.shield_mult, weapon.health_mult,
+                 src=(ox_m, oy_m))
         hits.append(Hit(tgt, dmg, t))
         if weapon.pierce_bodies and not had_sh:
             for i, (pd, pr) in enumerate(pierces):
@@ -187,7 +189,9 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
 
 
 def blast(center, radius_m, weapon, targets, rng, now):
-    """Area damage: full at the centre, linear to zero at radius_m."""
+    """Area damage: full at the centre, tapering to zero at radius_m. The
+    taper uses BLAST_FALLOFF_EXP (< 1) so the outer half of the blast still
+    hurts rather than only the dead centre."""
     hits = []
     cx, cy = center
     for tgt in targets:
@@ -196,7 +200,9 @@ def blast(center, radius_m, weapon, targets, rng, now):
         d = math.hypot(tgt.x - cx, tgt.y - cy)
         if d > radius_m:
             continue
-        dmg = weapons.roll_damage(weapon, rng) * (1.0 - d / radius_m)
-        tgt.take(dmg, now, weapon.shield_mult, weapon.health_mult)
+        dmg = weapons.roll_damage(weapon, rng) \
+            * (1.0 - d / radius_m) ** BLAST_FALLOFF_EXP
+        tgt.take(dmg, now, weapon.shield_mult, weapon.health_mult,
+                 src=(cx, cy))
         hits.append(Hit(tgt, dmg, d))
     return hits
