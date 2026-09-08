@@ -4,6 +4,10 @@ Authoring happens at one character per metre. The simulation runs on a finer
 grid (subdiv cells per metre) so that doorways are several cells wide and
 sound diffraction behaves. Actors live in world metres and sample the fine
 arrays; nothing snaps to the grid except the obstacles themselves.
+
+This is the legacy `.grid` + `tiles.toml` loader. New maps use the JSON
+`.map` format (sim/mapfile.py, made by editor.py), which builds the same
+TileMap. main.py's load_any_map() picks the loader by file extension.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ class GuardSpec:
     identify_deg: float = 20.0
     recognise_deg: float = 100.0
     peripheral_deg: float = 170.0
+    weapon: str = "combat_rifle"      # weapons.ROSTER id; editor can override
 
 
 @dataclass
@@ -79,6 +84,12 @@ class TileMap:
     idle_spots: list[IdleSpot] = field(default_factory=list)
     lights: list[Light] = field(default_factory=list)
 
+    # set by the JSON map loader (sim/mapfile.py); None for legacy .grid maps.
+    # coarse (rows, cols) arrays of tile ids for a sprite renderer.
+    floor_ids: "np.ndarray | None" = None
+    object_ids: "np.ndarray | None" = None
+    tileset: object = None
+
     @property
     def cells_per_metre(self) -> float:
         return self.subdiv / self.metres_per_char
@@ -107,8 +118,16 @@ class TileMap:
         cx, cy = self.cell_of(x_m, y_m)
         return bool(self.blocks_move[cy, cx])
 
+    def in_bounds(self, x_m: float, y_m: float, radius_m: float = 0.0) -> bool:
+        """The point (with an optional body radius) lies inside the map rect."""
+        return (radius_m <= x_m <= self.width_m - radius_m
+                and radius_m <= y_m <= self.height_m - radius_m)
+
     def can_stand(self, x_m: float, y_m: float, radius_m: float = 0.28) -> bool:
-        """Circle test against blocks_move, sampled at centre plus 4 rim points."""
+        """Circle test against blocks_move, sampled at centre plus 4 rim points.
+        Also rejects anything that would poke past the map border."""
+        if not self.in_bounds(x_m, y_m, radius_m):
+            return False
         if self.solid_at(x_m, y_m):
             return False
         r = radius_m

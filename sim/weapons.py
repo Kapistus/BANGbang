@@ -27,6 +27,7 @@ DMG_SCALE = 4.0         # global multiplier on all weapon damage. The bible's
                         # different pacing; this brings time-to-kill into
                         # single-digit seconds against bible-scale health.
 SPREAD_SCALE = 1.0       # global multiplier on all spread; tune for feel
+SOUND_SCALE = 0.8        # global multiplier on how far every shot is audible
 HARD_RANGE_MULT = 2.5    # a shot is discarded past optimal_range * this
 WALL_DMG_RETAIN = 0.6    # damage kept per piece of cover a bullet pierces
 BODY_DMG_RETAIN = 0.8    # damage kept per body a piercing beam passes through
@@ -129,15 +130,15 @@ ROSTER: dict[str, Weapon] = {
         pen=1.8, auto_rof=13.0, auto_accuracy=0.70,
         sound_reach_m=100.0, weight=2.7, str_req=12.5, module_slots=2),
     "combat_shotgun": Weapon(
-        "combat shotgun", "ballistic", 2, 4, 26, 1.0, 0.92, 8, 3.0,
+        "combat shotgun", "ballistic", 2, 4, 26, 2.0, 0.92, 8, 3.0,
         pen=1.6, pellets=5, sound_reach_m=115.0, weight=3.5, str_req=12.5,
         module_slots=1),
     "rail_pistol": Weapon(
-        "rail pistol", "ballistic", 15, 20, 36, 2.0, 0.95, 10, 2.5,
+        "rail pistol", "ballistic", 15, 20, 36, 1.2, 0.95, 10, 2.5,
         pen=4.0, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
         sound_reach_m=95.0, weight=1.4, str_req=8, module_slots=1),
     "rail_rifle": Weapon(
-        "rail rifle", "ballistic", 20, 28, 40, 1.0, 0.97, 15, 2.5,
+        "rail rifle", "ballistic", 20, 28, 40, 0.8, 0.97, 15, 2.5,
         pen=5.0, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
         sound_reach_m=110.0, weight=4.5, str_req=10, module_slots=2),
     "heavy_rifle": Weapon(
@@ -166,7 +167,7 @@ ROSTER: dict[str, Weapon] = {
         pen=1.0, pierce_bodies=True, shield_mult=1.9, health_mult=1.0,
         sound_reach_m=45.0, weight=1.0, str_req=8, module_slots=1),
     "laser_rifle": Weapon(
-        "laser rifle", "laser", 8, 12, 40, 1.0, 0.99, 30, 3.5,
+        "laser rifle", "laser", 8, 12, 40, 2.0, 0.99, 30, 3.5,
         pen=1.2, pierce_bodies=True, shield_mult=1.9, health_mult=1.0,
         sound_reach_m=50.0, weight=4.7, str_req=11, module_slots=2),
     "plasma_pistol": Weapon(
@@ -178,6 +179,13 @@ ROSTER: dict[str, Weapon] = {
         pen=0.0, blast_r=2.2, shield_mult=1.2, health_mult=1.2,
         sound_reach_m=95.0, weight=6.2, str_req=13, module_slots=2),
 }
+
+# Apply the global audible-range trim to every weapon in one place, so the
+# per-weapon figures above stay readable as relative loudness.
+for _w in ROSTER.values():
+    object.__setattr__(_w, "sound_reach_m", round(_w.sound_reach_m * SOUND_SCALE, 1))
+del _w
+
 
 # What the player carries in the prototype - one of each fire type so every
 # code path (single, burst, pellets, piercing beam, explosive) is reachable.

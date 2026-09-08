@@ -65,6 +65,8 @@ PERIPH_RANGE_M = 7.0
 KEEP_MIN_M = 3.5      # back off if the player gets closer than this
 KEEP_MAX_M = 8.0      # advance if the player is further than this
 GUARD_FOOTSTEP_M = 5.0
+RECOIL_TIME = 0.09       # gun-kick timer, seconds (visual only, read by main.py)
+FLASH_TIME = 0.05        # muzzle-flash timer, seconds (visual only)
 DEFAULT_PROFILE = "imperium_soldier"
 
 # Cover-seeking in COMBAT
@@ -95,7 +97,10 @@ class Guard(Combatant):
             shield_regen=base.shield_regen, shield_delay=base.shield_delay,
             faction=base.faction, speed=base.speed)
         self.profile = profile
-        self.weapon = weapons.ROSTER[ENEMY_PROFILES[profile]["weapon"]]
+        # the map/editor may override the profile's default gun per guard
+        wid = getattr(spec, "weapon", None) or ENEMY_PROFILES[profile]["weapon"]
+        self.weapon = weapons.ROSTER.get(
+            wid, weapons.ROSTER[ENEMY_PROFILES[profile]["weapon"]])
         self.id = spec.id
         self.cpm = cells_per_metre
         self.pts = pts
@@ -112,6 +117,10 @@ class Guard(Combatant):
         self._peek_end = 0.0
         self._cur_side = 1.0        # which way this peek leans
         self._peek_last = 1.0       # last side that had a clean shot
+        self.recoil_t = 0.0        # gun-kick timer, decays each update (visual)
+        self.flash_t = 0.0         # muzzle-flash timer (visual)
+        self.flash_roll = 0.0      # per-shot flash spin, degrees
+        self.flash_scale = 1.0     # per-shot flash size jitter
         self._peek_dist = PEEK_OFFSET_M   # how far to lean (wide cover needs more)
         self._flank_dir = 1.0      # committed strafe direction when flanking
         self._flank_until = 0.0
@@ -527,6 +536,11 @@ class Guard(Combatant):
             return None                          # own cover in the way - hold fire
 
         self.fire_cd = w.burst_time
+        if w.blast_r <= 0.0:
+            self.recoil_t = RECOIL_TIME
+            self.flash_t = FLASH_TIME
+            self.flash_roll = random.uniform(-180.0, 180.0)
+            self.flash_scale = random.uniform(0.85, 1.25)
         shots = []
         for _ in range(w.burst):
             if self.mag <= 0:
@@ -549,6 +563,8 @@ class Guard(Combatant):
                sounds, player, rng, emit_cb):
         """Advance one guard. Returns the list of ballistics.Shot it fired."""
         self.fire_cd = max(0.0, self.fire_cd - dt)
+        self.recoil_t = max(0.0, self.recoil_t - dt)
+        self.flash_t = max(0.0, self.flash_t - dt)
         if self.reload_t > 0.0:
             self.reload_t -= dt
             if self.reload_t <= 0.0:
