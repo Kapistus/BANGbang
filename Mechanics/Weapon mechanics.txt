@@ -1,0 +1,61 @@
+- Players can have one main weapon equipped, and additional weapons in backpack.
+  Players can switch weapons by opening the inventory screen and dragging a weapon to their hand slot.
+- Each weapon type consumes its specific ammunition, without any you will not be able to fire your weapon.
+
+Accuracy:
+---------
+
+http://mathworld.wolfram.com/Cone.html
+http://docs.unity3d.com/ScriptReference/Random-insideUnitCircle.html
+
+h = range.
+r = accuracy reverse ( 0 - 1 )... Accuracy = 0.0, r = 0.5 -> d = 1.0. ...
+								  Accuracy = 0.999, r = 0.111 d = 0.22
+angle = arctan ( r / h )
+
+
+IMPLEMENTATION NOTES  (sim/weapons.py, sim/ballistics.py)
+--------------------------------------------------------
+
+Accuracy, as built:
+  r = (0.5 - 0.389 * accuracy) * SPREAD_SCALE
+  per-shot angular error = atan2(r, range), sampled triangular so shots
+      cluster near the centre
+  beyond the optimal range, r blows up: r *= 1 + 2*(dist/range - 1)
+  moving multiplies r by 1.10 (the 10% move penalty)
+  There is no damage falloff with distance - range is modelled purely as
+  spread, exactly as the bible describes.
+
+Fire modes:
+  Each weapon has a primary mode (semi, or a fixed-size burst) and some also
+  have a full-auto alternate mode, toggled in play with the "b" key:
+    - combat rifle: primary 3-round burst @ ~0.55 s cycle; alt full-auto
+      6 rounds/s at reduced accuracy (0.96 -> 0.83)
+    - SMG: primary semi @ 8/s; alt full-auto 13 rounds/s at reduced accuracy
+      (0.87 -> 0.70)
+  Full-auto trades accuracy for rate of fire; SMG is the faster, looser one.
+
+Rocket launcher:
+  Reloads after every shot (magazine of 1), overriding the bible's listed
+  "2 shots before reloading".
+
+Penetration:
+  - Cover: every solid tile has a pen_cost (wall/pillar 3.5, door 1.8, low
+    cover 1.2, glass 0.3). A weapon has a penetration budget; the first face
+    of each piece of cover a shot crosses spends that tile's pen_cost, and
+    each cover pierced multiplies the surviving damage by 0.6. Budget goes
+    negative -> the shot stops in that cover. Explosives (0 budget) stop on
+    the first thing they touch.
+  - Bodies: rail and laser weapons ("pierce_bodies") pass through a target
+    that had NO shields, losing 20% of their damage each time, and stop on
+    the first target that did have shields. Every other weapon stops on the
+    first body.
+
+Glass:
+  Windows let a shot straight through for a token penetration cost and no
+  damage penalty, and the pane shatters into a permanent hole - bullets and
+  line of sight then pass freely, the frame still blocks movement, and the
+  sound cost of that tile drops. The break is loud (audible ~15 m). An
+  explosive round detonates on the pane instead of passing.
+
+See "Damage model.txt" for how a hit that lands is resolved.

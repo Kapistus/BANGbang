@@ -1,0 +1,103 @@
+DAMAGE MODEL  (as implemented in the prototype)
+==============================================
+
+This file records how damage actually resolves in code (sim/combat.py,
+sim/ballistics.py, sim/weapons.py). The per-weapon and per-enemy stat blocks
+elsewhere in mechanics/ are the design targets; the numbers below are what the
+running prototype uses, trimmed for readable, decisive fights.
+
+
+RESOLUTION ORDER
+----------------
+A hit is resolved shields -> armor -> health:
+
+  1. SHIELDS absorb first. Each weapon carries a shield multiplier:
+       - ballistic / heavy      1.0   (neutral)
+       - energy (pulse, laser)  1.9   (energy is the anti-shield answer)
+       - rail                   0.4   (rail barely dents shields; it is the
+                                       anti-armor / anti-flesh answer)
+     When a hit would take the shield below zero, the leftover crosses to
+     health at the raw (pre-multiplier) rate. Explosive splash also hits
+     shields first.
+
+  2. ARMOR is a percentage reduction on the health portion only.
+     1 armor point = 1% less damage, per the bible. Rolled per hit inside the
+     item's armor band (e.g. a soldier's 18-35). Capped at 80%.
+
+  3. HEALTH is what remains. Zero health kills. Shields do not gate death;
+     they are a buffer, not a second health bar.
+
+Health is deliberately a small core. Armor carries the sustained mitigation;
+shields are a thin buffer you spend once per engagement.
+
+
+GLOBAL DAMAGE SCALE
+-------------------
+weapons.DMG_SCALE = 4.0 multiplies every weapon's rolled damage. The bible's
+base figures (pistol 3-4, rifle 3-5) were written for a different pace; at
+bible-scale health pools they produce 15-20 second time-to-kill. The scale
+brings that into single digits.
+
+Open problem: the bible's per-level Conditioning term inflates health as
+characters level. DMG_SCALE will eventually need a matching level term, or
+enemies must stay near their base pools.
+
+
+DIFFICULTY HOOK
+---------------
+Combatant.incoming_mult scales all damage a character takes (this is the
+Difficulty.txt "enemies deal X% damage" lever). Default 1.0. The player is
+NOT given a discount - survival is meant to come from armor and shields, not
+from a hidden mitigation.
+
+
+SHIELD REGENERATION
+-------------------
+Shields regenerate only after a lull with no damage taken, then slowly:
+
+                     delay after last hit    regen rate
+  player (Commando)        6 s                3.5 / s      (~20 s to refill)
+  enemies                  7 s                2 / s
+
+Once shields break in a fight they stay broken for the rest of it. Regen is
+a between-fights recovery, not something you out-heal under fire. (Design
+intent from Statsystem.txt is that recharge scales with the Logic stat; the
+prototype uses the fixed rates above.)
+
+
+PROTOTYPE POOLS
+---------------
+Player (Commando L1, debug starter kit - no loot system yet):
+  ~78 health, ~57 shields, 20% armor.
+  A bare Commando (Leather 3% / ~17 shields) folds in about a second of fire.
+
+Enemies (sim/combat.py ENEMY_PROFILES) - human factions run thin:
+  Imperium soldier        70 hp / 14 sh / 18-35% armor
+  Imperium squad leader   95 hp / 14 sh / 18-35%
+  Pirate                  75 hp / 40 sh / 11-23%
+  Scavenger               35 hp /  0 sh /  0-11%
+  Consortium drone        50 hp / 200 sh / 20%   (shield archetype - unchanged)
+  Consortium controller   80 hp / 360 sh / 20%   (shield archetype - unchanged)
+
+The Consortium keeps its large shield pools on purpose: that archetype exists
+to force the player onto energy weapons.
+
+
+TIME-TO-KILL TARGETS
+--------------------
+Point blank, every round hitting (the worst case; real fights run 2-4x longer
+once range spread and cover are involved):
+
+                    scavenger   soldier    shield tank (drone)
+  pistol              ~1.1 s     ~3.6 s      ~9.8 s  (near useless)
+  combat rifle burst  <1 s       ~1.2 s      ~2.8 s
+  combat shotgun      1 shell    ~1.0 s      ~4.0 s
+  rail rifle          1 shot     ~1.0 s      ~6.0 s
+  pulse carbine       ~0.5 s     ~1.1 s      ~2.6 s  (best vs shields)
+  rocket launcher     1 shot     1 shot      1 shot
+
+  guard combat rifle -> naked player   ~0.6 s
+  guard combat rifle -> geared player  ~1.7 s
+
+Pistols are a backup that armor shrugs off. Naked targets drop almost
+instantly. Shields and armor are what let anything trade fire at all.

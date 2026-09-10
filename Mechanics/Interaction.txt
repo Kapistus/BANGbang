@@ -1,0 +1,15 @@
+Interacting with items:
+
+- Holding ALT-key or mouse-overing will edge-highlight any nearby lootable containers, interactable items / consoles and any dead enemies.
+- Left-clicking will interact with mouse-overed target.
+
+Loot containers:
+
+Chest:
+	May contain credits, ammunition, medical supplies, weapons, armor, modules.
+Locker:
+	May contain ammunition, medical supplies and weapons, modules, armor.
+Safe:
+	May contain ammunition or credits.
+Enemies:
+	Everything, depending from enemy type.
