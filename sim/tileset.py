@@ -31,6 +31,9 @@ class TileDef:
     door: bool
     glass: bool
     bush: bool
+    overlay: bool               # draw ON TOP of characters (foliage canopy etc.)
+    encloses: bool              # a full-height barrier that seals a room for roofing
+    group: str                  # editor palette group ("" = base); purely UI
     colour: tuple[int, int, int]
 
 
@@ -80,6 +83,10 @@ def load_tileset(path: str | Path | None = None) -> Tileset:
         wk = bool(spec.get("is_walkable", True))
         bl = bool(spec.get("blocks_los", False))
         bs = bool(spec.get("blocks_shots", False))
+        gl = bool(spec.get("glass", False))
+        # a full-height barrier: not walkable, and either opaque or a glass pane.
+        # low cover (walkable F, see-through, no glass) does NOT enclose.
+        enc = (not wk) and ((not st) or gl)
         out[tid] = TileDef(
             id=tid,
             name=spec.get("name", tid.replace("_", " ").title()),
@@ -94,8 +101,11 @@ def load_tileset(path: str | Path | None = None) -> Tileset:
             footstep_mult=float(spec.get("footstep_mult", 1.0)),
             pen_cost=float(spec.get("pen_cost", _derive_pen_cost(wk, bl, bs))),
             door=bool(spec.get("door", False)),
-            glass=bool(spec.get("glass", False)),
+            glass=gl,
             bush=bool(spec.get("bush", tid == "bush")),
+            overlay=bool(spec.get("overlay", spec.get("bush", tid == "bush"))),
+            encloses=bool(spec.get("encloses", enc)),
+            group=str(spec.get("group", "")),
             colour=tuple(spec.get("colour", (180, 180, 180))),
         )
     return Tileset(

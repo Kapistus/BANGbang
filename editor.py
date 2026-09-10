@@ -22,9 +22,13 @@ Mouse
 
 Keys
     s  save        S  save as        l  load        n  new map
-    g  grid on/off      p  paint mode
+    g  grid on/off      p  paint mode      f  roof preview on/off
+    w  toggle placing tiles as Floor / Wall (walls are solid + drawn darker)
+    Tab / Shift+Tab  next / prev tileset page in the palette
     o  set player spawn (then click a cell)
     k  add guard: click waypoints, Enter to finish, Backspace undo point
+    L  light mode: click to place a lamp; wheel = intensity, shift+wheel = radius
+       (or r / i keys, +shift to lower); RMB/Del remove
     [ ]  cycle the guard's weapon - the route under the cursor, or the
          default for the next route (combat rifle by default)
     c  clear all guards        del  erase hovered object
@@ -37,9 +41,11 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import pygame
 
 from sim import mapfile, sprites, weapons
+from sim.tilemap import FLOOR_DARKEN, WALL_LIGHTEN, enclosed_mask
 from sim.tileset import load_tileset
 
 ROOT = Path(__file__).resolve().parent
@@ -47,8 +53,9 @@ MAPS_DIR = ROOT / "maps"
 GUARD_WEAPONS = ["combat_rifle", "smg", "combat_shotgun", "pistol",
                  "rail_rifle", "laser_rifle", "rocket_launcher"]
 GUARD_SKILLS = ["veteran", "seasoned", "rookie"]
-PANEL_W = 210
+PANEL_W = 240
 STATUS_H = 26
+TILE_ICON = 96          # palette preview size (was 24)
 BG = (26, 26, 24)
 PANEL_BG = (20, 20, 19)
 TEXT = (222, 220, 212)
@@ -57,6 +64,9 @@ SEL = (239, 159, 39)
 GRIDLN = (60, 60, 58)
 SPAWN_C = (29, 158, 117)
 GUARD_C = (216, 90, 48)
+LIGHT_C = (240, 210, 120)
+DEF_LIGHT_RADIUS = 5.0
+DEF_LIGHT_INTENSITY = 1.0
 
 MIN_ZOOM, MAX_ZOOM = 8, 48
 DEF_ZOOM = 18             # px per cell (a cell is mapfile cell_m metres)
@@ -146,19 +156,72 @@ class Editor:
         self.cam_x = PANEL_W + 20
         self.cam_y = 20
         self.sel = self.ts.default_floor
+        self.place_role = "floor"           # floor | wall  (w toggles; specials ignore)
+        self.groups = self._tile_groups()   # palette pages: "base" + each group
+        self.tile_group = self.groups[0]
         self.mode = "paint"                 # paint | spawn | guard
         self.guard_wip = []
         self.guard_weapon = "combat_rifle"  # gun for the next route ([ ] / , . cycle)
         self.guard_skill = "veteran"        # aim tier for the next route (t cycles)
+        self.light_radius = DEF_LIGHT_RADIUS      # next placed light ([ ] adjust)
+        self.light_intensity = DEF_LIGHT_INTENSITY  # next placed light (, . adjust)
         self.toast = ""
         self.toast_t = 0
         self.show_grid = True
+        self.show_roof = True               # f : auto-roof (enclosed area) preview
         self.panel_scroll = 0
         self.rows_hit = []                  # (rect, kind, value) filled per frame
         self.painting = self.erasing = self.panning = False
         self.pan_from = (0, 0)
 
     # -- geometry ----------------------------------------------------
+
+    def _generic_tds(self):
+        """Non-special TileDefs (art tiles you paint as Floor or Wall)."""
+        return [td for td in self.ts.tiles.values() if not self._is_special(td)]
+
+    def _special_tds(self):
+        return [td for td in self.ts.tiles.values() if self._is_special(td)]
+
+    def _tile_groups(self):
+        """Palette pages: 'base' (ungrouped generic tiles) then each named
+        group, sorted."""
+        tds = self._generic_tds()
+        pages = ["base"] if any(not td.group for td in tds) else []
+        pages += sorted({td.group for td in tds if td.group})
+        return pages or ["base"]
+
+    def _group_tiles(self):
+        """Generic TileDefs on the active palette page."""
+        return [td for td in self._generic_tds()
+                if (td.group or "base") == self.tile_group]
+
+    def cycle_group(self, step):
+        if len(self.groups) < 2:
+            return
+        i = (self.groups.index(self.tile_group) + step) % len(self.groups)
+        self.tile_group = self.groups[i]
+        self.panel_scroll = 0
+        page = self._group_tiles()
+        if page and self.sel not in {td.id for td in page}:
+            self.sel, self.mode = page[0].id, "paint"
+        self._flash(f"tileset: {self.tile_group}")
+
+    def _roof_mask(self):
+        """Coarse bool of cells the game will auto-roof: sealed off from the
+        map border by a closed loop of enclosing object tiles (walls, window
+        frames, doors). Recomputed live so painting a wall shows its roof."""
+        ts = self.ts
+        obj = self.doc["object"]
+        enc = np.zeros((self.rows, self.cols), dtype=bool)
+        for r in range(self.rows):
+            row = obj[r]
+            for c in range(self.cols):
+                o = row[c]
+                # any object cell seals a room except a bush (walkable foliage)
+                if o and o in ts and not ts[o].bush:
+                    enc[r, c] = True
+        return enclosed_mask(enc)
 
     def _cell_m(self):
         return float(getattr(self, "doc", {}).get("cell_m", 1.0)) if hasattr(
@@ -168,6 +231,17 @@ class Editor:
         z = self.zoom
         self.disp = {k: pygame.transform.smoothscale(v, (z, z))
                      for k, v in self.native.items()}
+        # role-tinted copies (mirror sim/tilemap): floor darker, wall lighter
+        dk = int(round(255 * FLOOR_DARKEN))
+        lt = int(round(255 * WALL_LIGHTEN))
+        self.disp_floor, self.disp_wall = {}, {}
+        for k, s in self.disp.items():
+            f = s.copy()
+            f.fill((dk, dk, dk, 255), special_flags=pygame.BLEND_RGB_MULT)
+            self.disp_floor[k] = f
+            wv = s.copy()
+            wv.fill((lt, lt, lt, 0), special_flags=pygame.BLEND_RGB_ADD)
+            self.disp_wall[k] = wv
         # zoom is px per cell; a cell is cell_m metres, so px-per-metre is
         # zoom / cell_m. Characters then preview at true in-game size.
         self.bank.set_scale(z / self._cell_m() / sprites.ART_PPM)
@@ -197,16 +271,29 @@ class Editor:
         if self.mode == "guard":
             self.guard_wip.append([c + 0.5, r + 0.5])
             return
+        if self.mode == "light":
+            self.doc.setdefault("lights", []).append(
+                {"pos": [c + 0.5, r + 0.5], "radius": self.light_radius,
+                 "intensity": self.light_intensity})
+            self.dirty = True
+            return
         if erase:
             if self.doc["object"][r][c]:
                 self.doc["object"][r][c] = ""
                 self.dirty = True
             return
         td = self.ts[self.sel]
-        grid = self.doc["floor"] if td.layer == "floor" else self.doc["object"]
+        # door / window / bush always land on the object layer; every other
+        # tile follows the Floor / Wall toggle
+        as_wall = self._is_special(td) or self.place_role == "wall"
+        grid = self.doc["object"] if as_wall else self.doc["floor"]
         if grid[r][c] != self.sel:
             grid[r][c] = self.sel
             self.dirty = True
+
+    @staticmethod
+    def _is_special(td):
+        return bool(td.door or td.glass or td.bush)
 
     def commit_guard(self):
         if len(self.guard_wip) >= 1:
@@ -233,6 +320,39 @@ class Editor:
             self.dirty = True
             return True
         return False
+
+    def light_near(self, mx, my):
+        c, r = self.cell_at(mx, my)
+        cx, cy = c + 0.5, r + 0.5
+        best, bd = None, 1.2
+        for lt in self.doc.get("lights", []):
+            d = math.hypot(lt["pos"][0] - cx, lt["pos"][1] - cy)
+            if d < bd:
+                best, bd = lt, d
+        return best
+
+    def delete_light_near(self, mx, my):
+        lt = self.light_near(mx, my)
+        if lt is not None:
+            self.doc["lights"].remove(lt)
+            self.dirty = True
+            return True
+        return False
+
+    def tune_light(self, mx, my, dr=0.0, di=0.0):
+        """[ ] adjust radius, , . adjust intensity - of the light under the
+        cursor, else the next-placed default."""
+        lt = self.light_near(mx, my)
+        if lt is not None:
+            lt["radius"] = round(min(40.0, max(1.0, lt["radius"] + dr)), 1)
+            lt["intensity"] = round(min(20.0, max(0.1, lt["intensity"] + di)), 2)
+            self.dirty = True
+            self._flash(f"light  r{lt['radius']}  i{lt['intensity']}")
+        else:
+            self.light_radius = round(min(40.0, max(1.0, self.light_radius + dr)), 1)
+            self.light_intensity = round(
+                min(20.0, max(0.1, self.light_intensity + di)), 2)
+            self._flash(f"next light  r{self.light_radius}  i{self.light_intensity}")
 
     def _flash(self, text):
         self.toast = text
@@ -324,43 +444,65 @@ class Editor:
 
         def row(label, kind, value, sprite=None, active=False):
             nonlocal y
-            rect = pygame.Rect(6, y, PANEL_W - 12, 30)
-            if 0 <= y <= h:
+            rh = (TILE_ICON + 8) if sprite is not None else 30
+            rect = pygame.Rect(6, y, PANEL_W - 12, rh)
+            if y + rh > 0 and y < h:
                 if active:
                     pygame.draw.rect(self.screen, (48, 42, 20), rect)
                     pygame.draw.rect(self.screen, SEL, rect, 1)
+                col = TEXT if active else DIM
                 if sprite is not None:
-                    self.screen.blit(pygame.transform.smoothscale(sprite, (24, 24)),
-                                     (10, y + 3))
-                tx = 40 if sprite is not None else 12
-                self.screen.blit(self.font.render(label, True,
-                                 TEXT if active else DIM), (tx, y + 8))
+                    self.screen.blit(
+                        pygame.transform.smoothscale(sprite, (TILE_ICON, TILE_ICON)),
+                        (10, y + 4))
+                    self.screen.blit(self.font.render(label, True, col),
+                                     (TILE_ICON + 18, y + rh // 2 - 7))
+                else:
+                    self.screen.blit(self.font.render(label, True, col),
+                                     (12, y + 8))
             self.rows_hit.append((rect, kind, value))
-            y += 32
+            y += rh + 2
 
         row("[ set player spawn ]  o", "mode", "spawn", active=self.mode == "spawn")
         row("[ guard route ]  k", "mode", "guard", active=self.mode == "guard")
+        row("[ light ]  L", "mode", "light", active=self.mode == "light")
         row("[ paint / erase ]  p", "mode", "erase", active=self.mode == "paint")
+        y += 4
+
+        # Floor / Wall placement toggle  (w)
+        box = "[x]" if self.place_role == "wall" else "[ ]"
+        row(f"{box} place as WALL   w", "role", None,
+            active=self.place_role == "wall")
         y += 6
-        for layer in ("floor", "object"):
+
+        # tileset page switcher: < name (i/N) >  (Tab / click the arrows)
+        if len(self.groups) > 1:
+            gr = pygame.Rect(6, y, PANEL_W - 12, 24)
+            half = gr.width // 2
             if 0 <= y <= h:
-                self.screen.blit(self.small.render(layer.upper(), True, SEL),
-                                 (10, y))
+                pygame.draw.rect(self.screen, (40, 40, 38), gr)
+                pygame.draw.rect(self.screen, SEL, gr, 1)
+                i = self.groups.index(self.tile_group) + 1
+                cap = f"{self.tile_group}  {i}/{len(self.groups)}"
+                ct = self.small.render(cap, True, TEXT)
+                self.screen.blit(ct, (gr.centerx - ct.get_width() // 2, y + 6))
+                self.screen.blit(self.font.render("<", True, SEL), (gr.x + 7, y + 4))
+                self.screen.blit(self.font.render(">", True, SEL),
+                                 (gr.right - 15, y + 4))
+            self.rows_hit.append((pygame.Rect(gr.x, y, half, 24), "group", -1))
+            self.rows_hit.append((pygame.Rect(gr.x + half, y, half, 24), "group", 1))
+            y += 30
+
+        for head, tds in (("TILES", self._group_tiles()),
+                          ("SPECIAL", self._special_tds())):
+            if not tds:
+                continue
+            if 0 <= y <= h:
+                self.screen.blit(self.small.render(head, True, SEL), (10, y))
             y += 16
-            for td in self.ts.by_layer(layer):
+            for td in tds:
                 row(td.name, "tile", td.id, self.native[td.id],
                     active=self.mode == "paint" and self.sel == td.id)
-        y += 8
-        if 0 <= y <= h:
-            t = self.ts[self.sel]
-            for i, ln in enumerate((
-                f"see_through {t.is_see_through}",
-                f"walkable    {t.is_walkable}",
-                f"blocks_los  {t.blocks_los}",
-                f"blocks_shots {t.blocks_shots}",
-            )):
-                self.screen.blit(self.small.render(ln, True, DIM),
-                                 (12, y + i * 14))
 
     def panel_click(self, mx, my):
         for rect, kind, value in self.rows_hit:
@@ -369,6 +511,11 @@ class Editor:
                     self.sel, self.mode = value, "paint"
                 elif kind == "mode":
                     self.mode = value if value != "erase" else "paint"
+                elif kind == "group":
+                    self.cycle_group(value)
+                elif kind == "role":
+                    self.place_role = ("wall" if self.place_role == "floor"
+                                       else "floor")
                 return
 
     # -- main view -----------------------------------------------
@@ -381,15 +528,22 @@ class Editor:
         r0 = max(0, int((0 - self.cam_y) / self.zoom))
         c1 = min(self.cols, int((w - self.cam_x) / self.zoom) + 1)
         r1 = min(self.rows, int((h - self.cam_y) / self.zoom) + 1)
+        canopy = []            # overlay tiles - drawn after the characters
         for r in range(r0, r1):
             for c in range(c0, c1):
                 rect = self.cell_rect(c, r)
-                self.screen.blit(self.disp[self.doc["floor"][r][c]
-                                 if self.doc["floor"][r][c] in self.disp
-                                 else self.ts.default_floor], rect)
+                fid = self.doc["floor"][r][c]
+                self.screen.blit(self.disp_floor[fid if fid in self.disp_floor
+                                                 else self.ts.default_floor], rect)
                 obj = self.doc["object"][r][c]
                 if obj and obj in self.disp:
-                    self.screen.blit(self.disp[obj], rect)
+                    otd = self.ts[obj] if obj in self.ts else None
+                    if otd is not None and otd.overlay:
+                        canopy.append((obj, rect))
+                    elif otd is not None and self._is_special(otd):
+                        self.screen.blit(self.disp[obj], rect)      # door/window
+                    else:
+                        self.screen.blit(self.disp_wall[obj], rect)  # wall = lighter
         if self.show_grid and self.zoom >= 10:
             for c in range(c0, c1 + 1):
                 x = self.cam_x + c * self.zoom
@@ -404,6 +558,18 @@ class Editor:
                          (self.cam_x, self.cam_y,
                           self.cols * self.zoom, self.rows * self.zoom), 1)
         self._draw_entities()
+        for obj, rect in canopy:
+            self.screen.blit(self.disp[obj], rect)
+        if self.show_roof:
+            # live auto-roof preview: translucent wash over every enclosed cell
+            mask = self._roof_mask()
+            wash = pygame.Surface((self.zoom, self.zoom), pygame.SRCALPHA)
+            wash.fill((0, 0, 0, 205))
+            for r in range(r0, r1):
+                mr = mask[r]
+                for c in range(c0, c1):
+                    if mr[c]:
+                        self.screen.blit(wash, self.cell_rect(c, r))
         # hover
         mx, my = pygame.mouse.get_pos()
         if mx >= PANEL_W:
@@ -459,6 +625,18 @@ class Editor:
                 self.screen.blit(self.small.render(str(i + 1), True, (0, 0, 0)),
                                  (p[0] - 3, p[1] - 6))
 
+        for lt in self.doc.get("lights", []):
+            lx, ly = self._wpt(lt["pos"])
+            rr = int(lt["radius"] / self._cell_m() * self.zoom)
+            if rr > 2:
+                halo = pygame.Surface((rr * 2, rr * 2), pygame.SRCALPHA)
+                a = int(24 + 46 * min(1.0, lt["intensity"]))
+                pygame.draw.circle(halo, (*LIGHT_C, a), (rr, rr), rr)
+                self.screen.blit(halo, (lx - rr, ly - rr))
+                pygame.draw.circle(self.screen, LIGHT_C, (lx, ly), rr, 1)
+            pygame.draw.circle(self.screen, LIGHT_C, (lx, ly), 4)
+            pygame.draw.circle(self.screen, (20, 20, 20), (lx, ly), 4, 1)
+
     def draw_status(self):
         w, h = self.screen.get_size()
         pygame.draw.rect(self.screen, PANEL_BG, (0, h - STATUS_H, w, STATUS_H))
@@ -466,14 +644,20 @@ class Editor:
         c, r = self.cell_at(mx, my)
         cell = f"{c},{r}" if self.in_grid(c, r) else "--"
         name = (self.path.name if self.path else "untitled") + ("*" if self.dirty else "")
-        cur = {"paint": f"tile:{self.sel}", "spawn": "SET SPAWN (click a cell)",
+        cur = {"paint": f"tile:{self.sel} [{self.tile_group}] as {self.place_role.upper()}",
+               "spawn": "SET SPAWN (click a cell)",
                "guard": (f"GUARD  next [{self.guard_weapon} / {self.guard_skill}]  "
                          f"LMB=waypoint  Enter=save  [ ],. =weapon  t=skill  "
                          f"(hover a waypoint to retag)  RMB/Del=delete  "
-                         f"wpts:{len(self.guard_wip)}")
+                         f"wpts:{len(self.guard_wip)}"),
+               "light": (f"LIGHT  next r{self.light_radius} i{self.light_intensity}  "
+                         f"LMB=place  wheel=intensity  shift+wheel=radius  "
+                         f"(r/i keys, +shift to lower)  RMB/Del=remove  "
+                         f"({len(self.doc.get('lights', []))} placed)")
                }[self.mode]
         msg = (f"cell {cell:>7}   {cur}   |   {name}  {self.cols}x{self.rows} "
-               f"z{self.zoom}   s save  l load  n new  o spawn  k guard  g grid")
+               f"z{self.zoom}   s save  l load  n new  o spawn  k guard  g grid"
+               f"  f roof{'' if self.show_roof else ':off'}")
         self.screen.blit(self.font.render(msg, True, DIM), (8, h - STATUS_H + 6))
         if self.toast and pygame.time.get_ticks() - self.toast_t < 2000:
             t = self.small.render(self.toast, True, SEL)
@@ -536,11 +720,24 @@ class Editor:
         if k == pygame.K_s:
             self.do_save(as_new=bool(shift))
         elif k == pygame.K_l:
-            self.do_load()
+            if shift:
+                if self.mode == "guard":
+                    self.commit_guard()
+                self.mode = "light"
+            else:
+                self.do_load()
         elif k == pygame.K_n:
             self.do_new()
         elif k == pygame.K_g:
             self.show_grid = not self.show_grid
+        elif k == pygame.K_TAB:
+            self.cycle_group(-1 if shift else 1)
+        elif k == pygame.K_w:
+            self.place_role = "wall" if self.place_role == "floor" else "floor"
+            self._flash(f"placing as {self.place_role}")
+        elif k == pygame.K_f:
+            self.show_roof = not self.show_roof
+            self._flash(f"auto-roof preview {'on' if self.show_roof else 'off'}")
         elif k == pygame.K_p:
             if self.mode == "guard":
                 self.commit_guard()          # don't lose a route in progress
@@ -556,11 +753,24 @@ class Editor:
         elif k == pygame.K_c and self.mode != "guard":
             self.doc["guards"] = []
             self.dirty = True
+        elif k == pygame.K_r and self.mode == "light":
+            mx, my = pygame.mouse.get_pos()
+            self.tune_light(mx, my, dr=-1.0 if shift else 1.0)
+        elif k == pygame.K_i and self.mode == "light":
+            mx, my = pygame.mouse.get_pos()
+            self.tune_light(mx, my, di=-0.25 if shift else 0.25)
         elif k in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
                    pygame.K_COMMA, pygame.K_PERIOD):
             mx, my = pygame.mouse.get_pos()
-            back = k in (pygame.K_LEFTBRACKET, pygame.K_COMMA)
-            self.cycle_guard_weapon(mx, my, -1 if back else 1)
+            if self.mode == "light":
+                self.tune_light(
+                    mx, my,
+                    dr={pygame.K_LEFTBRACKET: -0.5, pygame.K_RIGHTBRACKET: 0.5}
+                    .get(k, 0.0),
+                    di={pygame.K_COMMA: -0.1, pygame.K_PERIOD: 0.1}.get(k, 0.0))
+            else:
+                back = k in (pygame.K_LEFTBRACKET, pygame.K_COMMA)
+                self.cycle_guard_weapon(mx, my, -1 if back else 1)
         elif k == pygame.K_t:
             mx, my = pygame.mouse.get_pos()
             self.cycle_guard_skill(mx, my, -1 if shift else 1)
@@ -570,7 +780,7 @@ class Editor:
             self.guard_wip.pop()
         elif k in (pygame.K_DELETE, pygame.K_BACKSPACE):
             mx, my = pygame.mouse.get_pos()
-            if not self.delete_guard_near(mx, my):
+            if not self.delete_guard_near(mx, my) and not self.delete_light_near(mx, my):
                 self.apply(mx, my, erase=True)
         return True
 
@@ -586,6 +796,8 @@ class Editor:
         elif ev.button == 3:
             if self.mode == "guard":
                 self.delete_guard_near(mx, my)   # RMB a route to remove it
+            elif self.mode == "light":
+                self.delete_light_near(mx, my)
             else:
                 self.erasing = True
                 self.apply(mx, my, erase=True)
@@ -609,6 +821,14 @@ class Editor:
         mx, my = pygame.mouse.get_pos()
         if mx < PANEL_W:
             self.panel_scroll = max(0, self.panel_scroll - ev.y * 40)
+            return
+        if self.mode == "light":
+            keys = pygame.key.get_pressed()
+            shift = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+            if shift:
+                self.tune_light(mx, my, dr=ev.y * 1.0)
+            else:
+                self.tune_light(mx, my, di=ev.y * 0.25)
             return
         old = self.zoom
         self.zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom + ev.y * 2))

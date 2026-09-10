@@ -31,7 +31,9 @@ from pathlib import Path
 
 import numpy as np
 
-from sim.tilemap import GuardSpec, IdleSpot, Light, Tile, TileMap, _expand
+from sim.tilemap import (GuardSpec, IdleSpot, Light, Tile, TileMap, _expand,
+                         bake_lightmap, compute_roof, darken, lighten,
+                         WALL_PEN_COST, WALL_SOUND_COST)
 from sim.tileset import Tileset, load_tileset
 
 FORMAT = "bangbang-map/1"
@@ -75,12 +77,9 @@ def load_doc(path: str | Path) -> dict:
     return doc
 
 
-def effective_id(doc: dict, r: int, c: int, ts: Tileset) -> str:
-    obj = doc["object"][r][c]
-    if obj and obj in ts:
-        return obj
-    flr = doc["floor"][r][c]
-    return flr if flr in ts else ts.default_floor
+def _is_special(td) -> bool:
+    """door / window / bush keep their own behaviour and ignore Floor/Wall."""
+    return bool(td.door or td.glass or td.bush)
 
 
 def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
@@ -102,6 +101,8 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
     pc = np.zeros((rows, cols), dtype=np.float32)
     gl = np.zeros((rows, cols), dtype=bool)
     bu = np.zeros((rows, cols), dtype=bool)
+    en = np.zeros((rows, cols), dtype=bool)      # static enclosing tile (no doors)
+    dcz = np.zeros((rows, cols), dtype=bool)     # door tile here
 
     chars = np.empty((rows, cols), dtype="<U1")
     tiles: dict[str, Tile] = {}
@@ -109,27 +110,54 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
 
     for r in range(rows):
         for c in range(cols):
-            tid = effective_id(doc, r, c, ts)
-            td = ts[tid]
-            bm[r, c] = not td.is_walkable
-            bs[r, c] = td.blocks_los
-            bb[r, c] = td.blocks_shots
-            sc[r, c] = td.sound_cost
-            fm[r, c] = td.footstep_mult
-            pc[r, c] = td.pen_cost
-            gl[r, c] = td.glass
-            bu[r, c] = td.bush
-            ch = char_of.get(tid)
+            fid = doc["floor"][r][c]
+            ftd = ts[fid] if fid in ts else ts[ts.default_floor]
+            oid = doc["object"][r][c]
+            otd = ts[oid] if (oid and oid in ts) else None
+
+            if otd is not None and _is_special(otd):
+                # door / window / bush: keep the tile's own semantics
+                bm[r, c] = not otd.is_walkable
+                bs[r, c] = otd.blocks_los
+                bb[r, c] = otd.blocks_shots
+                sc[r, c] = otd.sound_cost
+                fm[r, c] = otd.footstep_mult
+                pc[r, c] = otd.pen_cost
+                gl[r, c] = otd.glass
+                bu[r, c] = otd.bush
+                en[r, c] = otd.encloses and not otd.door and not otd.bush
+                dcz[r, c] = otd.door
+                cell_td, role = otd, "obj"
+            elif otd is not None:
+                # any tile painted as a WALL
+                bm[r, c] = bs[r, c] = bb[r, c] = True
+                sc[r, c] = WALL_SOUND_COST
+                fm[r, c] = 1.0
+                pc[r, c] = WALL_PEN_COST
+                en[r, c] = True
+                cell_td, role = otd, "wall"
+            else:
+                # floor: walkable, see-through; keep the tile's step/sound flavour
+                sc[r, c] = ftd.sound_cost if ftd.sound_cost else 1.0
+                fm[r, c] = ftd.footstep_mult
+                cell_td, role = ftd, "floor"
+
+            key = (cell_td.id, role)
+            ch = char_of.get(key)
             if ch is None:
                 ch = _CHAR_POOL[len(char_of) % len(_CHAR_POOL)]
-                char_of[tid] = ch
+                char_of[key] = ch
+                col = (lighten(cell_td.colour) if role == "wall"
+                       else darken(cell_td.colour) if role == "floor"
+                       else tuple(cell_td.colour))
                 tiles[ch] = Tile(
-                    char=ch, name=td.name,
-                    blocks_move=not td.is_walkable, blocks_sight=td.blocks_los,
-                    blocks_bullets=td.blocks_shots, sound_cost=td.sound_cost,
-                    footstep_mult=td.footstep_mult, pen_cost=td.pen_cost,
-                    door=td.door, glass=td.glass, bush=td.bush,
-                    colour=tuple(td.colour))
+                    char=ch, name=cell_td.name,
+                    blocks_move=bool(bm[r, c]), blocks_sight=bool(bs[r, c]),
+                    blocks_bullets=bool(bb[r, c]), sound_cost=float(sc[r, c]),
+                    footstep_mult=float(fm[r, c]), pen_cost=float(pc[r, c]),
+                    door=bool(dcz[r, c]), glass=bool(gl[r, c]),
+                    bush=bool(bu[r, c]), encloses=bool(en[r, c]),
+                    colour=col)
             chars[r, c] = ch
 
     guards = [
@@ -160,7 +188,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
         for l in doc.get("lights", [])
     ]
 
-    return TileMap(
+    tm = TileMap(
         name=doc.get("name", Path(path).stem),
         chars=chars,
         tiles=tiles,
@@ -181,4 +209,12 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
         floor_ids=floor_ids,
         object_ids=object_ids,
         tileset=ts,
+        roof_enc=en,
+        roof_doorcells=dcz,
     )
+    # auto-roof: any coarse cell walled/windowed off from the border in a
+    # closed loop. Doors start shut, so they seal here; main.py recomputes
+    # on every toggle. None everywhere if nothing is enclosed.
+    compute_roof(tm, {})
+    tm.lightmap = bake_lightmap(tm)
+    return tm

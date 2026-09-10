@@ -65,7 +65,8 @@ import numpy as np
 import pygame
 
 from sim import ai, audio, ballistics, combat, mapfile, sound, sprites, weapons
-from sim.tilemap import TileMap, load_map, validate_patrols, validate_spawns
+from sim.tilemap import (FLOOR_DARKEN, WALL_LIGHTEN, TileMap, compute_roof,
+                         load_map, validate_patrols, validate_spawns)
 
 
 def load_any_map(path):
@@ -84,7 +85,7 @@ def load_any_map(path):
         + sorted(q.name for q in p.parent.glob("*.toml"))
     raise SystemExit(f"map not found: {path}\n"
                      f"available in {p.parent}/: {', '.join(here) or '(none)'}")
-from sim.vision import ConeSpec, VisibilityCache, line_of_sight
+from sim.vision import ConeSpec, VisibilityCache, line_of_sight, shadowcast
 
 PX_PER_M = 48          # pixels per world metre (fixed; the camera scrolls)
 VIEW_PPM = 48          # 1920x1080 sweet spot: readable characters (~49 px), the
@@ -147,6 +148,30 @@ RESPAWN_DELAY = 1.2
 TRACER_FADE = 0.18
 BLAST_FADE = 0.32
 BACKBLAST_FADE = 0.30       # rocket-launcher exhaust cone behind the shooter
+MUZZLE_LIGHT_TIME = 0.11    # muzzle-flash light: expand+brighten then dim, seconds
+MUZZLE_LIGHT_GAIN = 110     # additive world brighten from a muzzle flash you can see
+MFLASH_BLUR = 3             # fine-cell blur that softens the muzzle-flash light
+                           # (small: it must not spill across a wall it is cast behind)
+MFLASH_POP_GAIN = 180      # brightness of the coloured muzzle-flash glow over the fog
+
+
+def muzzle_light_spec(w) -> tuple:
+    """(rgb, brightness, reach_m) for a weapon's muzzle-flash light, by kind:
+    orange/white for slugthrowers, dim blue for rail, blue-green for plasma,
+    cyan for energy/laser, dim wide orange for the rocket."""
+    n = w.name.lower()
+    cat = w.category
+    if "rail" in n:
+        return (95, 140, 255), 0.55, 1.8
+    if cat == "plasma":
+        return (120, 255, 180), 0.85, 2.6
+    if cat in ("laser", "energy"):
+        return (150, 235, 255), 0.70, 2.2
+    if "rocket" in n:
+        return (255, 195, 140), 0.45, 3.8
+    if "flame" in n:
+        return (255, 150, 65), 0.40, 2.0
+    return (255, 224, 170), 0.9, 2.4            # ballistic + heavy
 NEAR_MISS_M = 1.3          # a shot passing this close to a guard = "shot at"
 INTERACT_RANGE = 1.6
 
@@ -166,9 +191,19 @@ CONE_RANGE_M = (18.0, 14.0, 8.0, 0.0)   # identify shortened so it fits the view
 
 
 # Black overlay alpha per visibility state. 0 = fully lit, 255 = hidden.
-A_UNKNOWN = 248       # never seen: almost nothing shows
+A_UNKNOWN = 255       # never seen: fully hidden - no bleed from lit rooms you
+                      # have no line of sight into
 A_REMEMBERED = 138    # seen before: geometry readable but clearly stale
+CONE_REVEAL = 0.35    # how far the vision cone lifts the veil (1 = clears it to
+                      # a flashlight beam, lower = a faint lightening of the wedge)
+FLASHLIGHT_GAIN = 135    # additive brightness at the beam core (player `l` toggle)
+FLASHLIGHT_BLUR = 5      # fine-cell blur that softens the beam edge + tip
+LIGHT_SEE_MIN = 0.20    # illumination below this reveals nothing (dark = blind)
+LIGHT_SEE_FULL = 0.50   # illumination at/above this gives full perception
+FLASHLIGHT_SELF = 0.55  # how much the flashlight lights the player holding it
 FOG_BLUR_R = 3        # box-blur radius (fine cells) that feathers every fog edge
+ROOF_BLUR_R = 3      # same feather for the roof reveal edge (window / door peek)
+ROOF_REVEAL = 0.02   # cone intensity above which a roofed cell is shown through
 
 GHOST = (150, 96, 72)
 BLIP = (200, 140, 90)
@@ -235,7 +270,17 @@ class ActiveSound:
         return self.elapsed_cells(now) > self.field.max_travel + 20
 
 
-def build_base_surface(m: TileMap) -> pygame.Surface:
+def apply_lightmap(base: pygame.Surface, lm: np.ndarray) -> None:
+    """Multiply the static light map into the base surface (in place). Lights
+    are static, so this is a one-time bake - no per-frame cost."""
+    g = np.clip(lm * 255.0, 0, 255).astype(np.uint8)          # (h, w)
+    tex = pygame.surfarray.make_surface(np.repeat(g.T[:, :, None], 3, axis=2))
+    base.blit(pygame.transform.smoothscale(tex, base.get_size()),
+              (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+
+
+def _flat_base(m: TileMap, world_w: int, world_h: int) -> pygame.Surface:
+    """Legacy .grid maps: one flat colour per cell, no tile art."""
     rows, cols = m.chars.shape
     arr = np.zeros((rows, cols, 3), dtype=np.uint8)
     for ch, t in m.tiles.items():
@@ -243,8 +288,64 @@ def build_base_surface(m: TileMap) -> pygame.Surface:
         if mask.any():
             arr[mask] = t.colour
     small = pygame.surfarray.make_surface(np.transpose(arr, (1, 0, 2)))
-    return pygame.transform.scale(
-        small, (round(m.width_m * PX_PER_M), round(m.height_m * PX_PER_M)))
+    return pygame.transform.scale(small, (world_w, world_h))
+
+
+def build_base_surface(m: TileMap) -> pygame.Surface:
+    """The static map layer. For a .map (which carries floor/object id grids +
+    the tileset) this blits the real tile PNGs, tinted by role - floor cells
+    darker, wall cells lighter. Door cells are left to the dynamic door draw;
+    bush (overlay) is not on the base."""
+    world_w = round(m.width_m * PX_PER_M)
+    world_h = round(m.height_m * PX_PER_M)
+    ts = getattr(m, "tileset", None)
+    fids = getattr(m, "floor_ids", None)
+    if ts is None or fids is None:
+        return _flat_base(m, world_w, world_h)
+
+    oids = m.object_ids
+    rows, cols = fids.shape
+    cell = max(1, round(PX_PER_M * m.metres_per_char))
+    root = ts.path.parent
+    dk = int(round(255 * FLOOR_DARKEN))
+    lt = int(round(255 * WALL_LIGHTEN))
+    cache: dict = {}
+
+    def tile(tid: str, role: str) -> pygame.Surface:
+        got = cache.get((tid, role))
+        if got is not None:
+            return got
+        td = ts.tiles.get(tid)
+        try:
+            img = pygame.image.load(str(root / td.png)).convert_alpha()
+            s = pygame.transform.smoothscale(img, (cell, cell))
+        except Exception:
+            s = pygame.Surface((cell, cell))
+            s.fill(td.colour if td is not None else (150, 150, 150))
+        s = s.copy()
+        if role == "floor":
+            s.fill((dk, dk, dk, 255), special_flags=pygame.BLEND_RGB_MULT)
+        elif role == "wall":
+            s.fill((lt, lt, lt, 0), special_flags=pygame.BLEND_RGB_ADD)
+        cache[(tid, role)] = s
+        return s
+
+    surf = pygame.Surface((world_w, world_h))
+    for r in range(rows):
+        for c in range(cols):
+            x, y = c * cell, r * cell
+            surf.blit(tile(fids[r, c] or ts.default_floor, "floor"), (x, y))
+            oid = oids[r, c]
+            if not oid:
+                continue
+            otd = ts.tiles.get(oid)
+            special = otd is not None and (otd.door or otd.glass or otd.bush)
+            if otd is not None and otd.overlay:
+                continue                      # bush canopy: not on the base
+            if otd is not None and otd.door:
+                continue                      # door: the dynamic door draw owns it
+            surf.blit(tile(oid, "obj" if special else "wall"), (x, y))
+    return surf
 
 
 def field_surface(fine: np.ndarray, rgb, alpha: np.ndarray) -> pygame.Surface:
@@ -471,6 +572,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
     print("sprites:", "on" if bank.ok else "off (circle fallback)")
 
     base = build_base_surface(m)
+    if m.lightmap is not None:
+        apply_lightmap(base, m.lightmap)
     overlays = {
         pygame.K_F2: ("sound_cost", static_overlay(m.sound_cost, m, 1, 9, (239, 159, 39))),
         pygame.K_F3: ("blocks_sight", static_overlay(m.blocks_sight.astype(np.float32), m, 0, 1, (216, 90, 48))),
@@ -522,6 +625,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
     blasts: list = []           # ((x, y), radius_m, t0) for explosion rings
     rockets: list = []          # travelling explosives: dicts, see spawn below
     backblasts: list = []       # {x,y,ang,t0} exhaust cones behind a backblast weapon
+    muzzle_lights: list = []    # {x,y,t0,col,gain,reach} - brief flash of light at a muzzle
     respawn_t = 0.0
     show_cones = False
 
@@ -544,6 +648,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
     # scratch surface for the fog/ripple overlay - only the on-screen slice of
     # the fine grid, recreated when the visible slice changes size (map edges)
     ov_surf = pygame.Surface((_ov_w, _ov_h), pygame.SRCALPHA)
+    roof_surf = pygame.Surface((_ov_w, _ov_h), pygame.SRCALPHA)   # roof pass slice
 
     guards = [ai.Guard(g, cpm) for g in m.guards]
     memory: dict[str, tuple[float, float, float, float]] = {}
@@ -566,6 +671,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
     flash_t = 0.0                  # muzzle-flash timer (player)
     slung = False                  # gun lowered (h) - faster, cannot fire
     raise_t = 0.0                  # bringing a slung gun back up
+    flashlight = False             # l - a beam the shape of the identify cone
     stamina = 1.0                  # 0..1, drained by sprinting
     sprint_locked = False          # true when stamina bottomed out, until STAMINA_UNLOCK
     flash_roll = 0.0               # per-shot flash spin, degrees
@@ -659,10 +765,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
         if bbul[_mcy, _mcx]:
             ox, oy = px_, py_
         travels = w.blast_r > 0.0 and w.projectile_speed > 0.0
+        _fired = False
         for _ in range(rounds if rounds else w.burst):
             if mags[wi] <= 0:
                 break
             mags[wi] -= 1
+            _fired = True
             for _p in range(w.pellets):
                 hd = (base + weapons.pellet_offset(w, rng)
                       + weapons.jitter(w, aim_d, moving, rng, acc))
@@ -693,6 +801,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     hit = live + [player] if player.alive else live
                     ballistics.blast(sh.impact, w.blast_r, w, hit, rng, now)
                     blasts.append((sh.impact, w.blast_r, now))
+        if _fired:
+            _mcol, _mgain, _mreach = muzzle_light_spec(w)
+            muzzle_lights.append({"x": ox, "y": oy, "t0": now, "col": _mcol,
+                                  "gain": _mgain, "reach": _mreach})
         if w.backblast:
             backblasts.append({"x": px_ - math.cos(base) * 0.55,
                                "y": py_ - math.sin(base) * 0.55,
@@ -759,6 +871,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     slung = not slung
                     raise_t = RAISE_TIME if not slung else 0.0
                     msg, msg_t = ("weapon slung" if slung else "weapon ready"), now
+                elif ev.key == pygame.K_l:
+                    flashlight = not flashlight
+                    msg, msg_t = ("flashlight on" if flashlight
+                                  else "flashlight off"), now
                 elif pygame.K_1 <= ev.key <= pygame.K_9:
                     idx = ev.key - pygame.K_1
                     if idx < len(loadout) and idx != wi and swap_t <= 0.0:
@@ -776,15 +892,25 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     if best is None:
                         msg, msg_t = "nothing to interact with", now
                     else:
-                        doors[best] = not doors[best]
-                        set_door(m, cost, best[0], best[1], doors[best])
-                        vis_cache.invalidate()
-                        sounds.clear()
-                        emit(m, cost, best[1] + 0.5, best[0] + 0.5,
-                             e_knock * 0.7, "door", sounds, now, jobs=jobs)
-                        sfx("door")
-                        msg = f"door {'opened' if doors[best] else 'closed'}"
-                        msg_t = now
+                        want_open = not doors[best]
+                        _br, _bc = best
+                        _nx = min(max(px_, _bc), _bc + 1.0)
+                        _ny = min(max(py_, _br), _br + 1.0)
+                        in_leaf = math.hypot(px_ - _nx, py_ - _ny) < BODY_R + 0.05
+                        if not want_open and in_leaf:
+                            # closing the leaf on your own body traps you
+                            msg, msg_t = "stand clear to close the door", now
+                        else:
+                            doors[best] = want_open
+                            set_door(m, cost, best[0], best[1], want_open)
+                            compute_roof(m, doors)
+                            vis_cache.invalidate()
+                            sounds.clear()
+                            emit(m, cost, best[1] + 0.5, best[0] + 0.5,
+                                 e_knock * 0.7, "door", sounds, now, jobs=jobs)
+                            sfx("door")
+                            msg = f"door {'opened' if want_open else 'closed'}"
+                            msg_t = now
                 elif ev.key == pygame.K_p:
                     paused = not paused
                 elif ev.key == pygame.K_c:
@@ -954,6 +1080,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                                    bbul, sounds, player, rng, _gemit):
                     if sh.segments:
                         tracers.append((sh.segments, now))
+                        _o = sh.segments[0][0]
+                        _mc, _mg, _mr = muzzle_light_spec(g.weapon)
+                        muzzle_lights.append({"x": _o[0], "y": _o[1], "t0": now,
+                                              "col": _mc, "gain": _mg, "reach": _mr})
                     if sh.shattered:
                         break_glass(sh.shattered)
                     if g.weapon.blast_r > 0.0:
@@ -988,6 +1118,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                                 and vx_ * fx + vy_ * fy > 0.0):
                             doors[(r_, c_)] = True
                             set_door(m, cost, r_, c_, True)
+                            compute_roof(m, doors)
                             vis_cache.invalidate()
                             sounds.clear()
                             emit(m, cost, c_ + 0.5, r_ + 0.5, e_knock * 0.7,
@@ -1179,11 +1310,99 @@ def main(map_path: str = "maps/arena.toml") -> None:
         inten_raw = vf.cone_intensity(facing, cone)
         prof["vision"] = (time.perf_counter() - _t) * 1000
         h_, w_ = inten_raw.shape
+
+        # player flashlight (l): a warm beam shaped like the identify band - the
+        # narrowest, longest LOS cone - softened at the edge.
+        fl = None
+        if flashlight and not in_bush:
+            fb = vf.bands(facing, cone)
+            # fade to nothing well inside the LOS range so the tip is never a
+            # hard cut-off at the cone edge, then blur the whole beam
+            reach = max(cone.identify_range * 0.9, 1.0)
+            t = np.clip(1.0 - vf.dist / reach, 0.0, 1.0)
+            t = t * t * (3.0 - 2.0 * t)
+            fl = np.where(fb == 1, 1.0,
+                          np.where(fb == 2, 0.35, 0.0)).astype(np.float32) * t
+            fl = box_blur(fl, FLASHLIGHT_BLUR)
+
+        # active muzzle flashes as a brief radial light, shadow-cast from each
+        # flash so a wall stops it, then masked to what the player can see.
+        # `mflash` = mono field (perception + world brighten), `mflash_rgb` =
+        # the per-flash coloured glow drawn over the fog.
+        mflash = None
+        mflash_rgb = None
+        if muzzle_lights:
+            _mf = np.zeros((h_, w_), np.float32)
+            _mrgb = np.zeros((h_, w_, 3), np.float32)
+            for ml in muzzle_lights:
+                _age = (now - ml["t0"]) / MUZZLE_LIGHT_TIME
+                if _age >= 1.0:
+                    continue
+                _b = _age / 0.32 if _age < 0.32 else (1.0 - _age) / 0.68
+                _b = max(0.0, _b) ** 1.25 * ml["gain"]
+                if _b <= 0.02:
+                    continue
+                _fcx, _fcy = m.cell_of(ml["x"], ml["y"])
+                _rc = max(2, int(ml["reach"] * cpm * 1.3))
+                _sf = shadowcast(m.blocks_sight, _fcx, _fcy, _rc)
+                _lit = np.where(
+                    _sf.visible,
+                    np.clip(1.0 - _sf.dist / _rc, 0.0, 1.0) ** 1.6 * _b,
+                    0.0).astype(np.float32)
+                _oy, _ox = _sf.y0 - vf.y0, _sf.x0 - vf.x0
+                _y0, _x0 = max(0, _oy), max(0, _ox)
+                _y1 = min(h_, _oy + _lit.shape[0])
+                _x1 = min(w_, _ox + _lit.shape[1])
+                if _y1 > _y0 and _x1 > _x0:
+                    src = _lit[_y0 - _oy:_y1 - _oy, _x0 - _ox:_x1 - _ox]
+                    np.maximum(_mf[_y0:_y1, _x0:_x1], src,
+                               out=_mf[_y0:_y1, _x0:_x1])
+                    _col = np.array(ml["col"], np.float32) / 255.0
+                    _mrgb[_y0:_y1, _x0:_x1] += src[:, :, None] * _col
+            if _mf.max() > 0.0:
+                _vis = vf.visible.astype(np.float32)
+                _mf = box_blur(_mf, MFLASH_BLUR) * _vis
+                if _mf.max() > 0.0:
+                    mflash = _mf
+                _mrgb *= _vis[:, :, None]
+                if _mrgb.max() > 0.0:
+                    mflash_rgb = _mrgb
+
+        # STATIC illumination (baked lightmap + flashlight) gates what enters
+        # fog memory: a room with no lamp and the flashlight off reveals nothing.
+        if m.lightmap is not None:
+            illum = m.lightmap[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_].astype(np.float32)
+        else:
+            illum = np.zeros((h_, w_), dtype=np.float32)
+        if fl is not None:
+            illum = np.maximum(illum, fl)
+        see = np.clip((illum - LIGHT_SEE_MIN) / (LIGHT_SEE_FULL - LIGHT_SEE_MIN),
+                      0.0, 1.0)
+        gated = inten_raw * see
         if in_bush:
             # hunkered in foliage: you can't see out, only the leaves around you
             bsub = m.bush[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
-            inten_raw = np.where(bsub, inten_raw, 0.0)
-        known[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_] |= inten_raw > 0.03
+            gated = np.where(bsub, gated, 0.0)
+        known[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_] |= gated > 0.03
+        inten_raw = gated                        # fog cone-carve + roof peek use this
+
+        # additive brighten of the world (base surface + characters) under the
+        # flashlight and any muzzle flash - BEFORE the fog, like a real light
+        add = None
+        if fl is not None:
+            add = fl * FLASHLIGHT_GAIN
+        if mflash is not None:
+            _m2 = mflash * MUZZLE_LIGHT_GAIN
+            add = _m2 if add is None else np.maximum(add, _m2)
+        if add is not None and add.max() > 1.0:
+            g = np.clip(add, 0, 255).astype(np.uint8)
+            warm = np.stack([g, (g * 0.94).astype(np.uint8),
+                             (g * 0.82).astype(np.uint8)], axis=2)
+            tex = pygame.surfarray.make_surface(np.transpose(warm, (1, 0, 2)))
+            sc = pygame.transform.smoothscale(
+                tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
+            screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
+                        special_flags=pygame.BLEND_RGB_ADD)
 
         _t = time.perf_counter()
         if show_fog:
@@ -1193,8 +1412,15 @@ def main(map_path: str = "maps/arena.toml") -> None:
             # are lightened (never below their remembered level)
             sub_a = ov_a[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
             lit = inten_raw > 0.004
-            sub_a[lit] = np.minimum(sub_a[lit],
-                                    A_REMEMBER_F * (1.0 - inten_raw[lit]))
+            sub_a[lit] = np.minimum(
+                sub_a[lit],
+                A_REMEMBER_F * (1.0 - CONE_REVEAL * inten_raw[lit]))
+            if mflash is not None:
+                # a muzzle flash briefly parts the veil ONLY where it lights - a
+                # transient lift that never writes `known`
+                _mm = mflash > 0.004
+                mlift = np.clip(mflash[_mm] * 2.2, 0.0, 1.0)
+                sub_a[_mm] = np.minimum(sub_a[_mm], A_REMEMBER_F * (1.0 - mlift))
             # then blur the whole alpha field once: this is what feathers the
             # cone rim, the shadow edges AND the explored/fog boundary - every
             # hard line between "seen now", "remembered" and "unknown" softens
@@ -1264,10 +1490,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
             for r in range(m.chars.shape[0] + 1):
                 pygame.draw.line(screen, (60, 60, 58), (0, r * gpx), (world_w, r * gpx))
 
-        for lt in m.lights:
-            c = (int(lt.pos[0] * PX_PER_M), int(lt.pos[1] * PX_PER_M))
-            pygame.draw.circle(screen, LIGHT, c, 4)
-            pygame.draw.circle(screen, LIGHT, c, int(lt.radius * PX_PER_M), 1)
+        if show_debug:
+            for lt in m.lights:
+                c = (int(lt.pos[0] * PX_PER_M), int(lt.pos[1] * PX_PER_M))
+                pygame.draw.circle(screen, LIGHT, c, 4)
+                pygame.draw.circle(screen, LIGHT, c, int(lt.radius * PX_PER_M), 1)
 
         for s_ in m.idle_spots:
             sx, sy = int(s_.pos[0] * PX_PER_M), int(s_.pos[1] * PX_PER_M)
@@ -1411,6 +1638,17 @@ def main(map_path: str = "maps/arena.toml") -> None:
             screen.blit(cs, (cxp - rr - 2, cyp - rr - 2))
         backblasts = [b for b in backblasts if now - b["t0"] < BACKBLAST_FADE]
 
+        if mflash_rgb is not None:               # coloured muzzle-flash glow,
+            # already shadow-cast per flash + masked to player LOS - no bleed
+            g = np.clip(mflash_rgb * MFLASH_POP_GAIN, 0, 255).astype(np.uint8)
+            tex = pygame.surfarray.make_surface(np.transpose(g, (1, 0, 2)))
+            sc = pygame.transform.smoothscale(
+                tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
+            screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
+                        special_flags=pygame.BLEND_RGB_ADD)
+        muzzle_lights = [m for m in muzzle_lights
+                         if now - m["t0"] < MUZZLE_LIGHT_TIME]
+
         for (bx, by), br, t0 in blasts:
             age = (now - t0) / BLAST_FADE
             if age >= 1.0:
@@ -1428,37 +1666,100 @@ def main(map_path: str = "maps/arena.toml") -> None:
         _t = time.perf_counter()
         ppx, ppy = px_ * PX_PER_M, py_ * PX_PER_M
         down = player.hp <= 0.0
+
+        # the player sprite's brightness + contrast track the light on their
+        # cell (crushed toward a dark silhouette in shadow), lifted by the
+        # flashlight when it is on
+        _pl = float(m.lightmap[pcy, pcx]) if m.lightmap is not None else 0.0
+        if flashlight:
+            _pl = max(_pl, FLASHLIGHT_SELF)
+        if mflash is not None:                   # your own / a nearby muzzle flash
+            _ly, _lx = pcy - vf.y0, pcx - vf.x0
+            if 0 <= _ly < h_ and 0 <= _lx < w_:
+                _pl = max(_pl, float(mflash[_ly, _lx]) * 1.4)
+        _k = min(1.0, max(0.0, (_pl - 0.14) / 0.78))
+        _k = _k * _k * (3.0 - 2.0 * _k)
+        _v = int(3 + (255 - 3) * _k)
+        ptint = (_v, int(_v * 0.97), int(_v * 0.87)) if flashlight else (_v, _v, _v)
+        if down:
+            ptint = tuple(int(c * 0.55) for c in ptint)
+
         drew = False
         if bank.ok:
             if down:
                 drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing,
-                                 tint=(90, 90, 90))
+                                 tint=ptint)
             elif swap_t > 0.0:
                 pose, wsprite = sprites.swap_frame(1.0 - swap_t / sprites.SWAP_TIME,
                                                    loadout[wi])
-                drew = bank.blit(screen, pose, ppx, ppy, facing)
+                drew = bank.blit(screen, pose, ppx, ppy, facing, tint=ptint)
                 if wsprite:
-                    bank.blit(screen, wsprite, ppx, ppy, facing)
+                    bank.blit(screen, wsprite, ppx, ppy, facing, tint=ptint)
             elif reload_t > 0.0:
-                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing)
-                bank.blit(screen, "weapon_sling", ppx, ppy, facing)
+                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing, tint=ptint)
+                bank.blit(screen, "weapon_sling", ppx, ppy, facing, tint=ptint)
             elif slung or raise_t > 0.0:
-                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing)
-                bank.blit(screen, "weapon_sling", ppx, ppy, facing)
+                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing, tint=ptint)
+                bank.blit(screen, "weapon_sling", ppx, ppy, facing, tint=ptint)
             else:
-                drew = bank.blit(screen, "soldier_ready", ppx, ppy, facing)
+                drew = bank.blit(screen, "soldier_ready", ppx, ppy, facing, tint=ptint)
                 kick = recoil_t / sprites.RECOIL_TIME * sprites.RECOIL_M * PX_PER_M
                 gwx = ppx - math.cos(facing) * kick
                 gwy = ppy - math.sin(facing) * kick
-                bank.blit(screen, sprites.weapon_art(loadout[wi]), gwx, gwy, facing)
+                bank.blit(screen, sprites.weapon_art(loadout[wi]), gwx, gwy, facing,
+                          tint=ptint)
                 draw_muzzle(sprites.weapon_art(loadout[wi]), gwx, gwy, facing,
                             flash_t, flash_roll, flash_scale)
+            if drew and not down:
+                # flashlight kit overlay, centred on the body like a weapon.
+                # off = an unlit attachment (follows body light); on = the lamp
+                # itself, drawn full-bright.
+                if flashlight:
+                    bank.blit(screen, "light_on", ppx, ppy, facing)
+                else:
+                    bank.blit(screen, "light_off", ppx, ppy, facing, tint=ptint)
         if not drew:
             pygame.draw.line(screen, FACING, (ppx, ppy),
                              (ppx + math.cos(facing) * 26,
                               ppy + math.sin(facing) * 26), 2)
             pygame.draw.circle(screen, DEAD if down else PLAYER,
                                (int(ppx), int(ppy)), int(BODY_R * PX_PER_M))
+
+        # roof pass: a building's roof draws OVER everything - floor, walls,
+        # characters, fx - so its interior is hidden until the vision cone
+        # reaches inside (through a window or an open door) or the player is
+        # standing inside that same building.
+        if m.roof is not None:
+            roof_a = np.where(m.roof, 1.0, 0.0).astype(np.float32)
+            rslc = roof_a[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
+            rslc[inten_raw > ROOF_REVEAL] = 0.0
+            pbid = int(m.roof_bid[pcy, pcx])
+            if pbid:
+                roof_a[m.roof_bid == pbid] = 0.0
+            roof_a = box_blur(roof_a, ROOF_BLUR_R)
+            # snap the plateau back to fully opaque - the blur is only meant to
+            # feather the reveal edge, not thin the whole cover
+            roof_a = np.minimum(roof_a * 1.8, 1.0)
+            roh, rcol = roof_a.shape
+            rmgn = ROOF_BLUR_R + 2
+            gx0 = max(0, int(cam_x / ppc) - rmgn)
+            gy0 = max(0, int(cam_y / ppc) - rmgn)
+            gx1 = min(rcol, int((cam_x + view_w) / ppc) + rmgn + 1)
+            gy1 = min(roh, int((cam_y + view_h) / ppc) + rmgn + 1)
+            gw, gh = gx1 - gx0, gy1 - gy0
+            if gw > 0 and gh > 0:
+                if roof_surf.get_size() != (gw, gh):
+                    roof_surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
+                rp3 = pygame.surfarray.pixels3d(roof_surf)
+                rpa = pygame.surfarray.pixels_alpha(roof_surf)
+                rp3[:, :, :] = np.transpose(
+                    m.roof_rgb[gy0:gy1, gx0:gx1], (1, 0, 2))
+                rpa[:, :] = np.transpose(np.clip(
+                    roof_a[gy0:gy1, gx0:gx1] * 255.0, 0, 255)).astype(np.uint8)
+                del rp3, rpa
+                rsc = pygame.transform.scale(
+                    roof_surf, (round(gw * ppc), round(gh * ppc)))
+                screen.blit(rsc, (round(gx0 * ppc), round(gy0 * ppc)))
 
         # lift the camera window out of the world and back to the real screen
         # (world is opaque and always covers the viewport, so no fill needed)

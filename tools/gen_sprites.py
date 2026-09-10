@@ -94,6 +94,9 @@ def main(tileset_path: str | None = None) -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for td in ts.tiles.values():
+        # png in a subfolder = hand-placed real art; never overwrite it.
+        if "/" in td.png or "\\" in td.png:
+            continue
         surf = pygame.Surface((ts.tile_px, ts.tile_px))
         draw_tile(surf, td.id, tuple(td.colour))
         pygame.image.save(surf, str(out_dir / td.png))

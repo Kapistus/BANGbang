@@ -33,6 +33,7 @@ class Tile:
     door: bool = False
     glass: bool = False         # a bullet passes through but shatters the pane
     bush: bool = False          # walkable concealment: hides a still occupant, blocks sight past
+    encloses: bool = False      # full-height barrier: seals a room for auto-roofing
     colour: tuple[int, int, int] = (200, 200, 200)
 
 
@@ -92,6 +93,20 @@ class TileMap:
     floor_ids: "np.ndarray | None" = None
     object_ids: "np.ndarray | None" = None
     tileset: object = None
+
+    # Auto-roofing. A coarse cell sealed off from the map border by a closed
+    # loop of enclosing tiles (walls, window frames, shut doors) gets a roof
+    # that the renderer draws over the interior until you look in through an
+    # aperture. `compute_roof` (re)derives the first three from the last two;
+    # all None when the map has no fully enclosed area. The sim never reads
+    # any of it - render-time only.
+    roof: "np.ndarray | None" = None          # bool (fine): cell is under a roof
+    roof_bid: "np.ndarray | None" = None      # int  (fine): building id, 0 = none
+    roof_rgb: "np.ndarray | None" = None      # uint8 (fine, 3): roof fill colour
+    roof_enc: "np.ndarray | None" = None      # bool (coarse): static enclosing tile (no doors)
+    roof_doorcells: "np.ndarray | None" = None  # bool (coarse): door tile here
+
+    lightmap: "np.ndarray | None" = None      # fine float 0..1, baked from `lights`
 
     @property
     def cells_per_metre(self) -> float:
@@ -192,6 +207,186 @@ def _expand(coarse: np.ndarray, subdiv: int) -> np.ndarray:
     return np.kron(coarse, np.ones((subdiv, subdiv), dtype=coarse.dtype))
 
 
+ROOF_RGB = (0, 0, 0)             # flat roof fill - opaque black cover
+ROOF_MAX_CELLS = 800             # a sealed blob bigger than this (coarse cells) is
+                                 # a walled arena / courtyard, not a room - no roof
+
+# Editor Floor / Wall placement roles bake fixed sim properties; the tile is
+# just art. For readability the two roles render at different brightness:
+# floor cells are darkened, wall cells are lightened toward white.
+WALL_SOUND_COST = 40.0
+WALL_PEN_COST = 3.5
+FLOOR_DARKEN = 0.55      # floor cell brightness, fraction of the tile
+WALL_LIGHTEN = 0.40      # wall cell blend toward white, 0 = tile .. 1 = white
+
+
+def darken(colour, f: float = FLOOR_DARKEN) -> tuple:
+    return tuple(max(0, min(255, int(round(v * f)))) for v in colour[:3])
+
+
+def lighten(colour, k: float = WALL_LIGHTEN) -> tuple:
+    return tuple(max(0, min(255, int(round(v + (255 - v) * k)))) for v in colour[:3])
+
+
+def _label_buildings(mask: np.ndarray) -> np.ndarray:
+    """4-connected flood fill of a coarse roof mask -> per-cell building id
+    (1..N, 0 where there is no roof). One connected roof = one building, so
+    the renderer can drop a whole building's roof when the player is inside."""
+    from collections import deque
+
+    rows, cols = mask.shape
+    bid = np.zeros((rows, cols), dtype=np.int32)
+    nxt = 0
+    for r in range(rows):
+        for c in range(cols):
+            if not mask[r, c] or bid[r, c]:
+                continue
+            nxt += 1
+            dq = deque([(r, c)])
+            bid[r, c] = nxt
+            while dq:
+                y, x = dq.popleft()
+                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if (0 <= ny < rows and 0 <= nx < cols
+                            and mask[ny, nx] and not bid[ny, nx]):
+                        bid[ny, nx] = nxt
+                        dq.append((ny, nx))
+    return bid
+
+
+def enclosed_mask(enc: np.ndarray) -> np.ndarray:
+    """Given a coarse bool of enclosing tiles, return a coarse bool of cells
+    that sit inside a closed loop - the interior floor AND the ring around it.
+
+    Flood-fills 'exterior' inward from the map border across every non-
+    enclosing cell; whatever it never reaches is walled off. Roof blobs that
+    contain no open interior cell (a lone pillar, an unclosed wall stub) are
+    dropped so only real rooms roof."""
+    rows, cols = enc.shape
+    from collections import deque
+
+    exterior = np.zeros((rows, cols), dtype=bool)
+    dq: deque = deque()
+
+    def seed(r, c):
+        if not enc[r, c] and not exterior[r, c]:
+            exterior[r, c] = True
+            dq.append((r, c))
+
+    for r in range(rows):
+        seed(r, 0)
+        seed(r, cols - 1)
+    for c in range(cols):
+        seed(0, c)
+        seed(rows - 1, c)
+    while dq:
+        y, x = dq.popleft()
+        for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+            if (0 <= ny < rows and 0 <= nx < cols
+                    and not enc[ny, nx] and not exterior[ny, nx]):
+                exterior[ny, nx] = True
+                dq.append((ny, nx))
+
+    roofed = ~exterior
+    if not roofed.any():
+        return roofed
+    # keep a blob only if it encloses open (non-enclosing) floor AND is small
+    # enough to be a room rather than a walled arena
+    bid = _label_buildings(roofed)
+    interior = roofed & ~enc
+    sizes = np.bincount(bid.ravel())
+    keep = [int(v) for v in np.unique(bid[interior])
+            if v and sizes[v] <= ROOF_MAX_CELLS]
+    if not keep:
+        return np.zeros((rows, cols), dtype=bool)
+    return np.isin(bid, keep)
+
+
+LIGHT_AMBIENT = 0.15        # brightness of unlit ground (0 = black .. 1 = full)
+LIGHT_FALLOFF_POW = 1.6     # >1 = light pools tighter around the source
+LIGHT_BLUR = 6             # fine-cell radius the lightmap is softened by
+
+
+def _blur2d(a: np.ndarray, radius: int) -> np.ndarray:
+    """Separable box blur - feathers the pool and shadow edges of a light."""
+    out = a.astype(np.float32).copy()
+    for _ in range(2):                       # two passes ~ a soft gaussian
+        src = out.copy()
+        for d in range(1, radius + 1):
+            out[:, d:] += src[:, :-d]
+            out[:, :-d] += src[:, d:]
+        out /= (2 * radius + 1)
+        src = out.copy()
+        for d in range(1, radius + 1):
+            out[d:, :] += src[:-d, :]
+            out[:-d, :] += src[d:, :]
+        out /= (2 * radius + 1)
+    return out
+
+
+def bake_lightmap(m: "TileMap") -> "np.ndarray | None":
+    """Fine float array 0..1: an ambient floor plus each Light's radial falloff,
+    shadow-cast against blocks_sight so walls throw light shadows, then blurred
+    so the pools read soft. Static - baked once at load; the renderer
+    multiplies it into the base surface.
+
+    Returns None when the map has no lights, so an unlit map renders at full
+    brightness rather than everywhere-ambient."""
+    if not m.lights:
+        return None
+    from sim.vision import shadowcast
+
+    h, w = m.blocks_sight.shape
+    lit = np.zeros((h, w), dtype=np.float32)     # the light contribution only
+    cpm = m.cells_per_metre
+    for lt in m.lights:
+        lx = int(round(lt.pos[0] * cpm))
+        ly = int(round(lt.pos[1] * cpm))
+        if not (0 <= lx < w and 0 <= ly < h):
+            continue
+        rc = max(1, int(round(lt.radius * cpm)))
+        vf = shadowcast(m.blocks_sight, lx, ly, rc)
+        fall = np.clip(1.0 - vf.dist / rc, 0.0, 1.0) ** LIGHT_FALLOFF_POW
+        add = np.where(vf.visible, fall * float(lt.intensity), 0.0)
+        lit[vf.y0:vf.y0 + add.shape[0], vf.x0:vf.x0 + add.shape[1]] += add
+    if LIGHT_BLUR > 0:
+        lit = _blur2d(lit, LIGHT_BLUR)
+    lm = np.clip(LIGHT_AMBIENT + lit, 0.0, 1.0)
+    return lm.astype(np.float32)
+
+
+def compute_roof(m: "TileMap",
+                 door_open: "dict[tuple[int, int], bool] | None" = None) -> None:
+    """(Re)derive m.roof / m.roof_bid / m.roof_rgb from m.roof_enc plus the
+    current door states. Cheap (coarse grid) - safe to call on every door
+    toggle. Sets all three to None if nothing is enclosed."""
+    enc = m.roof_enc
+    if enc is None:
+        m.roof = m.roof_bid = m.roof_rgb = None
+        return
+    mask = enc.copy()
+    dc = m.roof_doorcells
+    if dc is not None and dc.any():
+        opened = door_open or {}
+        rows, cols = mask.shape
+        for r in range(rows):
+            for c in range(cols):
+                if dc[r, c] and not opened.get((r, c), False):
+                    mask[r, c] = True        # a shut door seals the loop
+
+    roofed = enclosed_mask(mask)
+    if not roofed.any():
+        m.roof = m.roof_bid = m.roof_rgb = None
+        return
+    subdiv = m.subdiv
+    m.roof = _expand(roofed, subdiv)
+    m.roof_bid = _expand(_label_buildings(roofed), subdiv)
+    rows, cols = roofed.shape
+    rgb = np.zeros((rows, cols, 3), dtype=np.uint8)
+    rgb[roofed] = ROOF_RGB
+    m.roof_rgb = np.repeat(np.repeat(rgb, subdiv, axis=0), subdiv, axis=1)
+
+
 def load_tiles(path: Path) -> tuple[dict[str, Tile], int, float]:
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
@@ -213,6 +408,11 @@ def load_tiles(path: Path) -> tuple[dict[str, Tile], int, float]:
             door=bool(spec.get("door", False)),
             glass=bool(spec.get("glass", False)),
             bush=bool(spec.get("bush", False)),
+            encloses=bool(spec.get(
+                "encloses",
+                bool(spec.get("blocks_move", False))
+                and (bool(spec.get("blocks_sight", False))
+                     or bool(spec.get("glass", False))))),
             colour=tuple(spec.get("colour", (200, 200, 200))),
         )
     return tiles, subdiv, mpc
@@ -259,6 +459,8 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
     pc = np.zeros((rows, cols), dtype=np.float32)
     gl = np.zeros((rows, cols), dtype=bool)
     bu = np.zeros((rows, cols), dtype=bool)
+    en = np.zeros((rows, cols), dtype=bool)
+    dcz = np.zeros((rows, cols), dtype=bool)
 
     for ch, t in tiles.items():
         m = chars == ch
@@ -272,8 +474,10 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
         pc[m] = t.pen_cost
         gl[m] = t.glass
         bu[m] = t.bush
+        en[m] = t.encloses and not t.door
+        dcz[m] = t.door
 
-    return TileMap(
+    tm = TileMap(
         name=meta.get("name", sidecar.stem),
         chars=chars,
         tiles=tiles,
@@ -316,4 +520,9 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
             )
             for l in meta.get("lights", [])
         ],
+        roof_enc=en,
+        roof_doorcells=dcz,
     )
+    compute_roof(tm, {})
+    tm.lightmap = bake_lightmap(tm)
+    return tm

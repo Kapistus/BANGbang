@@ -1,104 +1,33 @@
 # Tile palette for the map editor and the game.
 #
-# Every entry has the four gameplay booleans the editor exposes:
-#   is_see_through  can the player/guards see THROUGH this cell (visually)
-#   is_walkable     can an actor stand/move here
-#   blocks_los      does it stop line-of-sight for the vision system
-#   blocks_shots    does it stop bullets
+# Tiles are now PURE ART. A tile carries only png / name / colour / group.
+# How a painted cell behaves is set by the editor's Floor / Wall toggle, not
+# by the tile:
+#   Floor cell  -> walkable, see-through, no blocking. Drawn at full brightness.
+#   Wall cell   -> blocks movement, sight and shots, and encloses a room for
+#                  the auto-roof. Drawn darker (sim/tilemap.WALL_DARKEN).
+# `footstep_mult` / `sound_cost` on a tile are still read for a Floor cell so
+# a grating floor can be loud.
 #
-# Plus values the sim needs. If any of sound_cost / footstep_mult / pen_cost
-# are omitted, sim/tileset.py derives a sensible default from the booleans.
+# The exceptions are the three SPECIAL tiles below - door, window, bush - which
+# keep fixed behaviour and ignore the Floor/Wall toggle (they always place on
+# the object layer).
 #
-#   layer = "floor"   painted on the base layer (every cell has one)
-#   layer = "object"  painted on top (walls, doors, props); "" clears it
-#
-# Swap the placeholder PNGs in this folder for real art at the same size.
+# Roofs are automatic: any area a wall / window / door loop seals off from the
+# map border is roofed at load (see sim/tilemap.compute_roof).
 
 [meta]
-tile_px = 32
-default_floor = "floor"
+tile_px = 128
+default_floor = "blank"
 
-# ---- floor layer -------------------------------------------------------
+# ---- base tile -------------------------------------------------------------
 
-[tiles.floor]
-png = "floor.png"
-layer = "floor"
-name = "Floor"
-is_see_through = true
-is_walkable = true
-blocks_los = false
-blocks_shots = false
-colour = [216, 214, 205]
+[tiles.blank]
+png = "blank.png"
+name = "Blank"
+colour = [150, 150, 150]
 
-[tiles.concrete]
-png = "concrete.png"
-layer = "floor"
-name = "Concrete"
-is_see_through = true
-is_walkable = true
-blocks_los = false
-blocks_shots = false
-colour = [188, 186, 180]
-
-[tiles.dirt]
-png = "dirt.png"
-layer = "floor"
-name = "Dirt"
-is_see_through = true
-is_walkable = true
-blocks_los = false
-blocks_shots = false
-footstep_mult = 0.9
-colour = [150, 122, 92]
-
-[tiles.grating]
-png = "grating.png"
-layer = "floor"
-name = "Grating (loud)"
-is_see_through = true
-is_walkable = true
-blocks_los = false
-blocks_shots = false
-footstep_mult = 1.8
-colour = [196, 188, 170]
-
-# ---- object layer ----------------------------------------------------
-
-[tiles.wall]
-png = "wall.png"
-layer = "object"
-name = "Wall"
-is_see_through = false
-is_walkable = false
-blocks_los = true
-blocks_shots = true
-sound_cost = 40.0
-pen_cost = 3.5
-colour = [92, 90, 84]
-
-[tiles.thin_wall]
-png = "thin_wall.png"
-layer = "object"
-name = "Thin wall (penetrable)"
-is_see_through = false
-is_walkable = false
-blocks_los = true
-blocks_shots = false
-sound_cost = 16.0
-pen_cost = 0.9
-colour = [132, 128, 118]
-
-[tiles.pillar]
-png = "pillar.png"
-layer = "object"
-name = "Pillar"
-is_see_through = false
-is_walkable = false
-blocks_los = true
-blocks_shots = true
-sound_cost = 40.0
-pen_cost = 3.5
-colour = [104, 100, 92]
+# ---- special tiles (fixed behaviour, ignore the Floor/Wall toggle) --------
 
 [tiles.window]
 png = "window.png"
@@ -126,30 +55,6 @@ sound_cost = 10.0
 pen_cost = 1.8
 colour = [150, 118, 78]
 
-[tiles.low_cover]
-png = "low_cover.png"
-layer = "object"
-name = "Low cover (see over)"
-is_see_through = true
-is_walkable = false
-blocks_los = false
-blocks_shots = true
-sound_cost = 2.2
-pen_cost = 1.2
-colour = [168, 158, 138]
-
-[tiles.crate]
-png = "crate.png"
-layer = "object"
-name = "Crate"
-is_see_through = false
-is_walkable = false
-blocks_los = true
-blocks_shots = true
-sound_cost = 8.0
-pen_cost = 1.5
-colour = [156, 120, 74]
-
 [tiles.bush]
 png = "bush.png"
 layer = "object"
@@ -161,4 +66,1575 @@ blocks_shots = false
 footstep_mult = 1.1
 sound_cost = 1.0
 pen_cost = 0.0
+overlay = true          # canopy draws over characters; texture gaps let them peek
 colour = [86, 120, 66]
+
+# === auto-generated tiles below (tools/sync_tileset.py) — edits here are overwritten ===
+
+[tiles.metal_00_00]
+png = "metal_00_00.png"
+name = "metal 00 00"
+group = "metal_00"
+colour = [47, 46, 48]
+
+[tiles.metal_00_01]
+png = "metal_00_01.png"
+name = "metal 00 01"
+group = "metal_00"
+colour = [43, 43, 44]
+
+[tiles.metal_00_02]
+png = "metal_00_02.png"
+name = "metal 00 02"
+group = "metal_00"
+colour = [42, 42, 44]
+
+[tiles.metal_00_03]
+png = "metal_00_03.png"
+name = "metal 00 03"
+group = "metal_00"
+colour = [46, 47, 48]
+
+[tiles.metal_00_10]
+png = "metal_00_10.png"
+name = "metal 00 10"
+group = "metal_00"
+colour = [64, 64, 66]
+
+[tiles.metal_00_11]
+png = "metal_00_11.png"
+name = "metal 00 11"
+group = "metal_00"
+colour = [53, 53, 54]
+
+[tiles.metal_00_12]
+png = "metal_00_12.png"
+name = "metal 00 12"
+group = "metal_00"
+colour = [51, 52, 54]
+
+[tiles.metal_00_13]
+png = "metal_00_13.png"
+name = "metal 00 13"
+group = "metal_00"
+colour = [36, 37, 38]
+
+[tiles.metal_00_20]
+png = "metal_00_20.png"
+name = "metal 00 20"
+group = "metal_00"
+colour = [34, 34, 37]
+
+[tiles.metal_00_21]
+png = "metal_00_21.png"
+name = "metal 00 21"
+group = "metal_00"
+colour = [57, 58, 61]
+
+[tiles.metal_00_22]
+png = "metal_00_22.png"
+name = "metal 00 22"
+group = "metal_00"
+colour = [47, 48, 49]
+
+[tiles.metal_00_23]
+png = "metal_00_23.png"
+name = "metal 00 23"
+group = "metal_00"
+colour = [44, 44, 45]
+
+[tiles.metal_00_30]
+png = "metal_00_30.png"
+name = "metal 00 30"
+group = "metal_00"
+colour = [45, 46, 47]
+
+[tiles.metal_00_31]
+png = "metal_00_31.png"
+name = "metal 00 31"
+group = "metal_00"
+colour = [43, 43, 43]
+
+[tiles.metal_00_32]
+png = "metal_00_32.png"
+name = "metal 00 32"
+group = "metal_00"
+colour = [54, 55, 58]
+
+[tiles.metal_00_33]
+png = "metal_00_33.png"
+name = "metal 00 33"
+group = "metal_00"
+colour = [39, 40, 43]
+
+[tiles.metal_01_00]
+png = "metal_01_00.png"
+name = "metal 01 00"
+group = "metal_01"
+colour = [99, 98, 101]
+
+[tiles.metal_01_01]
+png = "metal_01_01.png"
+name = "metal 01 01"
+group = "metal_01"
+colour = [54, 54, 56]
+
+[tiles.metal_01_02]
+png = "metal_01_02.png"
+name = "metal 01 02"
+group = "metal_01"
+colour = [88, 86, 84]
+
+[tiles.metal_01_03]
+png = "metal_01_03.png"
+name = "metal 01 03"
+group = "metal_01"
+colour = [56, 56, 56]
+
+[tiles.metal_01_10]
+png = "metal_01_10.png"
+name = "metal 01 10"
+group = "metal_01"
+colour = [91, 90, 91]
+
+[tiles.metal_01_11]
+png = "metal_01_11.png"
+name = "metal 01 11"
+group = "metal_01"
+colour = [79, 76, 75]
+
+[tiles.metal_01_12]
+png = "metal_01_12.png"
+name = "metal 01 12"
+group = "metal_01"
+colour = [62, 61, 61]
+
+[tiles.metal_01_13]
+png = "metal_01_13.png"
+name = "metal 01 13"
+group = "metal_01"
+colour = [84, 83, 84]
+
+[tiles.metal_01_20]
+png = "metal_01_20.png"
+name = "metal 01 20"
+group = "metal_01"
+colour = [57, 57, 57]
+
+[tiles.metal_01_21]
+png = "metal_01_21.png"
+name = "metal 01 21"
+group = "metal_01"
+colour = [89, 87, 88]
+
+[tiles.metal_01_22]
+png = "metal_01_22.png"
+name = "metal 01 22"
+group = "metal_01"
+colour = [64, 64, 66]
+
+[tiles.metal_01_23]
+png = "metal_01_23.png"
+name = "metal 01 23"
+group = "metal_01"
+colour = [53, 53, 54]
+
+[tiles.metal_01_30]
+png = "metal_01_30.png"
+name = "metal 01 30"
+group = "metal_01"
+colour = [62, 61, 62]
+
+[tiles.metal_01_31]
+png = "metal_01_31.png"
+name = "metal 01 31"
+group = "metal_01"
+colour = [58, 57, 58]
+
+[tiles.metal_01_32]
+png = "metal_01_32.png"
+name = "metal 01 32"
+group = "metal_01"
+colour = [84, 83, 84]
+
+[tiles.metal_01_33]
+png = "metal_01_33.png"
+name = "metal 01 33"
+group = "metal_01"
+colour = [75, 73, 71]
+
+[tiles.metal_02_00]
+png = "metal_02_00.png"
+name = "metal 02 00"
+group = "metal_02"
+colour = [60, 44, 38]
+
+[tiles.metal_02_01]
+png = "metal_02_01.png"
+name = "metal 02 01"
+group = "metal_02"
+colour = [57, 43, 35]
+
+[tiles.metal_02_02]
+png = "metal_02_02.png"
+name = "metal 02 02"
+group = "metal_02"
+colour = [95, 79, 67]
+
+[tiles.metal_02_03]
+png = "metal_02_03.png"
+name = "metal 02 03"
+group = "metal_02"
+colour = [82, 62, 49]
+
+[tiles.metal_02_10]
+png = "metal_02_10.png"
+name = "metal 02 10"
+group = "metal_02"
+colour = [81, 62, 49]
+
+[tiles.metal_02_11]
+png = "metal_02_11.png"
+name = "metal 02 11"
+group = "metal_02"
+colour = [75, 54, 41]
+
+[tiles.metal_02_12]
+png = "metal_02_12.png"
+name = "metal 02 12"
+group = "metal_02"
+colour = [59, 49, 42]
+
+[tiles.metal_02_13]
+png = "metal_02_13.png"
+name = "metal 02 13"
+group = "metal_02"
+colour = [68, 53, 43]
+
+[tiles.metal_02_20]
+png = "metal_02_20.png"
+name = "metal 02 20"
+group = "metal_02"
+colour = [82, 64, 51]
+
+[tiles.metal_02_21]
+png = "metal_02_21.png"
+name = "metal 02 21"
+group = "metal_02"
+colour = [50, 40, 35]
+
+[tiles.metal_02_22]
+png = "metal_02_22.png"
+name = "metal 02 22"
+group = "metal_02"
+colour = [65, 50, 41]
+
+[tiles.metal_02_23]
+png = "metal_02_23.png"
+name = "metal 02 23"
+group = "metal_02"
+colour = [68, 55, 48]
+
+[tiles.metal_02_30]
+png = "metal_02_30.png"
+name = "metal 02 30"
+group = "metal_02"
+colour = [49, 40, 36]
+
+[tiles.metal_02_31]
+png = "metal_02_31.png"
+name = "metal 02 31"
+group = "metal_02"
+colour = [70, 57, 44]
+
+[tiles.metal_02_32]
+png = "metal_02_32.png"
+name = "metal 02 32"
+group = "metal_02"
+colour = [69, 57, 50]
+
+[tiles.metal_02_33]
+png = "metal_02_33.png"
+name = "metal 02 33"
+group = "metal_02"
+colour = [70, 60, 54]
+
+[tiles.metal_03_00]
+png = "metal_03_00.png"
+name = "metal 03 00"
+group = "metal_03"
+colour = [152, 145, 147]
+
+[tiles.metal_03_01]
+png = "metal_03_01.png"
+name = "metal 03 01"
+group = "metal_03"
+colour = [145, 143, 142]
+
+[tiles.metal_03_02]
+png = "metal_03_02.png"
+name = "metal 03 02"
+group = "metal_03"
+colour = [80, 80, 81]
+
+[tiles.metal_03_03]
+png = "metal_03_03.png"
+name = "metal 03 03"
+group = "metal_03"
+colour = [160, 161, 165]
+
+[tiles.metal_03_10]
+png = "metal_03_10.png"
+name = "metal 03 10"
+group = "metal_03"
+colour = [151, 150, 151]
+
+[tiles.metal_03_11]
+png = "metal_03_11.png"
+name = "metal 03 11"
+group = "metal_03"
+colour = [77, 77, 77]
+
+[tiles.metal_03_12]
+png = "metal_03_12.png"
+name = "metal 03 12"
+group = "metal_03"
+colour = [147, 136, 138]
+
+[tiles.metal_03_13]
+png = "metal_03_13.png"
+name = "metal 03 13"
+group = "metal_03"
+colour = [70, 70, 70]
+
+[tiles.metal_03_20]
+png = "metal_03_20.png"
+name = "metal 03 20"
+group = "metal_03"
+colour = [144, 142, 140]
+
+[tiles.metal_03_21]
+png = "metal_03_21.png"
+name = "metal 03 21"
+group = "metal_03"
+colour = [146, 145, 146]
+
+[tiles.metal_03_22]
+png = "metal_03_22.png"
+name = "metal 03 22"
+group = "metal_03"
+colour = [100, 98, 97]
+
+[tiles.metal_03_23]
+png = "metal_03_23.png"
+name = "metal 03 23"
+group = "metal_03"
+colour = [138, 132, 125]
+
+[tiles.metal_03_30]
+png = "metal_03_30.png"
+name = "metal 03 30"
+group = "metal_03"
+colour = [93, 92, 94]
+
+[tiles.metal_03_31]
+png = "metal_03_31.png"
+name = "metal 03 31"
+group = "metal_03"
+colour = [140, 137, 139]
+
+[tiles.metal_03_32]
+png = "metal_03_32.png"
+name = "metal 03 32"
+group = "metal_03"
+colour = [138, 137, 137]
+
+[tiles.metal_03_33]
+png = "metal_03_33.png"
+name = "metal 03 33"
+group = "metal_03"
+colour = [79, 78, 79]
+
+[tiles.metal_04_00]
+png = "metal_04_00.png"
+name = "metal 04 00"
+group = "metal_04"
+colour = [56, 65, 46]
+
+[tiles.metal_04_01]
+png = "metal_04_01.png"
+name = "metal 04 01"
+group = "metal_04"
+colour = [49, 53, 38]
+
+[tiles.metal_04_02]
+png = "metal_04_02.png"
+name = "metal 04 02"
+group = "metal_04"
+colour = [66, 72, 52]
+
+[tiles.metal_04_03]
+png = "metal_04_03.png"
+name = "metal 04 03"
+group = "metal_04"
+colour = [61, 67, 49]
+
+[tiles.metal_04_10]
+png = "metal_04_10.png"
+name = "metal 04 10"
+group = "metal_04"
+colour = [53, 60, 43]
+
+[tiles.metal_04_11]
+png = "metal_04_11.png"
+name = "metal 04 11"
+group = "metal_04"
+colour = [58, 63, 48]
+
+[tiles.metal_04_12]
+png = "metal_04_12.png"
+name = "metal 04 12"
+group = "metal_04"
+colour = [38, 41, 34]
+
+[tiles.metal_04_13]
+png = "metal_04_13.png"
+name = "metal 04 13"
+group = "metal_04"
+colour = [44, 47, 34]
+
+[tiles.metal_04_20]
+png = "metal_04_20.png"
+name = "metal 04 20"
+group = "metal_04"
+colour = [44, 48, 35]
+
+[tiles.metal_04_21]
+png = "metal_04_21.png"
+name = "metal 04 21"
+group = "metal_04"
+colour = [56, 64, 46]
+
+[tiles.metal_04_22]
+png = "metal_04_22.png"
+name = "metal 04 22"
+group = "metal_04"
+colour = [49, 53, 39]
+
+[tiles.metal_04_23]
+png = "metal_04_23.png"
+name = "metal 04 23"
+group = "metal_04"
+colour = [54, 62, 44]
+
+[tiles.metal_04_30]
+png = "metal_04_30.png"
+name = "metal 04 30"
+group = "metal_04"
+colour = [52, 60, 43]
+
+[tiles.metal_04_31]
+png = "metal_04_31.png"
+name = "metal 04 31"
+group = "metal_04"
+colour = [39, 42, 35]
+
+[tiles.metal_04_32]
+png = "metal_04_32.png"
+name = "metal 04 32"
+group = "metal_04"
+colour = [51, 59, 42]
+
+[tiles.metal_04_33]
+png = "metal_04_33.png"
+name = "metal 04 33"
+group = "metal_04"
+colour = [42, 45, 33]
+
+[tiles.metal_05_00]
+png = "metal_05_00.png"
+name = "metal 05 00"
+group = "metal_05"
+colour = [46, 48, 53]
+
+[tiles.metal_05_01]
+png = "metal_05_01.png"
+name = "metal 05 01"
+group = "metal_05"
+colour = [38, 41, 44]
+
+[tiles.metal_05_02]
+png = "metal_05_02.png"
+name = "metal 05 02"
+group = "metal_05"
+colour = [37, 42, 48]
+
+[tiles.metal_05_03]
+png = "metal_05_03.png"
+name = "metal 05 03"
+group = "metal_05"
+colour = [42, 43, 48]
+
+[tiles.metal_05_10]
+png = "metal_05_10.png"
+name = "metal 05 10"
+group = "metal_05"
+colour = [36, 39, 44]
+
+[tiles.metal_05_11]
+png = "metal_05_11.png"
+name = "metal 05 11"
+group = "metal_05"
+colour = [39, 41, 44]
+
+[tiles.metal_05_12]
+png = "metal_05_12.png"
+name = "metal 05 12"
+group = "metal_05"
+colour = [40, 42, 45]
+
+[tiles.metal_05_13]
+png = "metal_05_13.png"
+name = "metal 05 13"
+group = "metal_05"
+colour = [40, 41, 46]
+
+[tiles.metal_05_20]
+png = "metal_05_20.png"
+name = "metal 05 20"
+group = "metal_05"
+colour = [41, 45, 50]
+
+[tiles.metal_05_21]
+png = "metal_05_21.png"
+name = "metal 05 21"
+group = "metal_05"
+colour = [42, 45, 49]
+
+[tiles.metal_05_22]
+png = "metal_05_22.png"
+name = "metal 05 22"
+group = "metal_05"
+colour = [39, 41, 44]
+
+[tiles.metal_05_23]
+png = "metal_05_23.png"
+name = "metal 05 23"
+group = "metal_05"
+colour = [35, 36, 38]
+
+[tiles.metal_05_30]
+png = "metal_05_30.png"
+name = "metal 05 30"
+group = "metal_05"
+colour = [40, 45, 51]
+
+[tiles.metal_05_31]
+png = "metal_05_31.png"
+name = "metal 05 31"
+group = "metal_05"
+colour = [36, 38, 42]
+
+[tiles.metal_05_32]
+png = "metal_05_32.png"
+name = "metal 05 32"
+group = "metal_05"
+colour = [31, 34, 38]
+
+[tiles.metal_05_33]
+png = "metal_05_33.png"
+name = "metal 05 33"
+group = "metal_05"
+colour = [36, 38, 42]
+
+[tiles.metal_06_00]
+png = "metal_06_00.png"
+name = "metal 06 00"
+group = "metal_06"
+colour = [129, 109, 89]
+
+[tiles.metal_06_01]
+png = "metal_06_01.png"
+name = "metal 06 01"
+group = "metal_06"
+colour = [80, 69, 58]
+
+[tiles.metal_06_02]
+png = "metal_06_02.png"
+name = "metal 06 02"
+group = "metal_06"
+colour = [137, 119, 100]
+
+[tiles.metal_06_03]
+png = "metal_06_03.png"
+name = "metal 06 03"
+group = "metal_06"
+colour = [105, 89, 73]
+
+[tiles.metal_06_10]
+png = "metal_06_10.png"
+name = "metal 06 10"
+group = "metal_06"
+colour = [128, 109, 87]
+
+[tiles.metal_06_11]
+png = "metal_06_11.png"
+name = "metal 06 11"
+group = "metal_06"
+colour = [140, 124, 106]
+
+[tiles.metal_06_12]
+png = "metal_06_12.png"
+name = "metal 06 12"
+group = "metal_06"
+colour = [110, 88, 63]
+
+[tiles.metal_06_13]
+png = "metal_06_13.png"
+name = "metal 06 13"
+group = "metal_06"
+colour = [124, 106, 90]
+
+[tiles.metal_06_20]
+png = "metal_06_20.png"
+name = "metal 06 20"
+group = "metal_06"
+colour = [128, 111, 94]
+
+[tiles.metal_06_21]
+png = "metal_06_21.png"
+name = "metal 06 21"
+group = "metal_06"
+colour = [95, 80, 64]
+
+[tiles.metal_06_22]
+png = "metal_06_22.png"
+name = "metal 06 22"
+group = "metal_06"
+colour = [125, 108, 89]
+
+[tiles.metal_06_23]
+png = "metal_06_23.png"
+name = "metal 06 23"
+group = "metal_06"
+colour = [84, 70, 58]
+
+[tiles.metal_06_30]
+png = "metal_06_30.png"
+name = "metal 06 30"
+group = "metal_06"
+colour = [93, 77, 63]
+
+[tiles.metal_06_31]
+png = "metal_06_31.png"
+name = "metal 06 31"
+group = "metal_06"
+colour = [125, 107, 90]
+
+[tiles.metal_06_32]
+png = "metal_06_32.png"
+name = "metal 06 32"
+group = "metal_06"
+colour = [87, 72, 58]
+
+[tiles.metal_06_33]
+png = "metal_06_33.png"
+name = "metal 06 33"
+group = "metal_06"
+colour = [118, 100, 84]
+
+[tiles.metal_07_00]
+png = "metal_07_00.png"
+name = "metal 07 00"
+group = "metal_07"
+colour = [114, 37, 35]
+
+[tiles.metal_07_01]
+png = "metal_07_01.png"
+name = "metal 07 01"
+group = "metal_07"
+colour = [63, 35, 36]
+
+[tiles.metal_07_02]
+png = "metal_07_02.png"
+name = "metal 07 02"
+group = "metal_07"
+colour = [120, 37, 35]
+
+[tiles.metal_07_03]
+png = "metal_07_03.png"
+name = "metal 07 03"
+group = "metal_07"
+colour = [119, 41, 37]
+
+[tiles.metal_07_10]
+png = "metal_07_10.png"
+name = "metal 07 10"
+group = "metal_07"
+colour = [115, 35, 33]
+
+[tiles.metal_07_11]
+png = "metal_07_11.png"
+name = "metal 07 11"
+group = "metal_07"
+colour = [66, 47, 46]
+
+[tiles.metal_07_12]
+png = "metal_07_12.png"
+name = "metal 07 12"
+group = "metal_07"
+colour = [52, 32, 31]
+
+[tiles.metal_07_13]
+png = "metal_07_13.png"
+name = "metal 07 13"
+group = "metal_07"
+colour = [118, 30, 29]
+
+[tiles.metal_07_20]
+png = "metal_07_20.png"
+name = "metal 07 20"
+group = "metal_07"
+colour = [55, 32, 30]
+
+[tiles.metal_07_21]
+png = "metal_07_21.png"
+name = "metal 07 21"
+group = "metal_07"
+colour = [114, 38, 32]
+
+[tiles.metal_07_22]
+png = "metal_07_22.png"
+name = "metal 07 22"
+group = "metal_07"
+colour = [125, 40, 36]
+
+[tiles.metal_07_23]
+png = "metal_07_23.png"
+name = "metal 07 23"
+group = "metal_07"
+colour = [71, 38, 37]
+
+[tiles.metal_07_30]
+png = "metal_07_30.png"
+name = "metal 07 30"
+group = "metal_07"
+colour = [110, 36, 35]
+
+[tiles.metal_07_31]
+png = "metal_07_31.png"
+name = "metal 07 31"
+group = "metal_07"
+colour = [60, 33, 33]
+
+[tiles.metal_07_32]
+png = "metal_07_32.png"
+name = "metal 07 32"
+group = "metal_07"
+colour = [113, 36, 34]
+
+[tiles.metal_07_33]
+png = "metal_07_33.png"
+name = "metal 07 33"
+group = "metal_07"
+colour = [106, 34, 33]
+
+[tiles.metal_08_00]
+png = "metal_08_00.png"
+name = "metal 08 00"
+group = "metal_08"
+colour = [77, 97, 114]
+
+[tiles.metal_08_01]
+png = "metal_08_01.png"
+name = "metal 08 01"
+group = "metal_08"
+colour = [59, 71, 83]
+
+[tiles.metal_08_02]
+png = "metal_08_02.png"
+name = "metal 08 02"
+group = "metal_08"
+colour = [75, 95, 112]
+
+[tiles.metal_08_03]
+png = "metal_08_03.png"
+name = "metal 08 03"
+group = "metal_08"
+colour = [75, 94, 112]
+
+[tiles.metal_08_10]
+png = "metal_08_10.png"
+name = "metal 08 10"
+group = "metal_08"
+colour = [59, 66, 73]
+
+[tiles.metal_08_11]
+png = "metal_08_11.png"
+name = "metal 08 11"
+group = "metal_08"
+colour = [79, 98, 114]
+
+[tiles.metal_08_12]
+png = "metal_08_12.png"
+name = "metal 08 12"
+group = "metal_08"
+colour = [58, 70, 81]
+
+[tiles.metal_08_13]
+png = "metal_08_13.png"
+name = "metal 08 13"
+group = "metal_08"
+colour = [61, 75, 88]
+
+[tiles.metal_08_20]
+png = "metal_08_20.png"
+name = "metal 08 20"
+group = "metal_08"
+colour = [83, 101, 119]
+
+[tiles.metal_08_21]
+png = "metal_08_21.png"
+name = "metal 08 21"
+group = "metal_08"
+colour = [53, 62, 73]
+
+[tiles.metal_08_22]
+png = "metal_08_22.png"
+name = "metal 08 22"
+group = "metal_08"
+colour = [63, 79, 94]
+
+[tiles.metal_08_23]
+png = "metal_08_23.png"
+name = "metal 08 23"
+group = "metal_08"
+colour = [58, 70, 81]
+
+[tiles.metal_08_30]
+png = "metal_08_30.png"
+name = "metal 08 30"
+group = "metal_08"
+colour = [51, 59, 70]
+
+[tiles.metal_08_31]
+png = "metal_08_31.png"
+name = "metal 08 31"
+group = "metal_08"
+colour = [62, 79, 94]
+
+[tiles.metal_08_32]
+png = "metal_08_32.png"
+name = "metal 08 32"
+group = "metal_08"
+colour = [51, 64, 76]
+
+[tiles.metal_08_33]
+png = "metal_08_33.png"
+name = "metal 08 33"
+group = "metal_08"
+colour = [47, 56, 66]
+
+[tiles.metal_09_00]
+png = "metal_09_00.png"
+name = "metal 09 00"
+group = "metal_09"
+colour = [48, 43, 40]
+
+[tiles.metal_09_01]
+png = "metal_09_01.png"
+name = "metal 09 01"
+group = "metal_09"
+colour = [39, 38, 38]
+
+[tiles.metal_09_02]
+png = "metal_09_02.png"
+name = "metal 09 02"
+group = "metal_09"
+colour = [43, 41, 40]
+
+[tiles.metal_09_03]
+png = "metal_09_03.png"
+name = "metal 09 03"
+group = "metal_09"
+colour = [48, 47, 47]
+
+[tiles.metal_09_10]
+png = "metal_09_10.png"
+name = "metal 09 10"
+group = "metal_09"
+colour = [42, 40, 41]
+
+[tiles.metal_09_11]
+png = "metal_09_11.png"
+name = "metal 09 11"
+group = "metal_09"
+colour = [51, 46, 43]
+
+[tiles.metal_09_12]
+png = "metal_09_12.png"
+name = "metal 09 12"
+group = "metal_09"
+colour = [41, 40, 39]
+
+[tiles.metal_09_13]
+png = "metal_09_13.png"
+name = "metal 09 13"
+group = "metal_09"
+colour = [51, 45, 41]
+
+[tiles.metal_09_20]
+png = "metal_09_20.png"
+name = "metal 09 20"
+group = "metal_09"
+colour = [36, 36, 36]
+
+[tiles.metal_09_21]
+png = "metal_09_21.png"
+name = "metal 09 21"
+group = "metal_09"
+colour = [42, 40, 40]
+
+[tiles.metal_09_22]
+png = "metal_09_22.png"
+name = "metal 09 22"
+group = "metal_09"
+colour = [36, 34, 34]
+
+[tiles.metal_09_23]
+png = "metal_09_23.png"
+name = "metal 09 23"
+group = "metal_09"
+colour = [39, 39, 40]
+
+[tiles.metal_09_30]
+png = "metal_09_30.png"
+name = "metal 09 30"
+group = "metal_09"
+colour = [39, 38, 39]
+
+[tiles.metal_09_31]
+png = "metal_09_31.png"
+name = "metal 09 31"
+group = "metal_09"
+colour = [43, 40, 39]
+
+[tiles.metal_09_32]
+png = "metal_09_32.png"
+name = "metal 09 32"
+group = "metal_09"
+colour = [36, 35, 35]
+
+[tiles.metal_09_33]
+png = "metal_09_33.png"
+name = "metal 09 33"
+group = "metal_09"
+colour = [47, 42, 37]
+
+[tiles.metal_10_00]
+png = "metal_10_00.png"
+name = "metal 10 00"
+group = "metal_10"
+colour = [69, 69, 60]
+
+[tiles.metal_10_01]
+png = "metal_10_01.png"
+name = "metal 10 01"
+group = "metal_10"
+colour = [52, 50, 43]
+
+[tiles.metal_10_02]
+png = "metal_10_02.png"
+name = "metal 10 02"
+group = "metal_10"
+colour = [75, 71, 60]
+
+[tiles.metal_10_03]
+png = "metal_10_03.png"
+name = "metal 10 03"
+group = "metal_10"
+colour = [75, 72, 65]
+
+[tiles.metal_10_10]
+png = "metal_10_10.png"
+name = "metal 10 10"
+group = "metal_10"
+colour = [66, 64, 54]
+
+[tiles.metal_10_11]
+png = "metal_10_11.png"
+name = "metal 10 11"
+group = "metal_10"
+colour = [72, 70, 60]
+
+[tiles.metal_10_12]
+png = "metal_10_12.png"
+name = "metal 10 12"
+group = "metal_10"
+colour = [52, 51, 45]
+
+[tiles.metal_10_13]
+png = "metal_10_13.png"
+name = "metal 10 13"
+group = "metal_10"
+colour = [68, 65, 56]
+
+[tiles.metal_10_20]
+png = "metal_10_20.png"
+name = "metal 10 20"
+group = "metal_10"
+colour = [65, 63, 53]
+
+[tiles.metal_10_21]
+png = "metal_10_21.png"
+name = "metal 10 21"
+group = "metal_10"
+colour = [64, 62, 57]
+
+[tiles.metal_10_22]
+png = "metal_10_22.png"
+name = "metal 10 22"
+group = "metal_10"
+colour = [55, 51, 43]
+
+[tiles.metal_10_23]
+png = "metal_10_23.png"
+name = "metal 10 23"
+group = "metal_10"
+colour = [51, 47, 39]
+
+[tiles.metal_10_30]
+png = "metal_10_30.png"
+name = "metal 10 30"
+group = "metal_10"
+colour = [46, 45, 40]
+
+[tiles.metal_10_31]
+png = "metal_10_31.png"
+name = "metal 10 31"
+group = "metal_10"
+colour = [63, 61, 52]
+
+[tiles.metal_10_32]
+png = "metal_10_32.png"
+name = "metal 10 32"
+group = "metal_10"
+colour = [61, 58, 50]
+
+[tiles.metal_10_33]
+png = "metal_10_33.png"
+name = "metal 10 33"
+group = "metal_10"
+colour = [61, 58, 49]
+
+[tiles.metal_11_00]
+png = "metal_11_00.png"
+name = "metal 11 00"
+group = "metal_11"
+colour = [128, 128, 129]
+
+[tiles.metal_11_01]
+png = "metal_11_01.png"
+name = "metal 11 01"
+group = "metal_11"
+colour = [76, 77, 78]
+
+[tiles.metal_11_02]
+png = "metal_11_02.png"
+name = "metal 11 02"
+group = "metal_11"
+colour = [129, 129, 131]
+
+[tiles.metal_11_03]
+png = "metal_11_03.png"
+name = "metal 11 03"
+group = "metal_11"
+colour = [126, 126, 128]
+
+[tiles.metal_11_10]
+png = "metal_11_10.png"
+name = "metal 11 10"
+group = "metal_11"
+colour = [86, 85, 85]
+
+[tiles.metal_11_11]
+png = "metal_11_11.png"
+name = "metal 11 11"
+group = "metal_11"
+colour = [117, 116, 117]
+
+[tiles.metal_11_12]
+png = "metal_11_12.png"
+name = "metal 11 12"
+group = "metal_11"
+colour = [100, 100, 100]
+
+[tiles.metal_11_13]
+png = "metal_11_13.png"
+name = "metal 11 13"
+group = "metal_11"
+colour = [127, 124, 122]
+
+[tiles.metal_11_20]
+png = "metal_11_20.png"
+name = "metal 11 20"
+group = "metal_11"
+colour = [123, 122, 122]
+
+[tiles.metal_11_21]
+png = "metal_11_21.png"
+name = "metal 11 21"
+group = "metal_11"
+colour = [77, 77, 76]
+
+[tiles.metal_11_22]
+png = "metal_11_22.png"
+name = "metal 11 22"
+group = "metal_11"
+colour = [114, 114, 114]
+
+[tiles.metal_11_23]
+png = "metal_11_23.png"
+name = "metal 11 23"
+group = "metal_11"
+colour = [85, 84, 84]
+
+[tiles.metal_11_30]
+png = "metal_11_30.png"
+name = "metal 11 30"
+group = "metal_11"
+colour = [90, 89, 89]
+
+[tiles.metal_11_31]
+png = "metal_11_31.png"
+name = "metal 11 31"
+group = "metal_11"
+colour = [115, 114, 115]
+
+[tiles.metal_11_32]
+png = "metal_11_32.png"
+name = "metal 11 32"
+group = "metal_11"
+colour = [72, 71, 72]
+
+[tiles.metal_11_33]
+png = "metal_11_33.png"
+name = "metal 11 33"
+group = "metal_11"
+colour = [119, 116, 112]
+
+[tiles.metal_12_00]
+png = "metal_12_00.png"
+name = "metal 12 00"
+group = "metal_12"
+colour = [65, 60, 81]
+
+[tiles.metal_12_01]
+png = "metal_12_01.png"
+name = "metal 12 01"
+group = "metal_12"
+colour = [48, 44, 54]
+
+[tiles.metal_12_02]
+png = "metal_12_02.png"
+name = "metal 12 02"
+group = "metal_12"
+colour = [80, 77, 100]
+
+[tiles.metal_12_03]
+png = "metal_12_03.png"
+name = "metal 12 03"
+group = "metal_12"
+colour = [53, 47, 61]
+
+[tiles.metal_12_10]
+png = "metal_12_10.png"
+name = "metal 12 10"
+group = "metal_12"
+colour = [48, 43, 54]
+
+[tiles.metal_12_11]
+png = "metal_12_11.png"
+name = "metal 12 11"
+group = "metal_12"
+colour = [69, 61, 90]
+
+[tiles.metal_12_12]
+png = "metal_12_12.png"
+name = "metal 12 12"
+group = "metal_12"
+colour = [46, 43, 53]
+
+[tiles.metal_12_13]
+png = "metal_12_13.png"
+name = "metal 12 13"
+group = "metal_12"
+colour = [68, 62, 89]
+
+[tiles.metal_12_20]
+png = "metal_12_20.png"
+name = "metal 12 20"
+group = "metal_12"
+colour = [60, 53, 75]
+
+[tiles.metal_12_21]
+png = "metal_12_21.png"
+name = "metal 12 21"
+group = "metal_12"
+colour = [48, 41, 58]
+
+[tiles.metal_12_22]
+png = "metal_12_22.png"
+name = "metal 12 22"
+group = "metal_12"
+colour = [50, 47, 52]
+
+[tiles.metal_12_23]
+png = "metal_12_23.png"
+name = "metal 12 23"
+group = "metal_12"
+colour = [68, 57, 86]
+
+[tiles.metal_12_30]
+png = "metal_12_30.png"
+name = "metal 12 30"
+group = "metal_12"
+colour = [47, 40, 52]
+
+[tiles.metal_12_31]
+png = "metal_12_31.png"
+name = "metal 12 31"
+group = "metal_12"
+colour = [68, 57, 86]
+
+[tiles.metal_12_32]
+png = "metal_12_32.png"
+name = "metal 12 32"
+group = "metal_12"
+colour = [69, 65, 89]
+
+[tiles.metal_12_33]
+png = "metal_12_33.png"
+name = "metal 12 33"
+group = "metal_12"
+colour = [45, 41, 52]
+
+[tiles.metal_13_00]
+png = "metal_13_00.png"
+name = "metal 13 00"
+group = "metal_13"
+colour = [144, 129, 118]
+
+[tiles.metal_13_01]
+png = "metal_13_01.png"
+name = "metal 13 01"
+group = "metal_13"
+colour = [108, 96, 85]
+
+[tiles.metal_13_02]
+png = "metal_13_02.png"
+name = "metal 13 02"
+group = "metal_13"
+colour = [140, 125, 113]
+
+[tiles.metal_13_03]
+png = "metal_13_03.png"
+name = "metal 13 03"
+group = "metal_13"
+colour = [143, 129, 119]
+
+[tiles.metal_13_10]
+png = "metal_13_10.png"
+name = "metal 13 10"
+group = "metal_13"
+colour = [140, 119, 108]
+
+[tiles.metal_13_11]
+png = "metal_13_11.png"
+name = "metal 13 11"
+group = "metal_13"
+colour = [140, 127, 115]
+
+[tiles.metal_13_12]
+png = "metal_13_12.png"
+name = "metal 13 12"
+group = "metal_13"
+colour = [92, 83, 72]
+
+[tiles.metal_13_13]
+png = "metal_13_13.png"
+name = "metal 13 13"
+group = "metal_13"
+colour = [125, 112, 100]
+
+[tiles.metal_13_20]
+png = "metal_13_20.png"
+name = "metal 13 20"
+group = "metal_13"
+colour = [89, 76, 66]
+
+[tiles.metal_13_21]
+png = "metal_13_21.png"
+name = "metal 13 21"
+group = "metal_13"
+colour = [114, 102, 90]
+
+[tiles.metal_13_22]
+png = "metal_13_22.png"
+name = "metal 13 22"
+group = "metal_13"
+colour = [106, 94, 82]
+
+[tiles.metal_13_23]
+png = "metal_13_23.png"
+name = "metal 13 23"
+group = "metal_13"
+colour = [138, 114, 103]
+
+[tiles.metal_13_30]
+png = "metal_13_30.png"
+name = "metal 13 30"
+group = "metal_13"
+colour = [143, 124, 113]
+
+[tiles.metal_13_31]
+png = "metal_13_31.png"
+name = "metal 13 31"
+group = "metal_13"
+colour = [138, 126, 115]
+
+[tiles.metal_13_32]
+png = "metal_13_32.png"
+name = "metal 13 32"
+group = "metal_13"
+colour = [143, 124, 113]
+
+[tiles.metal_13_33]
+png = "metal_13_33.png"
+name = "metal 13 33"
+group = "metal_13"
+colour = [97, 87, 77]
+
+[tiles.metal_14_00]
+png = "metal_14_00.png"
+name = "metal 14 00"
+group = "metal_14"
+colour = [32, 55, 64]
+
+[tiles.metal_14_01]
+png = "metal_14_01.png"
+name = "metal 14 01"
+group = "metal_14"
+colour = [36, 58, 66]
+
+[tiles.metal_14_02]
+png = "metal_14_02.png"
+name = "metal 14 02"
+group = "metal_14"
+colour = [29, 50, 59]
+
+[tiles.metal_14_03]
+png = "metal_14_03.png"
+name = "metal 14 03"
+group = "metal_14"
+colour = [40, 58, 66]
+
+[tiles.metal_14_10]
+png = "metal_14_10.png"
+name = "metal 14 10"
+group = "metal_14"
+colour = [34, 55, 64]
+
+[tiles.metal_14_11]
+png = "metal_14_11.png"
+name = "metal 14 11"
+group = "metal_14"
+colour = [26, 42, 47]
+
+[tiles.metal_14_12]
+png = "metal_14_12.png"
+name = "metal 14 12"
+group = "metal_14"
+colour = [31, 57, 69]
+
+[tiles.metal_14_13]
+png = "metal_14_13.png"
+name = "metal 14 13"
+group = "metal_14"
+colour = [33, 47, 52]
+
+[tiles.metal_14_20]
+png = "metal_14_20.png"
+name = "metal 14 20"
+group = "metal_14"
+colour = [23, 38, 44]
+
+[tiles.metal_14_21]
+png = "metal_14_21.png"
+name = "metal 14 21"
+group = "metal_14"
+colour = [25, 47, 57]
+
+[tiles.metal_14_22]
+png = "metal_14_22.png"
+name = "metal 14 22"
+group = "metal_14"
+colour = [31, 50, 57]
+
+[tiles.metal_14_23]
+png = "metal_14_23.png"
+name = "metal 14 23"
+group = "metal_14"
+colour = [30, 54, 65]
+
+[tiles.metal_14_30]
+png = "metal_14_30.png"
+name = "metal 14 30"
+group = "metal_14"
+colour = [27, 49, 59]
+
+[tiles.metal_14_31]
+png = "metal_14_31.png"
+name = "metal 14 31"
+group = "metal_14"
+colour = [30, 41, 44]
+
+[tiles.metal_14_32]
+png = "metal_14_32.png"
+name = "metal 14 32"
+group = "metal_14"
+colour = [31, 54, 63]
+
+[tiles.metal_14_33]
+png = "metal_14_33.png"
+name = "metal 14 33"
+group = "metal_14"
+colour = [29, 42, 47]
+
+[tiles.metal_15_00]
+png = "metal_15_00.png"
+name = "metal 15 00"
+group = "metal_15"
+colour = [74, 68, 58]
+
+[tiles.metal_15_01]
+png = "metal_15_01.png"
+name = "metal 15 01"
+group = "metal_15"
+colour = [47, 47, 49]
+
+[tiles.metal_15_02]
+png = "metal_15_02.png"
+name = "metal 15 02"
+group = "metal_15"
+colour = [82, 74, 60]
+
+[tiles.metal_15_03]
+png = "metal_15_03.png"
+name = "metal 15 03"
+group = "metal_15"
+colour = [69, 64, 56]
+
+[tiles.metal_15_10]
+png = "metal_15_10.png"
+name = "metal 15 10"
+group = "metal_15"
+colour = [50, 49, 49]
+
+[tiles.metal_15_11]
+png = "metal_15_11.png"
+name = "metal 15 11"
+group = "metal_15"
+colour = [52, 50, 48]
+
+[tiles.metal_15_12]
+png = "metal_15_12.png"
+name = "metal 15 12"
+group = "metal_15"
+colour = [45, 43, 39]
+
+[tiles.metal_15_13]
+png = "metal_15_13.png"
+name = "metal 15 13"
+group = "metal_15"
+colour = [77, 70, 59]
+
+[tiles.metal_15_20]
+png = "metal_15_20.png"
+name = "metal 15 20"
+group = "metal_15"
+colour = [72, 64, 52]
+
+[tiles.metal_15_21]
+png = "metal_15_21.png"
+name = "metal 15 21"
+group = "metal_15"
+colour = [78, 69, 55]
+
+[tiles.metal_15_22]
+png = "metal_15_22.png"
+name = "metal 15 22"
+group = "metal_15"
+colour = [45, 43, 43]
+
+[tiles.metal_15_23]
+png = "metal_15_23.png"
+name = "metal 15 23"
+group = "metal_15"
+colour = [54, 56, 59]
+
+[tiles.metal_15_30]
+png = "metal_15_30.png"
+name = "metal 15 30"
+group = "metal_15"
+colour = [44, 44, 45]
+
+[tiles.metal_15_31]
+png = "metal_15_31.png"
+name = "metal 15 31"
+group = "metal_15"
+colour = [39, 38, 40]
+
+[tiles.metal_15_32]
+png = "metal_15_32.png"
+name = "metal 15 32"
+group = "metal_15"
+colour = [80, 70, 57]
+
+[tiles.metal_15_33]
+png = "metal_15_33.png"
+name = "metal 15 33"
+group = "metal_15"
+colour = [67, 58, 46]
+
+[tiles.metal_grating]
+png = "metal_grating.png"
+name = "metal grating"
+colour = [72, 73, 72]
+
+[tiles.metal_grid]
+png = "metal_grid.png"
+name = "metal grid"
+colour = [51, 51, 50]
+
+[tiles.metal_yellow]
+png = "metal_yellow.png"
+name = "metal yellow"
+colour = [121, 92, 40]
+
+[tiles.sideways]
+png = "tilesets/sideways.png"
+name = "sideways"
+colour = [43, 46, 48]
+
+[tiles.sideways_2]
+png = "tilesets/sideways_2.png"
+name = "sideways 2"
+group = "sideways"
+colour = [43, 46, 48]
+
+[tiles.tileset_metal_1]
+png = "tilesets/tileset_metal_1.png"
+name = "tileset metal 1"
+group = "tileset_metal"
+colour = [46, 46, 48]
