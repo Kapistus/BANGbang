@@ -101,6 +101,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
     fm = np.ones((rows, cols), dtype=np.float32)
     pc = np.zeros((rows, cols), dtype=np.float32)
     gl = np.zeros((rows, cols), dtype=bool)
+    bu = np.zeros((rows, cols), dtype=bool)
 
     chars = np.empty((rows, cols), dtype="<U1")
     tiles: dict[str, Tile] = {}
@@ -117,6 +118,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
             fm[r, c] = td.footstep_mult
             pc[r, c] = td.pen_cost
             gl[r, c] = td.glass
+            bu[r, c] = td.bush
             ch = char_of.get(tid)
             if ch is None:
                 ch = _CHAR_POOL[len(char_of) % len(_CHAR_POOL)]
@@ -126,7 +128,8 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
                     blocks_move=not td.is_walkable, blocks_sight=td.blocks_los,
                     blocks_bullets=td.blocks_shots, sound_cost=td.sound_cost,
                     footstep_mult=td.footstep_mult, pen_cost=td.pen_cost,
-                    door=td.door, glass=td.glass, colour=tuple(td.colour))
+                    door=td.door, glass=td.glass, bush=td.bush,
+                    colour=tuple(td.colour))
             chars[r, c] = ch
 
     guards = [
@@ -137,6 +140,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
             recognise_deg=float(g.get("recognise_deg", 100.0)),
             peripheral_deg=float(g.get("peripheral_deg", 170.0)),
             weapon=g.get("weapon", "combat_rifle"),
+            skill=g.get("skill", "veteran"),
         )
         for i, g in enumerate(doc.get("guards", []))
     ]
@@ -169,6 +173,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
         footstep_mult=_expand(fm, subdiv),
         pen_cost=_expand(pc, subdiv),
         glass=_expand(gl, subdiv),
+        bush=_expand(bu, subdiv),
         player_spawn=tuple(doc.get("player_spawn", (1.5, 1.5))),
         guards=guards,
         idle_spots=idle_spots,

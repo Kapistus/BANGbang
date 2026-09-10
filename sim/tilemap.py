@@ -32,6 +32,7 @@ class Tile:
     pen_cost: float = 0.0       # penetration budget a bullet spends to pierce it
     door: bool = False
     glass: bool = False         # a bullet passes through but shatters the pane
+    bush: bool = False          # walkable concealment: hides a still occupant, blocks sight past
     colour: tuple[int, int, int] = (200, 200, 200)
 
 
@@ -52,6 +53,7 @@ class GuardSpec:
     recognise_deg: float = 100.0
     peripheral_deg: float = 170.0
     weapon: str = "combat_rifle"      # weapons.ROSTER id; editor can override
+    skill: str = "veteran"            # veteran | seasoned | rookie (aim quality)
 
 
 @dataclass
@@ -78,6 +80,7 @@ class TileMap:
     footstep_mult: np.ndarray   # f32   (fine)
     pen_cost: np.ndarray        # f32   (fine)  bullet penetration cost
     glass: np.ndarray           # bool  (fine)  shatters when shot through
+    bush: np.ndarray            # bool  (fine)  walkable concealment foliage
 
     player_spawn: tuple[float, float] = (1.5, 1.5)
     guards: list[GuardSpec] = field(default_factory=list)
@@ -209,6 +212,7 @@ def load_tiles(path: Path) -> tuple[dict[str, Tile], int, float]:
             pen_cost=float(spec.get("pen_cost", 0.0)),
             door=bool(spec.get("door", False)),
             glass=bool(spec.get("glass", False)),
+            bush=bool(spec.get("bush", False)),
             colour=tuple(spec.get("colour", (200, 200, 200))),
         )
     return tiles, subdiv, mpc
@@ -254,6 +258,7 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
     fm = np.ones((rows, cols), dtype=np.float32)
     pc = np.zeros((rows, cols), dtype=np.float32)
     gl = np.zeros((rows, cols), dtype=bool)
+    bu = np.zeros((rows, cols), dtype=bool)
 
     for ch, t in tiles.items():
         m = chars == ch
@@ -266,6 +271,7 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
         fm[m] = t.footstep_mult
         pc[m] = t.pen_cost
         gl[m] = t.glass
+        bu[m] = t.bush
 
     return TileMap(
         name=meta.get("name", sidecar.stem),
@@ -280,6 +286,7 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
         footstep_mult=_expand(fm, subdiv),
         pen_cost=_expand(pc, subdiv),
         glass=_expand(gl, subdiv),
+        bush=_expand(bu, subdiv),
         player_spawn=tuple(meta.get("player_spawn", (1.5, 1.5))),
         guards=[
             GuardSpec(

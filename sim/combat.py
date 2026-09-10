@@ -41,6 +41,7 @@ class Combatant:
     health: Optional[float] = None
     shields: Optional[float] = None
     alive: bool = True
+    concealed: bool = False            # hidden (e.g. still inside a bush) - AI sight skips them
     last_hit_t: float = -1e9
     hit_from: Optional[tuple] = None   # world (x, y) the last damage came from
     _regen_at: float = field(default=-1e9, repr=False)

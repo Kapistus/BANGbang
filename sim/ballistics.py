@@ -77,12 +77,17 @@ def _trim(segs, ox, oy, dx, dy, t):
 
 
 def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
-              targets, rng, now):
+              targets, rng, now, apply_damage=True):
     """Resolve one projectile. Applies damage to whatever it hits.
 
     `glass` is a bool array the size of the fine grid: a glass cell lets the
     shot pass (for a token penetration cost, no damage penalty) and is added
     to the returned Shot.shattered list so the caller can break the pane.
+
+    With `apply_damage=False` the geometry is traced and the first body in
+    the path still ends the shot (so `impact` is the detonation point), but
+    no `Combatant.take` is called - used for travelling explosives whose
+    damage is dealt later by `blast` when the projectile arrives.
     """
     cpm = m.cells_per_metre
     ox_m, oy_m = origin
@@ -164,6 +169,12 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
     hits = []
     for t, tgt in bodies:
         if t > stop_dist + 1e-6:
+            break
+        if not apply_damage:
+            # travelling explosive: the first body is where it detonates,
+            # but the damage comes from blast() on arrival, not here
+            stop_pt = (ox_m + dx * t, oy_m + dy * t)
+            segments = _trim(segments, ox_m, oy_m, dx, dy, t)
             break
         scale = 1.0
         for pd, pr in pierces:

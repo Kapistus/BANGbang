@@ -25,7 +25,9 @@ ASSETS = Path(__file__).resolve().parent.parent / "assets"
 CANVAS_PX = 200
 ART_PPM = 78.0           # authored pixels per world metre; ~80 px soldier art = ~1 m
 SPRITE_STEP = 3          # rotation cache granularity, degrees
-MUZZLE_M = 0.75          # grip (~body centre) -> muzzle, forward, metres
+MUZZLE_M = 1.10          # fallback muzzle offset (grip -> barrel tip, forward, m)
+MUZZLE_RIGHT_M = 0.18    # ...and to the shooter's right (barrel sits off-centre)
+                        # both used only for art files with no MUZZLE_PX entry
 RECOIL_M = 0.18          # how far the gun sprite kicks back on firing
 RECOIL_TIME = 0.09       # seconds for the kick to decay back to rest
 SWAP_TIME = 0.55         # weapon-change animation length
@@ -165,6 +167,19 @@ class SpriteBank:
         got = (raw, ox, oy)
         self._muzzle[key] = got
         return got
+
+    def muzzle_world(self, art: str, facing: float) -> "tuple[float, float]":
+        """(dx, dy) world-METRE offset from the character centre to the gun
+        muzzle, for this facing. Uses the same registered muzzle pixel the
+        flash does; falls back to MUZZLE_M straight ahead if the art has none."""
+        got = self._muzzle_off(art, "small") or self._muzzle_off(art, "big")
+        if got is None:
+            s, c = math.sin(facing), math.cos(facing)
+            return (c * MUZZLE_M - s * MUZZLE_RIGHT_M,
+                    s * MUZZLE_M + c * MUZZLE_RIGHT_M)
+        _raw, ox, oy = got
+        s, c = math.sin(facing), math.cos(facing)
+        return ((-ox * s - oy * c) / ART_PPM, (ox * c - oy * s) / ART_PPM)
 
     def flash(self, screen, art: str, layer: str, cx: float, cy: float,
               facing: float, roll_deg: float = 0.0, scale_mul: float = 1.0,

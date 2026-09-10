@@ -99,10 +99,12 @@ def _plasma(rng: random.Random) -> np.ndarray:
 
 
 def _footstep(rng: random.Random) -> np.ndarray:
-    n = int(0.055 * SR)
+    n = int(0.075 * SR)
     r = np.random.default_rng(rng.randrange(1 << 30))
-    x = _lp(r.uniform(-1, 1, n), 6) * _decay(n, 0.012)
-    return _norm(x, 0.5)
+    # heavy low-pass on the noise + a sub-bass thump = a low, dull footfall
+    thud = _lp(r.uniform(-1, 1, n), 16) * _decay(n, 0.022)
+    body = _sine(rng.uniform(46, 58), n) * _decay(n, 0.032) * 0.55
+    return _norm(thud + body, 0.38)
 
 
 def _clicks(rng: random.Random, k: int, spread: float, hi: bool) -> np.ndarray:
@@ -225,9 +227,13 @@ _FIRE_BY_CATEGORY = {
 
 
 def fire_clip(weapon) -> str:
-    if getattr(weapon, "blast_r", 0.0) > 0.0:
+    cat = getattr(weapon, "category", "")
+    # explosives launch with a boom - except energy/plasma/laser bolts, which
+    # keep their category zap (their detonation plays its own boom)
+    if getattr(weapon, "blast_r", 0.0) > 0.0 and cat not in (
+            "energy", "plasma", "laser"):
         return "boom"
-    return _FIRE_BY_CATEGORY.get(getattr(weapon, "category", ""), "gunshot")
+    return _FIRE_BY_CATEGORY.get(cat, "gunshot")
 
 
 def play_fire(weapon, gain: float = 1.0, pan: float = 0.0) -> None:

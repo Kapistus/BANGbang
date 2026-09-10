@@ -38,6 +38,9 @@ class Mode(str, Enum):
 # hysteresis dead band that keeps mode changes from chattering.
 A_COMBAT = 0.90
 A_SEARCH_ON = 0.55
+COMBAT_HOLD = 0.7    # keep fighting this long after a brief loss of contact, so a
+                    # guard doesn't flip COMBAT<->SEARCH (and head-scan) each frame
+                    # when the player hovers on a perception-range boundary
 A_SEARCH_OFF = 0.06
 
 SIGHT_GAIN = 3.5      # alert per second with the player identified in view
@@ -49,12 +52,20 @@ ENGAGED_FLOOR = 0.30  # alert cannot fall below this while the hunt timer runs
 SEARCH_TIME = 26.0    # seconds a guard keeps hunting after last real contact
 LOSE_SIGHT_ALERT = 0.85  # alert a guard drops to the instant it loses the player
 SHOT_MEMORY = 1.8     # seconds after being hit that the guard stays "under fire"
-BLIND_ENGAGE_M = 7.0  # a recent attacker this close is fought even without a cone sight
+BLIND_ENGAGE_M = 40.0  # a recent attacker within this is fought (cover-seek / return
+                       # fire) with no cone sight needed - being shot IS the trigger,
+                       # no waiting for the gunshot's sound to propagate
 HEAR_MIN = 0.10       # remaining sound energy that still registers
 
 ALERT_SPEEDUP = 0.9   # extra fraction of base speed at full alert
-TURN_BASE = 3.2       # rad/s
+TURN_BASE = 2.4       # rad/s (base head/aim turn rate; scaled up by alert)
+TURN_ALERT_MULT = 1.0  # extra turn rate at full alert (was 1.5 - felt "on a dime")
+AIM_ON = math.radians(7.0)   # a guard holds fire until `facing` is this close to
+                             # `_face_target` - it must swing the gun onto you
 STRIDE = 0.85         # metres between footstep sounds
+STUCK_S = 0.7         # seconds of no-progress before a guard tries a sidestep
+# beat between spotting the player and the first shot, by skill
+REACTION_S = {"veteran": 0.25, "seasoned": 0.40, "rookie": 0.60}
 
 VIEW_RANGE_M = 17.0
 FOV_IDENT = math.radians(40.0)    # half-angle of the identifying cone
@@ -64,7 +75,25 @@ PERIPH_RANGE_M = 7.0
 
 KEEP_MIN_M = 3.5      # back off if the player gets closer than this
 KEEP_MAX_M = 8.0      # advance if the player is further than this
+AUTO_RANGE_M = 7.0    # within this, an auto-capable guard hoses full-auto
+FIRE_SND_EVERY = 0.3  # min seconds between a guard's shot-noise propagation emits
 GUARD_FOOTSTEP_M = 5.0
+
+# skill tier -> (chance a burst is aimed off, max bearing error in radians).
+# This shifts the whole burst off the player (an aim error), it does NOT widen
+# the per-shot spread. "veteran" is the baseline (dead-on).
+SKILL_AIM_ERR = {
+    "veteran":  (0.0,  0.0),
+    "seasoned": (0.45, math.radians(4.5)),
+    "rookie":   (0.75, math.radians(10.0)),
+}
+
+# guards can sprint toward a distant target while alarmed, on their own stamina
+GUARD_SPRINT_MULT = 1.7
+SPRINT_MIN_M = 4.0       # only sprint when the move target is at least this far
+GUARD_STAM_DRAIN = 0.18  # per second sprinting (~5.5 s to empty)
+GUARD_STAM_REGEN = 0.09  # per second otherwise (~11 s to full)
+GUARD_STAM_UNLOCK = 0.30 # sprint re-enables once stamina climbs back to this
 RECOIL_TIME = 0.09       # gun-kick timer, seconds (visual only, read by main.py)
 FLASH_TIME = 0.05        # muzzle-flash timer, seconds (visual only)
 DEFAULT_PROFILE = "imperium_soldier"
@@ -101,6 +130,13 @@ class Guard(Combatant):
         wid = getattr(spec, "weapon", None) or ENEMY_PROFILES[profile]["weapon"]
         self.weapon = weapons.ROSTER.get(
             wid, weapons.ROSTER[ENEMY_PROFILES[profile]["weapon"]])
+        self.skill = getattr(spec, "skill", "veteran")
+        if self.skill not in SKILL_AIM_ERR:
+            self.skill = "veteran"
+        self._aim_err = 0.0        # bearing offset for the current burst
+        self.stamina = 1.0        # 0..1, sprint fuel
+        self.sprint_locked = False
+        self._want_sprint = False
         self.id = spec.id
         self.cpm = cells_per_metre
         self.pts = pts
@@ -111,6 +147,9 @@ class Guard(Combatant):
         self._face_target = 0.0
         self.since_step = 0.0
         self._blocked = False       # last move attempt made ~no progress
+        self._stuck_t = 0.0         # accumulated no-progress time (sidestep trigger)
+        self._combat_hold_until = -1e9
+        self._sb_hold = -1e9        # "shot was blocked recently" hysteresis
         self._cover = None          # (x, y) cover anchor being used, or None
         self._cover_next = 0.0      # earliest time to re-evaluate cover
         self._peeking = False       # currently leaning out of cover to fire
@@ -118,6 +157,8 @@ class Guard(Combatant):
         self._cur_side = 1.0        # which way this peek leans
         self._peek_last = 1.0       # last side that had a clean shot
         self.recoil_t = 0.0        # gun-kick timer, decays each update (visual)
+        self.snd_cache = {}        # one reusable sound field (like the player's step_cache)
+        self._fire_snd_t = -1e9    # last shot-noise emit; throttled by FIRE_SND_EVERY
         self.flash_t = 0.0         # muzzle-flash timer (visual)
         self.flash_roll = 0.0      # per-shot flash spin, degrees
         self.flash_scale = 1.0     # per-shot flash size jitter
@@ -147,7 +188,10 @@ class Guard(Combatant):
         return int(self.x * self.cpm), int(self.y * self.cpm)
 
     def _speed(self) -> float:
-        return self.speed * (1.0 + ALERT_SPEEDUP * self.alert)
+        base = self.speed * (1.0 + ALERT_SPEEDUP * self.alert)
+        if self._want_sprint and self.stamina > 0.0 and not self.sprint_locked:
+            return base * GUARD_SPRINT_MULT
+        return base
 
     def _route_facing(self) -> float:
         ax, ay = self.pts[self.i]
@@ -165,13 +209,20 @@ class Guard(Combatant):
         self.wait = 0.0
         self._cover = None
         self._peeking = False
+        self._aim_err = 0.0
+        self._stuck_t = 0.0
+        self._combat_hold_until = -1e9
+        self._sb_hold = -1e9
+        self.stamina = 1.0
+        self.sprint_locked = False
+        self._want_sprint = False
 
     # -- perception ---------------------------------------------------
 
     def sees(self, blocks_sight, player) -> int:
         """0 nothing, 1 identified (in the narrow cone), 3 peripheral only."""
-        if not player.alive:
-            return 0
+        if not player.alive or getattr(player, "concealed", False):
+            return 0                              # e.g. holding still in a bush
         dx, dy = player.x - self.x, player.y - self.y
         dist = math.hypot(dx, dy)
         if dist > VIEW_RANGE_M:
@@ -219,7 +270,7 @@ class Guard(Combatant):
     # -- motion primitives ------------------------------------------
 
     def _turn(self, dt: float) -> None:
-        rate = TURN_BASE * (1.0 + 1.5 * self.alert)
+        rate = TURN_BASE * (1.0 + TURN_ALERT_MULT * self.alert)
         d = (self._face_target - self.facing + math.pi) % (2 * math.pi) - math.pi
         self.facing += max(-rate * dt, min(rate * dt, d))
 
@@ -239,20 +290,41 @@ class Guard(Combatant):
             return 0.0
         if face:
             self._face_target = math.atan2(dy, dx)
+        if self.alert > 0.4 and d > SPRINT_MIN_M:
+            self._want_sprint = True          # alarmed + far to go -> sprint
         step = min(d, self._speed() * dt)
         bx, by = self.x, self.y
-        ux, uy = dx / d * step, dy / d * step
+        fx, fy = dx / d * step, dy / d * step      # straight toward the target
+        sidestep = self._stuck_t > STUCK_S
+        if sidestep:
+            # been grinding a wall - slip along it instead of into it, committing
+            # ~2 s to one direction before trying the other (no pathfinding, so
+            # this just keeps the guard moving until the way opens or a caller
+            # re-targets it)
+            side = 1.0 if int((self._stuck_t - STUCK_S) / 2.0) % 2 == 0 else -1.0
+            a = math.atan2(dy, dx) + side * (math.pi / 2.0)
+            ux, uy = math.cos(a) * step, math.sin(a) * step
+        else:
+            ux, uy = fx, fy
         if m.can_stand(self.x + ux, self.y, self.body_r):
             self.x += ux
         if m.can_stand(self.x, self.y + uy, self.body_r):
             self.y += uy
         moved = math.hypot(self.x - bx, self.y - by)
         self._blocked = moved < step * 0.35
+        if not sidestep and moved >= step * 0.35:
+            self._stuck_t = 0.0                    # normal progress
+        elif sidestep and (m.can_stand(self.x + fx, self.y, self.body_r)
+                           and m.can_stand(self.x, self.y + fy, self.body_r)):
+            self._stuck_t = 0.0                    # rounded it - path is open again
+        else:
+            self._stuck_t += dt                   # still stuck / still slipping
         self.since_step += moved
         if self.since_step >= STRIDE:
             self.since_step = 0.0
             emit_cb(self.x, self.y,
-                    gait_energy * (0.7 + 0.6 * self.alert), f"{self.id}/step")
+                    gait_energy * (0.7 + 0.6 * self.alert), f"{self.id}/step",
+                    self.snd_cache)
         return d - moved
 
     # -- per-mode behaviour ---------------------------------------
@@ -275,12 +347,13 @@ class Guard(Combatant):
             self.idle_until = now + rng.uniform(2.5, 6.0)
             self.mode = Mode.IDLE
             return
-        if rem < 0.10 or self._blocked:
+        if rem < 0.10 or self._blocked or self._stuck_t > STUCK_S:
             # reached it, or the leg is obstructed (a door shut, say) - either
             # way move on to the next waypoint rather than grind the wall
             self.i = (self.i + 1) % len(self.pts)
             self.wait = rng.uniform(0.6, 1.8)
             self._blocked = False
+            self._stuck_t = 0.0
 
     def _do_idle(self, dt, now):
         self.scan_t += dt
@@ -290,14 +363,27 @@ class Guard(Combatant):
 
     def _do_search(self, dt, now, m, rng, emit_cb):
         self.scan_t += dt
+        if now - self.last_hit_t < SHOT_MEMORY and self.hit_from is not None:
+            # under fire from range: march straight at the shot origin with the
+            # gun on it - no idle head-scan, no wandering, and NOT toward the
+            # jittery sound-bearing guess. this is what stops the "spazzing".
+            hx, hy = self.hit_from
+            self._step_toward(m, hx, hy, dt, emit_cb,
+                              GUARD_FOOTSTEP_M * self.cpm, face=False)
+            self._face_target = math.atan2(hy - self.y, hx - self.x)
+            return
         if self.investigate is None:
             self.investigate = (self.x, self.y)
         tx, ty = self.investigate
         rem = self._step_toward(m, tx, ty, dt, emit_cb,
                                 GUARD_FOOTSTEP_M * self.cpm)
         base = math.atan2(ty - self.y, tx - self.x)
-        self._face_target = base + math.sin(self.scan_t * 2.0) * 0.9
-        if rem < 0.5 or now >= self._poke_next or self._blocked:
+        # look firmly toward the source when alarmed; only idly scan when the
+        # lead is vague (low alert). stops the "hesitant, won't-turn" wobble.
+        wob = 0.9 * max(0.0, 1.0 - self.alert * 1.4)
+        self._face_target = base + math.sin(self.scan_t * 2.0) * wob
+        if (rem < 0.5 or now >= self._poke_next or self._blocked
+                or self._stuck_t > STUCK_S):
             self._poke_next = now + rng.uniform(1.5, 3.0)
             self._blocked = False
             for _ in range(6):
@@ -364,10 +450,9 @@ class Guard(Combatant):
             near = math.hypot(cx - self.x, cy - self.y)
             if near > max_near:
                 continue
-            if near > 1.8 and not line_of_sight(
-                    m.blocks_sight, self.x * cpm, self.y * cpm,
-                    cx * cpm, cy * cpm):
-                continue                          # can't straight-line to it
+            if near > 1.6 and self._bullet_block_dist(
+                    m.blocks_move, self.x, self.y, cx, cy) is not None:
+                continue                          # wall-slide can't reach it
             hb = self._bullet_block_dist(bbul, cx, cy, px, py)
             if hb is None or not (0.15 <= hb <= COVER_HUG_M):
                 continue
@@ -490,6 +575,11 @@ class Guard(Combatant):
         if self._cover is None:                   # open fight / flanking
             sb = self._bullet_block_dist(blocks_bullets, self.x, self.y,
                                          player.x, player.y)
+            if sb is not None:
+                self._sb_hold = now + 0.35        # a far/edge blocker flickers in
+                                                 # and out; treat it as blocked
+                                                 # for a beat so we don't jitter
+            sb_blocked = sb is not None or now < self._sb_hold
             u = dist or 1.0
             if sb is not None and sb <= 2.0 and now >= self._cover_next \
                     and self._peekable_from((self.x, self.y), m, blocks_bullets, player):
@@ -497,21 +587,25 @@ class Guard(Combatant):
                 self._cover = (self.x, self.y)
                 self._peek_end = now
                 moving = False
-            elif sb is not None:
-                # blocked shot, no peekable cover - commit to flanking one way
-                # around the obstacle for a beat rather than dithering
+            elif sb_blocked or now < self._flank_until:
+                # blocked shot (or still mid-commit) - flank one way for a full
+                # beat rather than snapping advance<->sidestep frame to frame
                 if now >= self._flank_until:
                     self._flank_dir = self._peek_last
                     self._flank_until = now + 1.8
-                s = self._flank_dir
-                tx = self.x - (dy / u) * 2.5 * s + (dx / u) * 1.2
-                ty = self.y + (dx / u) * 2.5 * s + (dy / u) * 1.2
-                if not m.can_stand(tx, ty, self.body_r):
-                    self._flank_dir = s = -s
-                    self._flank_until = now + 1.8
+                tgt = None
+                for s in (self._flank_dir, -self._flank_dir):
                     tx = self.x - (dy / u) * 2.5 * s + (dx / u) * 1.2
                     ty = self.y + (dx / u) * 2.5 * s + (dy / u) * 1.2
-                self._step_toward(m, tx, ty, dt, emit_cb, ge, face=False)
+                    if m.can_stand(tx, ty, self.body_r):
+                        tgt = (tx, ty)
+                        break
+                if tgt is not None:
+                    self._step_toward(m, tgt[0], tgt[1], dt, emit_cb, ge,
+                                      face=False)
+                else:
+                    moving = False        # boxed in - hold and face the player,
+                                          # do NOT thrash _flank_dir every frame
             elif dist > KEEP_MAX_M:
                 self._step_toward(m, player.x, player.y, dt, emit_cb, ge, face=False)
             elif dist < KEEP_MIN_M and dist > 1e-3:
@@ -534,27 +628,57 @@ class Guard(Combatant):
         if self._bullet_block_dist(blocks_bullets, self.x, self.y,
                                    player.x, player.y) is not None:
             return None                          # own cover in the way - hold fire
+        aim_off = abs((self._face_target - self.facing + math.pi)
+                      % (2 * math.pi) - math.pi)
+        if aim_off > AIM_ON:
+            return None                          # gun not on target yet - keep turning
 
-        self.fire_cd = w.burst_time
+        # fire mode: hose full-auto when close and committed, else the
+        # weapon's primary burst/semi pattern
+        auto = (w.has_auto and dist <= AUTO_RANGE_M
+                and self.mode == Mode.COMBAT and self.alert >= A_COMBAT)
+        self.fire_cd = w.auto_refire if auto else w.burst_time
+        rounds = 1 if auto else w.burst
+        acc = w.auto_accuracy if auto and w.auto_accuracy > 0.0 else None
+        # skill: roll a per-burst aim error (offsets the whole burst, not spread)
+        _p_off, _e_off = SKILL_AIM_ERR.get(self.skill, (0.0, 0.0))
+        self._aim_err = (rng.uniform(-_e_off, _e_off)
+                         if _p_off and rng.random() < _p_off else 0.0)
         if w.blast_r <= 0.0:
             self.recoil_t = RECOIL_TIME
             self.flash_t = FLASH_TIME
             self.flash_roll = random.uniform(-180.0, 180.0)
             self.flash_scale = random.uniform(0.85, 1.25)
+        # fire from the muzzle, ahead of the body, unless it lands in cover
+        ox = self.x + math.cos(self.facing) * weapons.MUZZLE_M
+        oy = self.y + math.sin(self.facing) * weapons.MUZZLE_M
+        _mx, _my = int(ox * self.cpm), int(oy * self.cpm)
+        h_, wd_ = blocks_bullets.shape
+        if not (0 <= _my < h_ and 0 <= _mx < wd_) or blocks_bullets[_my, _mx]:
+            ox, oy = self.x, self.y
         shots = []
-        for _ in range(w.burst):
+        for _ in range(rounds):
             if self.mag <= 0:
                 break
             self.mag -= 1
+            travels = w.blast_r > 0.0 and w.projectile_speed > 0.0
             for _p in range(w.pellets):
-                hd = self._face_target + weapons.jitter(w, dist, moving, rng)
+                hd = (self.facing + self._aim_err
+                      + weapons.pellet_offset(w, rng)
+                      + weapons.jitter(w, dist, moving, rng, acc))
                 sh = ballistics.fire_shot(m, blocks_bullets, pen, m.glass,
-                                          (self.x, self.y), hd, w,
-                                          [player], rng, now)
+                                          (ox, oy), hd, w,
+                                          [player], rng, now,
+                                          apply_damage=not travels)
                 shots.append(sh)
-                if w.blast_r > 0.0:
+                if w.blast_r > 0.0 and not travels:
+                    # instant blast; a travelling one is spawned by the caller
+                    # from the returned Shot and detonates on arrival
                     ballistics.blast(sh.impact, w.blast_r, w, [player], rng, now)
-        emit_cb(self.x, self.y, w.sound_reach_m * self.cpm, f"{self.id}/fire")
+        if now - self._fire_snd_t >= FIRE_SND_EVERY:
+            self._fire_snd_t = now
+            emit_cb(self.x, self.y, w.sound_reach_m * self.cpm,
+                    f"{self.id}/fire", self.snd_cache)
         return shots
 
     # -- top level ------------------------------------------------
@@ -581,8 +705,8 @@ class Guard(Combatant):
                          and self.hit_from is not None)
         if shot_recently:
             self.alert = 1.0
-            self.investigate = self.hit_from
             self.search_until = now + SEARCH_TIME
+            self.investigate = self.hit_from        # head for the shooter
 
         if band == 1:
             self.alert = min(1.0, self.alert + SIGHT_GAIN * dt)
@@ -594,7 +718,10 @@ class Guard(Combatant):
             self.search_until = now + SEARCH_TIME
         elif heard is not None:
             self.alert = min(1.0, self.alert + SOUND_GAIN * heard[0] * dt)
-            self.investigate = self._guess_source(heard)
+            if not shot_recently:
+                # a noisy long-range bearing guess must not fight the crisp
+                # hit_from we already set - that was the "spazzing" source
+                self.investigate = self._guess_source(heard)
             self.search_until = now + SEARCH_TIME
         else:
             hunting = (self.mode in (Mode.SEARCH, Mode.COMBAT)
@@ -608,12 +735,17 @@ class Guard(Combatant):
         # any live visual (identify OR peripheral) plus full alert is enough to
         # fight - peripheral range is point-blank, and staying in SEARCH there
         # just makes the guard scan past a target it can plainly see
+        if band in (1, 3):
+            self._combat_hold_until = now + COMBAT_HOLD
         if band in (1, 3) and player.alive and self.alert >= A_COMBAT:
             self.mode = Mode.COMBAT
         elif shot_recently and player.alive and pdist <= BLIND_ENGAGE_M:
             self.mode = Mode.COMBAT                 # point-blank attacker
         elif self.mode == Mode.COMBAT and band in (1, 3) and player.alive:
             pass                                   # hold the fight
+        elif (self.mode == Mode.COMBAT and player.alive
+              and now < self._combat_hold_until):
+            pass                                   # brief contact loss - hold on
         elif self.alert >= A_SEARCH_ON:
             self.mode = Mode.SEARCH
         elif self.alert <= A_SEARCH_OFF:
@@ -626,6 +758,9 @@ class Guard(Combatant):
             # full SEARCH_TIME from that moment
             self.search_until = now + SEARCH_TIME
             self.investigate = (player.x, player.y)
+            if prev != Mode.COMBAT:              # first-shot reaction beat
+                self.fire_cd = max(self.fire_cd,
+                                   REACTION_S.get(self.skill, 0.25))
         if prev == Mode.COMBAT and self.mode != Mode.COMBAT:
             self.alert = max(self.alert, LOSE_SIGHT_ALERT)
             self.search_until = now + SEARCH_TIME
@@ -645,6 +780,18 @@ class Guard(Combatant):
             self._do_idle(dt, now)
         else:
             self._do_patrol(dt, now, m, rng, emit_cb)
+
+        sprinting = (self._want_sprint and self.stamina > 0.0
+                     and not self.sprint_locked)
+        if sprinting:
+            self.stamina = max(0.0, self.stamina - GUARD_STAM_DRAIN * dt)
+            if self.stamina <= 0.0:
+                self.sprint_locked = True
+        else:
+            self.stamina = min(1.0, self.stamina + GUARD_STAM_REGEN * dt)
+            if self.sprint_locked and self.stamina >= GUARD_STAM_UNLOCK:
+                self.sprint_locked = False
+        self._want_sprint = False
 
         self._turn(dt)
         return shots

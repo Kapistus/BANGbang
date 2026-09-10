@@ -30,6 +30,7 @@ class TileDef:
     pen_cost: float
     door: bool
     glass: bool
+    bush: bool
     colour: tuple[int, int, int]
 
 
@@ -94,6 +95,7 @@ def load_tileset(path: str | Path | None = None) -> Tileset:
             pen_cost=float(spec.get("pen_cost", _derive_pen_cost(wk, bl, bs))),
             door=bool(spec.get("door", False)),
             glass=bool(spec.get("glass", False)),
+            bush=bool(spec.get("bush", tid == "bush")),
             colour=tuple(spec.get("colour", (180, 180, 180))),
         )
     return Tileset(
