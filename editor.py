@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parent
 MAPS_DIR = ROOT / "maps"
 GUARD_WEAPONS = ["combat_rifle", "smg", "combat_shotgun", "pistol",
                  "rail_rifle", "laser_rifle", "rocket_launcher"]
+GUARD_SKILLS = ["veteran", "seasoned", "rookie"]
 PANEL_W = 210
 STATUS_H = 26
 BG = (26, 26, 24)
@@ -147,7 +148,10 @@ class Editor:
         self.sel = self.ts.default_floor
         self.mode = "paint"                 # paint | spawn | guard
         self.guard_wip = []
-        self.guard_weapon = "combat_rifle"  # gun for the next route ([ ] cycles)
+        self.guard_weapon = "combat_rifle"  # gun for the next route ([ ] / , . cycle)
+        self.guard_skill = "veteran"        # aim tier for the next route (t cycles)
+        self.toast = ""
+        self.toast_t = 0
         self.show_grid = True
         self.panel_scroll = 0
         self.rows_hit = []                  # (rect, kind, value) filled per frame
@@ -208,7 +212,8 @@ class Editor:
         if len(self.guard_wip) >= 1:
             gid = f"g{len(self.doc['guards']) + 1}"
             self.doc["guards"].append({"id": gid, "patrol": self.guard_wip,
-                                       "weapon": self.guard_weapon})
+                                       "weapon": self.guard_weapon,
+                                       "skill": self.guard_skill})
             self.dirty = True
         self.guard_wip = []
 
@@ -229,17 +234,40 @@ class Editor:
             return True
         return False
 
+    def _flash(self, text):
+        self.toast = text
+        self.toast_t = pygame.time.get_ticks()
+
     def cycle_guard_weapon(self, mx, my, step):
-        """[ / ] : retag the route under the cursor, else the next-route default."""
+        """[ ] or , . : retag the route whose waypoint is under the cursor,
+        otherwise cycle the gun the NEXT route will be created with."""
         g = self.guard_near(mx, my) if self.mode == "guard" else None
         if g is not None:
             cur = g.get("weapon", "combat_rifle")
             i = GUARD_WEAPONS.index(cur) if cur in GUARD_WEAPONS else 0
             g["weapon"] = GUARD_WEAPONS[(i + step) % len(GUARD_WEAPONS)]
             self.dirty = True
+            self._flash(f"{g.get('id', 'route')}  weapon -> {g['weapon']}")
         else:
             i = GUARD_WEAPONS.index(self.guard_weapon)
             self.guard_weapon = GUARD_WEAPONS[(i + step) % len(GUARD_WEAPONS)]
+            hint = "" if self.mode == "guard" else "   (k = guard mode)"
+            self._flash(f"next route weapon -> {self.guard_weapon}{hint}")
+
+    def cycle_guard_skill(self, mx, my, step):
+        """t : retag the route under the cursor's aim tier, else the next one."""
+        g = self.guard_near(mx, my) if self.mode == "guard" else None
+        if g is not None:
+            cur = g.get("skill", "veteran")
+            i = GUARD_SKILLS.index(cur) if cur in GUARD_SKILLS else 0
+            g["skill"] = GUARD_SKILLS[(i + step) % len(GUARD_SKILLS)]
+            self.dirty = True
+            self._flash(f"{g.get('id', 'route')}  skill -> {g['skill']}")
+        else:
+            i = GUARD_SKILLS.index(self.guard_skill)
+            self.guard_skill = GUARD_SKILLS[(i + step) % len(GUARD_SKILLS)]
+            hint = "" if self.mode == "guard" else "   (k = guard mode)"
+            self._flash(f"next route skill -> {self.guard_skill}{hint}")
 
     def do_new(self):
         s = text_prompt(self.screen, self.font, "new map  cols,rows :",
@@ -419,7 +447,7 @@ class Editor:
                     self.bank.blit(self.screen, sprites.weapon_art(wid),
                                    pts[0][0], pts[0][1], face)
                 self._draw_body(pts[0][0], pts[0][1], GUARD_C)
-                lbl = f"{g.get('id', 'g')}  {wid}"
+                lbl = f"{g.get('id', 'g')}  {wid}  {g.get('skill', 'veteran')}"
                 self.screen.blit(self.small.render(lbl, True, TEXT),
                                  (pts[0][0] + 6, pts[0][1] - 6))
         if self.guard_wip:
@@ -439,13 +467,17 @@ class Editor:
         cell = f"{c},{r}" if self.in_grid(c, r) else "--"
         name = (self.path.name if self.path else "untitled") + ("*" if self.dirty else "")
         cur = {"paint": f"tile:{self.sel}", "spawn": "SET SPAWN (click a cell)",
-               "guard": (f"GUARD [{self.guard_weapon}]  LMB=waypoint  Enter=save  "
-                         f"[ ]=weapon (route or next)  RMB/Del=delete  "
+               "guard": (f"GUARD  next [{self.guard_weapon} / {self.guard_skill}]  "
+                         f"LMB=waypoint  Enter=save  [ ],. =weapon  t=skill  "
+                         f"(hover a waypoint to retag)  RMB/Del=delete  "
                          f"wpts:{len(self.guard_wip)}")
                }[self.mode]
         msg = (f"cell {cell:>7}   {cur}   |   {name}  {self.cols}x{self.rows} "
                f"z{self.zoom}   s save  l load  n new  o spawn  k guard  g grid")
         self.screen.blit(self.font.render(msg, True, DIM), (8, h - STATUS_H + 6))
+        if self.toast and pygame.time.get_ticks() - self.toast_t < 2000:
+            t = self.small.render(self.toast, True, SEL)
+            self.screen.blit(t, (w - t.get_width() - 10, h - STATUS_H + 7))
 
     # -- loop ----------------------------------------------------
 
@@ -524,9 +556,14 @@ class Editor:
         elif k == pygame.K_c and self.mode != "guard":
             self.doc["guards"] = []
             self.dirty = True
-        elif k in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
+        elif k in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
+                   pygame.K_COMMA, pygame.K_PERIOD):
             mx, my = pygame.mouse.get_pos()
-            self.cycle_guard_weapon(mx, my, -1 if k == pygame.K_LEFTBRACKET else 1)
+            back = k in (pygame.K_LEFTBRACKET, pygame.K_COMMA)
+            self.cycle_guard_weapon(mx, my, -1 if back else 1)
+        elif k == pygame.K_t:
+            mx, my = pygame.mouse.get_pos()
+            self.cycle_guard_skill(mx, my, -1 if shift else 1)
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.mode == "guard":
             self.commit_guard()
         elif k == pygame.K_BACKSPACE and self.mode == "guard" and self.guard_wip:

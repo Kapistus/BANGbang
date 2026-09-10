@@ -84,7 +84,7 @@ def load_any_map(path):
         + sorted(q.name for q in p.parent.glob("*.toml"))
     raise SystemExit(f"map not found: {path}\n"
                      f"available in {p.parent}/: {', '.join(here) or '(none)'}")
-from sim.vision import ConeSpec, VisibilityCache
+from sim.vision import ConeSpec, VisibilityCache, line_of_sight
 
 PX_PER_M = 48          # pixels per world metre (fixed; the camera scrolls)
 VIEW_PPM = 48          # 1920x1080 sweet spot: readable characters (~49 px), the
@@ -112,7 +112,14 @@ SOLVE_BUDGET = 1200
 SOUND_RENDER_MAX_COST = 5.0
 FPS_CAP = 60          # 0 = uncapped
 
-SPEED_CRAWL, SPEED_WALK, SPEED_RUN = 0.9, 2.2, 4.6
+SPEED_CRAWL, SPEED_WALK, SPEED_RUN = 0.9, 2.2, 6.0   # run +30% (was 4.6)
+SLING_SPEED_MULT = 1.20   # moving with the gun slung (not ready) is 20% faster
+RAISE_TIME = 0.35         # seconds to bring a slung weapon back up before it can fire
+
+STAMINA_DRAIN = 0.16      # per second while sprinting (~6 s to empty)
+STAMINA_REGEN_MOVE = 0.07  # per second while walking / sneaking (~14 s to full)
+STAMINA_REGEN_IDLE = 0.20  # per second while stationary (~5 s to full)
+STAMINA_UNLOCK = 0.25     # sprint re-enables once stamina climbs back to this
 
 # Metres travelled per footstep - this sets both the sound-propagation
 # cadence and the audible step rhythm. Walking patters (short spacing),
@@ -139,6 +146,8 @@ MAX_ACTIVE = 14
 RESPAWN_DELAY = 1.2
 TRACER_FADE = 0.18
 BLAST_FADE = 0.32
+BACKBLAST_FADE = 0.30       # rocket-launcher exhaust cone behind the shooter
+NEAR_MISS_M = 1.3          # a shot passing this close to a guard = "shot at"
 INTERACT_RANGE = 1.6
 
 VIS_SPEED = 140.0    # fine-cells/sec: sound-propagation speed (gates the ripple
@@ -196,6 +205,11 @@ MODE_COL = {
 TRACER_AIR = (255, 240, 180)
 TRACER_WALL = (150, 60, 45)
 DEAD = (72, 70, 66)
+DOOR_WOOD = (150, 118, 78)      # the door leaf
+DOOR_FRAME = (86, 66, 40)       # frame / seam on a closed door
+DOOR_OPEN_EDGE = (110, 175, 110)  # green outline marks a passable doorway
+DOOR_FLOOR = (206, 202, 190)    # what shows through an opened doorway
+GUARD_DOOR_REACH_M = 1.4        # a blocked guard shoves a door within this
 
 
 class ActiveSound:
@@ -288,6 +302,16 @@ def static_overlay(field: np.ndarray, m: TileMap, lo, hi, rgb):
     return scale_to_view(s, m, field.shape[1], field.shape[0])
 
 
+def seg_point_dist(px, py, ax, ay, bx, by):
+    """Shortest distance from point (px,py) to the segment (ax,ay)-(bx,by)."""
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
 def find_doors(m: TileMap) -> dict[tuple[int, int], bool]:
     """Map coarse (row, col) of every door tile to its open state."""
     out = {}
@@ -307,6 +331,7 @@ def set_door(m: TileMap, cost, r: int, c: int, is_open: bool) -> None:
     t = m.tiles[m.chars[r, c]]
     m.blocks_move[y0:y1, x0:x1] = False if is_open else t.blocks_move
     m.blocks_sight[y0:y1, x0:x1] = False if is_open else t.blocks_sight
+    m.blocks_bullets[y0:y1, x0:x1] = False if is_open else t.blocks_bullets
     val = 1.0 if is_open else t.sound_cost
     m.sound_cost[y0:y1, x0:x1] = val
     cost[y0:y1, x0:x1] = val
@@ -432,9 +457,13 @@ def main(map_path: str = "maps/arena.toml") -> None:
     world = pygame.Surface((world_w, world_h))   # the full map is drawn here,
     screen = window                              # then a camera rect is blitted
     cam_x = cam_y = 0
-    pygame.display.set_caption(f"stealth debug \u2014 {m.name}")
+    pygame.display.set_caption(f"BANGbang \u2014 {m.name}")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("consolas,monospace", 13)
+    font_mid = pygame.font.SysFont("consolas,monospace", 18, bold=True)
+    font_big = pygame.font.SysFont("consolas,monospace", 34, bold=True)
+    pygame.mouse.set_visible(False)          # we draw our own crosshair
+    show_debug = False                       # \u00a7 toggles the raw debug overlay
 
     bank = sprites.SpriteBank()
     bank.load()
@@ -458,6 +487,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
     known = np.zeros(m.blocks_sight.shape, dtype=bool)
 
     px_, py_ = m.player_spawn
+    prev_px, prev_py = px_, py_
+    in_bush = False
     facing = -math.pi / 2
     since_step = 0.0
     sounds: list[ActiveSound] = []
@@ -489,6 +520,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
     loadout = list(weapons.DEFAULT_LOADOUT)
     tracers: list = []          # (segments, t0)
     blasts: list = []           # ((x, y), radius_m, t0) for explosion rings
+    rockets: list = []          # travelling explosives: dicts, see spawn below
+    backblasts: list = []       # {x,y,ang,t0} exhaust cones behind a backblast weapon
     respawn_t = 0.0
     show_cones = False
 
@@ -508,8 +541,9 @@ def main(map_path: str = "maps/arena.toml") -> None:
     prof_peak = {}
 
     _ov_h, _ov_w = m.blocks_sight.shape
+    # scratch surface for the fog/ripple overlay - only the on-screen slice of
+    # the fine grid, recreated when the visible slice changes size (map edges)
     ov_surf = pygame.Surface((_ov_w, _ov_h), pygame.SRCALPHA)
-    ov_scaled = pygame.Surface((world_w, world_h), pygame.SRCALPHA)
 
     guards = [ai.Guard(g, cpm) for g in m.guards]
     memory: dict[str, tuple[float, float, float, float]] = {}
@@ -520,12 +554,20 @@ def main(map_path: str = "maps/arena.toml") -> None:
     doors = find_doors(m)
     wi = 0
     mags = [weapons.ROSTER[n].mag for n in loadout]
-    fmode = [0] * len(loadout)     # index into each weapon's fire_modes()
+    reserves = [weapons.ROSTER[n].reserve for n in loadout]   # -1 = unlimited
+    # index into each weapon's fire_modes(); the SMG starts on full-auto
+    fmode = [(weapons.ROSTER[n].fire_modes().index("auto")
+              if n == "smg" and "auto" in weapons.ROSTER[n].fire_modes() else 0)
+             for n in loadout]
     reload_t = 0.0
     fire_cd = 0.0
     swap_t = 0.0                   # weapon-change animation timer
     recoil_t = 0.0                 # gun-kick timer (player)
     flash_t = 0.0                  # muzzle-flash timer (player)
+    slung = False                  # gun lowered (h) - faster, cannot fire
+    raise_t = 0.0                  # bringing a slung gun back up
+    stamina = 1.0                  # 0..1, drained by sprinting
+    sprint_locked = False          # true when stamina bottomed out, until STAMINA_UNLOCK
     flash_roll = 0.0               # per-shot flash spin, degrees
     flash_scale = 1.0              # per-shot flash size jitter
     msg = ""
@@ -605,21 +647,56 @@ def main(map_path: str = "maps/arena.toml") -> None:
         base = math.atan2(ay - py_, ax - px_)
         aim_d = math.hypot(ax - px_, ay - py_)
         live = [g for g in guards if g.alive]
+        # fire from the gun's actual muzzle point (per-art, matches the flash) -
+        # unless that would put the origin inside cover the player is hugging
+        if bank.ok:
+            _mdx, _mdy = bank.muzzle_world(sprites.weapon_art(loadout[wi]), facing)
+        else:
+            _mdx = math.cos(base) * weapons.MUZZLE_M
+            _mdy = math.sin(base) * weapons.MUZZLE_M
+        ox, oy = px_ + _mdx, py_ + _mdy
+        _mcx, _mcy = m.cell_of(ox, oy)
+        if bbul[_mcy, _mcx]:
+            ox, oy = px_, py_
+        travels = w.blast_r > 0.0 and w.projectile_speed > 0.0
         for _ in range(rounds if rounds else w.burst):
             if mags[wi] <= 0:
                 break
             mags[wi] -= 1
             for _p in range(w.pellets):
-                hd = base + weapons.jitter(w, aim_d, moving, rng, acc)
-                sh = ballistics.fire_shot(m, bbul, pen, m.glass, (px_, py_),
-                                          hd, w, live, rng, now)
-                if sh.segments:
+                hd = (base + weapons.pellet_offset(w, rng)
+                      + weapons.jitter(w, aim_d, moving, rng, acc))
+                sh = ballistics.fire_shot(m, bbul, pen, m.glass, (ox, oy),
+                                          hd, w, live, rng, now,
+                                          apply_damage=not travels)
+                if sh.segments and not travels:
                     tracers.append((sh.segments, now))
                 if sh.shattered:
                     break_glass(sh.shattered)
-                if w.blast_r > 0.0:
-                    ballistics.blast(sh.impact, w.blast_r, w, live, rng, now)
+                # a shot that cracks past a guard still counts as "being shot
+                # at" - so a distant back-shot makes them whirl, not just a hit
+                _hit_ids = {id(h.target) for h in sh.hits}
+                for _g in live:
+                    if id(_g) in _hit_ids:
+                        continue
+                    if seg_point_dist(_g.x, _g.y, ox, oy, *sh.impact) < NEAR_MISS_M:
+                        _g.last_hit_t = now
+                        _g.hit_from = (ox, oy)
+                if travels:
+                    ix, iy = sh.impact
+                    d = math.hypot(ix - ox, iy - oy)
+                    rockets.append({"x": ox, "y": oy, "dx": math.cos(hd),
+                                    "dy": math.sin(hd), "w": w, "ix": ix,
+                                    "iy": iy, "dist": d, "flown": 0.0})
+                elif w.blast_r > 0.0:
+                    # the shooter is not immune to their own blast
+                    hit = live + [player] if player.alive else live
+                    ballistics.blast(sh.impact, w.blast_r, w, hit, rng, now)
                     blasts.append((sh.impact, w.blast_r, now))
+        if w.backblast:
+            backblasts.append({"x": px_ - math.cos(base) * 0.55,
+                               "y": py_ - math.sin(base) * 0.55,
+                               "ang": base + math.pi, "t0": now})
 
     running = True
     while running:
@@ -650,6 +727,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     known[:] = False
                 elif ev.key == pygame.K_F9:
                     show_prof = not show_prof
+                elif ev.unicode == "§" or ev.key == pygame.K_BACKQUOTE:
+                    show_debug = not show_debug
                 elif ev.key == pygame.K_F10:
                     show_own_sound = not show_own_sound
                 elif ev.key == pygame.K_F11:
@@ -670,15 +749,23 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 elif ev.key == pygame.K_r:
                     w = weapons.ROSTER[loadout[wi]]
                     if reload_t <= 0.0 and swap_t <= 0.0 and mags[wi] < w.mag:
-                        reload_t = w.reload_s
-                        msg, msg_t = f"reloading {w.name}", now
-                        sfx("reload")
+                        if reserves[wi] == 0:
+                            msg, msg_t = f"{w.name}: out of ammo", now
+                        else:
+                            reload_t = w.reload_step
+                            msg, msg_t = f"reloading {w.name}", now
+                            sfx("reload")
+                elif ev.key == pygame.K_h and swap_t <= 0.0:
+                    slung = not slung
+                    raise_t = RAISE_TIME if not slung else 0.0
+                    msg, msg_t = ("weapon slung" if slung else "weapon ready"), now
                 elif pygame.K_1 <= ev.key <= pygame.K_9:
                     idx = ev.key - pygame.K_1
                     if idx < len(loadout) and idx != wi and swap_t <= 0.0:
                         wi = idx
                         reload_t = 0.0
                         swap_t = sprites.SWAP_TIME
+                        slung, raise_t = False, 0.0   # a new weapon comes up ready
                         msg, msg_t = f"switched to {weapons.ROSTER[loadout[wi]].name}", now
                 elif ev.key == pygame.K_f:
                     best, bd = None, INTERACT_RANGE
@@ -712,12 +799,22 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     wi = (wi - (1 if ev.y > 0 else -1)) % len(loadout)
                     reload_t = 0.0
                     swap_t = sprites.SWAP_TIME
+                    slung, raise_t = False, 0.0
                     msg, msg_t = f"switched to {weapons.ROSTER[loadout[wi]].name}", now
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if pygame.mouse.get_pos()[1] < view_h:
                     w = weapons.ROSTER[loadout[wi]]
                     auto = cur_fire_mode() == "auto"
-                    if reload_t > 0.0 or fire_cd > 0.0 or swap_t > 0.0 or player.hp <= 0.0:
+                    # firing cancels a shell-by-shell reload in progress
+                    if reload_t > 0.0 and w.shell_reload and mags[wi] > 0:
+                        reload_t = 0.0
+                        msg, msg_t = "reload interrupted", now
+                    if slung or raise_t > 0.0:
+                        if slung:                       # a slung gun raises first
+                            slung = False
+                            raise_t = RAISE_TIME
+                            msg, msg_t = "weapon ready", now
+                    elif reload_t > 0.0 or fire_cd > 0.0 or swap_t > 0.0 or player.hp <= 0.0:
                         pass
                     elif mags[wi] > 0:
                         # a tap always fires one action; holding streams via the
@@ -734,27 +831,46 @@ def main(map_path: str = "maps/arena.toml") -> None:
                             flash_t = sprites.FLASH_TIME
                             flash_roll = rng.uniform(-180.0, 180.0)
                             flash_scale = rng.uniform(0.85, 1.25)
-                    elif reload_t <= 0.0 and mags[wi] < w.mag:
-                        reload_t = w.reload_s        # click on empty -> reload
-                        msg, msg_t = f"reloading {w.name}", now
-                        sfx("reload")
+                    else:
+                        # empty: the gun never reloads on its own - press R
+                        emit(m, cost, px_, py_, e_dry, "dryfire", sounds, now,
+                             jobs=jobs)
+                        msg, msg_t = f"{w.name}: empty - press R", now
 
         if not paused:
             fire_cd = max(0.0, fire_cd - dt)
             swap_t = max(0.0, swap_t - dt)
             recoil_t = max(0.0, recoil_t - dt)
             flash_t = max(0.0, flash_t - dt)
+            raise_t = max(0.0, raise_t - dt)
             if reload_t > 0.0:
                 reload_t -= dt
                 if reload_t <= 0.0:
                     reload_t = 0.0
-                    mags[wi] = weapons.ROSTER[loadout[wi]].mag
+                    _rw = weapons.ROSTER[loadout[wi]]
                     emit(m, cost, px_, py_, e_mag, "magazine", sounds, now, jobs=jobs)
                     sfx("magazine")
-                    msg, msg_t = "reloaded", now
+                    if _rw.shell_reload:
+                        mags[wi] += 1                            # one shell
+                        if reserves[wi] > 0:
+                            reserves[wi] -= 1
+                        if mags[wi] < _rw.mag and reserves[wi] != 0:
+                            reload_t = _rw.shell_reload_s        # keep loading
+                        else:
+                            msg, msg_t = "reloaded", now
+                    else:
+                        _need = _rw.mag - mags[wi]
+                        if reserves[wi] < 0:
+                            mags[wi] = _rw.mag
+                        else:
+                            _take = min(_need, reserves[wi])
+                            mags[wi] += _take
+                            reserves[wi] -= _take
+                        msg, msg_t = "reloaded", now
             # full-auto alternate fire: fire while the button is held down
             if (player.hp > 0.0 and cur_fire_mode() == "auto"
                     and fire_cd <= 0.0 and reload_t <= 0.0 and swap_t <= 0.0
+                    and not slung and raise_t <= 0.0
                     and mags[wi] > 0
                     and pygame.mouse.get_pressed()[0]
                     and pygame.mouse.get_pos()[1] < view_h):
@@ -774,12 +890,30 @@ def main(map_path: str = "maps/arena.toml") -> None:
         vx = (keys[pygame.K_d] or keys[pygame.K_RIGHT]) - (keys[pygame.K_a] or keys[pygame.K_LEFT])
         vy = (keys[pygame.K_s] or keys[pygame.K_DOWN]) - (keys[pygame.K_w] or keys[pygame.K_UP])
 
+        want_run = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+        moving_now = bool(vx or vy) and not paused
         if keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]:
-            speed, gait = SPEED_CRAWL, "crawl"
-        elif keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
-            speed, gait = SPEED_RUN, "run"
+            gait = "crawl"
+        elif want_run and not sprint_locked and stamina > 0.0:
+            gait = "run"
         else:
-            speed, gait = SPEED_WALK, "walk"
+            gait = "walk"
+        speed = {"crawl": SPEED_CRAWL, "walk": SPEED_WALK, "run": SPEED_RUN}[gait]
+        if slung:
+            speed *= SLING_SPEED_MULT
+
+        # stamina: sprinting burns it, standing still refills it fastest,
+        # walking/sneaking refills it slowly
+        if not paused:
+            if gait == "run" and moving_now:
+                stamina = max(0.0, stamina - STAMINA_DRAIN * dt)
+                if stamina <= 0.0:
+                    sprint_locked = True
+            else:
+                rate = STAMINA_REGEN_MOVE if moving_now else STAMINA_REGEN_IDLE
+                stamina = min(1.0, stamina + rate * dt)
+                if sprint_locked and stamina >= STAMINA_UNLOCK:
+                    sprint_locked = False
 
         if (vx or vy) and not paused:
             n = math.hypot(vx, vy)
@@ -796,13 +930,22 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 emit(m, cost, px_, py_, e, f"step/{gait}", sounds, now,
                      cache=step_cache, jobs=jobs)
                 if gait != "crawl":          # sneaking makes no audible step
-                    sfx("footstep", 0.15 if gait == "walk" else 0.24)
+                    sfx("footstep", 0.09 if gait == "walk" else 0.15)
 
         player.x, player.y = px_, py_
+
+        # bush concealment: standing still inside foliage hides you from the AI;
+        # the moment you move you rustle it and become visible again
+        _bcx, _bcy = m.cell_of(px_, py_)
+        in_bush = bool(m.bush[_bcy, _bcx])
+        moved_now = (px_ != prev_px or py_ != prev_py)
+        prev_px, prev_py = px_, py_
+        player.concealed = in_bush and not moved_now and player.hp > 0.0
+
         if not paused and player.hp > 0.0:
-            def _gemit(gx, gy, ge, glabel):
+            def _gemit(gx, gy, ge, glabel, cache=None):
                 emit(m, cost, gx, gy, ge, glabel, sounds, now,
-                     jobs=jobs, enemy=True)
+                     cache=cache, jobs=jobs, enemy=True)
             for g in guards:
                 g.tick(dt, now)
                 if not g.alive:
@@ -814,8 +957,65 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     if sh.shattered:
                         break_glass(sh.shattered)
                     if g.weapon.blast_r > 0.0:
-                        blasts.append((sh.impact, g.weapon.blast_r, now))
+                        if g.weapon.projectile_speed > 0.0 and sh.segments:
+                            o = sh.segments[0][0]
+                            ix, iy = sh.impact
+                            d = math.hypot(ix - o[0], iy - o[1])
+                            if d > 1e-6:
+                                dxn, dyn = (ix - o[0]) / d, (iy - o[1]) / d
+                                rockets.append({
+                                    "x": o[0], "y": o[1],
+                                    "dx": dxn, "dy": dyn,
+                                    "w": g.weapon, "ix": ix, "iy": iy,
+                                    "dist": d, "flown": 0.0})
+                                if g.weapon.backblast:
+                                    backblasts.append({
+                                        "x": g.x - dxn * 0.55,
+                                        "y": g.y - dyn * 0.55,
+                                        "ang": math.atan2(-dyn, -dxn),
+                                        "t0": now})
+                        else:
+                            blasts.append((sh.impact, g.weapon.blast_r, now))
+                # a guard stuck against a closed door ahead of it shoves it open
+                if getattr(g, "_blocked", False):
+                    _ft = getattr(g, "_face_target", g.facing)
+                    fx, fy = math.cos(_ft), math.sin(_ft)
+                    for (r_, c_), is_open in doors.items():
+                        if is_open:
+                            continue
+                        vx_, vy_ = c_ + 0.5 - g.x, r_ + 0.5 - g.y
+                        if (math.hypot(vx_, vy_) < GUARD_DOOR_REACH_M
+                                and vx_ * fx + vy_ * fy > 0.0):
+                            doors[(r_, c_)] = True
+                            set_door(m, cost, r_, c_, True)
+                            vis_cache.invalidate()
+                            sounds.clear()
+                            emit(m, cost, c_ + 0.5, r_ + 0.5, e_knock * 0.7,
+                                 f"{g.id}/door", sounds, now, jobs=jobs, enemy=True)
+                            sfx("door")
+                            break
             player.tick(dt, now)
+
+        if not paused and rockets:
+            still = []
+            for rk in rockets:
+                v = rk["w"].projectile_speed * dt
+                rk["x"] += rk["dx"] * v
+                rk["y"] += rk["dy"] * v
+                rk["flown"] += v
+                if rk["flown"] >= rk["dist"]:
+                    ctr = (rk["ix"], rk["iy"])
+                    tgts = [g for g in guards if g.alive]
+                    if player.alive:
+                        tgts.append(player)
+                    ballistics.blast(ctr, rk["w"].blast_r, rk["w"], tgts, rng, now)
+                    blasts.append((ctr, rk["w"].blast_r, now))
+                    emit(m, cost, ctr[0], ctr[1], rk["w"].sound_reach_m * cpm,
+                         "explosion", sounds, now, jobs=jobs)
+                    sfx("boom")
+                else:
+                    still.append(rk)
+            rockets = still
 
         if not paused:
             if player.hp <= 0.0 and respawn_t <= 0.0:
@@ -827,6 +1027,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     px_, py_ = m.player_spawn
                     player.x, player.y = px_, py_
                     player.heal_full()
+                    slung, raise_t = False, 0.0
+                    stamina, sprint_locked = 1.0, False
                     for g in guards:
                         g.calm()
                     sounds.clear()
@@ -870,8 +1072,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     "rem": rem,
                     "dir": b is not None and rem >= CUE_MIN_ENERGY,
                 })
-                sfx(audio.enemy_clip(snd.label),
-                    gain=min(1.0, rem * 1.3),
+                _cg = min(1.0, rem * 1.3)
+                if snd.label.endswith("/step"):
+                    _cg *= 0.4                # footsteps are a faint cue, not loud
+                sfx(audio.enemy_clip(snd.label), gain=_cg,
                     pan=(float(b[0]) if b else 0.0))
         cues = [c for c in cues if now - c["t"] < CUE_FADE]
 
@@ -879,10 +1083,24 @@ def main(map_path: str = "maps/arena.toml") -> None:
 
         _t = time.perf_counter()
         screen = world                  # world-space draws target the full map
-        screen.fill(BG)
-        screen.blit(base, (0, 0))
+        screen.blit(base, (0, 0))       # opaque + full-size, so it clears too
         if active_ov is not None:
             screen.blit(overlays[active_ov][1], (0, 0))
+
+        # door state, drawn under the fog: solid leaf = shut, hollow green =
+        # open (with the swung leaf tucked against a jamb)
+        for (r_, c_), is_open in doors.items():
+            drc = pygame.Rect(int(c_ * PX_PER_M), int(r_ * PX_PER_M),
+                              int(PX_PER_M), int(PX_PER_M))
+            if is_open:
+                pygame.draw.rect(screen, DOOR_FLOOR, drc)
+                lw = max(3, int(PX_PER_M * 0.22))
+                pygame.draw.rect(screen, DOOR_WOOD, (drc.x, drc.y, lw, drc.h))
+                pygame.draw.rect(screen, DOOR_OPEN_EDGE, drc, 2)
+            else:
+                pygame.draw.rect(screen, DOOR_WOOD, drc)
+                pygame.draw.rect(screen, DOOR_FRAME, drc, 2)
+                pygame.draw.line(screen, DOOR_FRAME, drc.midtop, drc.midbottom, 1)
         prof["base"] = (time.perf_counter() - _t) * 1000
 
         ppc = PX_PER_M / m.cells_per_metre
@@ -899,12 +1117,44 @@ def main(map_path: str = "maps/arena.toml") -> None:
         ripple_buf[:] = 0.0
         ripple_enemy[:] = 0.0
         any_ripple = False
-        for snd in sounds:
+        # fine-cell rect currently on screen
+        vx0, vy0 = cam_x / ppc, cam_y / ppc
+        vx1, vy1 = (cam_x + view_w) / ppc, (cam_y + view_h) / ppc
+        band = 2.5
+        # only the last few sounds can still have a visible wavefront; cap the
+        # per-frame array work so a burst of gunfire cannot stall the frame
+        for snd in sounds[-8:]:
+            # bail before any array work if this sound will not be drawn at all
+            if snd.enemy and enemy_mode != 2:
+                continue
+            if not snd.enemy and not show_own_sound:
+                continue
             f = snd.field
-            el = snd.elapsed_cells(now)
+            ox, oy = f.origin
+            # an enemy ripple is a DIRECTION cue: only show it when the player
+            # has no line of sight to the source (if you can see it, you don't
+            # need a wave pointing at it), and only when the sound actually
+            # reaches the player - then dim the ring by how loud it is there
+            if snd.enemy:
+                if line_of_sight(m.blocks_sight, pc[0], pc[1], ox, oy):
+                    continue
+                ploss = f.arrival(*pc)
+                if not math.isfinite(ploss) or ploss > snd.energy:
+                    continue
+                p_rem = 1.0 - ploss / snd.energy
+            else:
+                p_rem = 1.0
             t, tv = f.t, f.travel
-            band = 2.5
+            el = snd.elapsed_cells(now)
             if el - band > f.max_travel:
+                continue
+            # cull if the expanding ring's radius does not currently bracket the
+            # visible rectangle (it has already swept past, or not reached it)
+            near_x = 0.0 if vx0 <= ox <= vx1 else min(abs(ox - vx0), abs(ox - vx1))
+            near_y = 0.0 if vy0 <= oy <= vy1 else min(abs(oy - vy0), abs(oy - vy1))
+            far = math.hypot(max(abs(ox - vx0), abs(ox - vx1)),
+                             max(abs(oy - vy0), abs(oy - vy1)))
+            if el - band > far or el + band < math.hypot(near_x, near_y):
                 continue
             # the ring follows geometric travel, so it expands at a constant
             # speed; brightness follows attenuation, so it dims where the
@@ -916,15 +1166,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
                             & open_sub, (1.0 - d / band) ** 2, 0.0)
             if ring.max() <= 0.0:
                 continue
-            if snd.enemy and enemy_mode != 2:
-                continue
-            if not snd.enemy and not show_own_sound:
-                continue
             any_ripple = True
             atten = np.where(np.isfinite(t), 1.0 - np.clip(t / snd.energy, 0, 1), 0.0)
             dest = ripple_enemy if snd.enemy else ripple_buf
             sub = dest[f.y0:f.y0 + t.shape[0], f.x0:f.x0 + t.shape[1]]
-            np.maximum(sub, ring * atten * 235, out=sub)
+            np.maximum(sub, ring * atten * (235.0 * (0.3 + 0.7 * p_rem)), out=sub)
         prof["ripple"] = (time.perf_counter() - _t) * 1000
 
         _t = time.perf_counter()
@@ -933,6 +1179,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
         inten_raw = vf.cone_intensity(facing, cone)
         prof["vision"] = (time.perf_counter() - _t) * 1000
         h_, w_ = inten_raw.shape
+        if in_bush:
+            # hunkered in foliage: you can't see out, only the leaves around you
+            bsub = m.bush[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
+            inten_raw = np.where(bsub, inten_raw, 0.0)
         known[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_] |= inten_raw > 0.03
 
         _t = time.perf_counter()
@@ -969,14 +1219,27 @@ def main(map_path: str = "maps/arena.toml") -> None:
             ov_a = out_a
 
         if any_ripple or show_fog:
+            # composite only the fine-grid slice that is on screen, then scale
+            # that to viewport pixels - not the whole world every frame
+            foh, fow = ov_a.shape
+            mgn = FOG_BLUR_R + 2
+            fx0 = max(0, int(cam_x / ppc) - mgn)
+            fy0 = max(0, int(cam_y / ppc) - mgn)
+            fx1 = min(fow, int((cam_x + view_w) / ppc) + mgn + 1)
+            fy1 = min(foh, int((cam_y + view_h) / ppc) + mgn + 1)
+            fw, fh = fx1 - fx0, fy1 - fy0
+            if ov_surf.get_size() != (fw, fh):
+                ov_surf = pygame.Surface((fw, fh), pygame.SRCALPHA)
             px3 = pygame.surfarray.pixels3d(ov_surf)
             pxa = pygame.surfarray.pixels_alpha(ov_surf)
-            px3[:, :, :] = np.transpose(ov_rgb.astype(np.uint8), (1, 0, 2))
-            pxa[:, :] = np.transpose(
-                np.clip(ov_a * 255.0, 0, 255)).astype(np.uint8)
+            px3[:, :, :] = np.transpose(
+                ov_rgb[fy0:fy1, fx0:fx1].astype(np.uint8), (1, 0, 2))
+            pxa[:, :] = np.transpose(np.clip(
+                ov_a[fy0:fy1, fx0:fx1] * 255.0, 0, 255)).astype(np.uint8)
             del px3, pxa
-            pygame.transform.scale(ov_surf, (world_w, world_h), ov_scaled)
-            screen.blit(ov_scaled, (0, 0))
+            scaled = pygame.transform.scale(
+                ov_surf, (round(fw * ppc), round(fh * ppc)))
+            screen.blit(scaled, (round(fx0 * ppc), round(fy0 * ppc)))
         prof["overlay"] = (time.perf_counter() - _t) * 1000
 
         if enemy_mode == 1:
@@ -1035,18 +1298,18 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 memory[g.id] = (g.x, g.y, g.facing, now)
                 col = MODE_COL[g.mode]
                 tense = g.mode in (ai.Mode.COMBAT, ai.Mode.SEARCH)
-                slung = g.reload_t > 0.0 or not tense   # reloading -> gun down
+                g_slung = g.reload_t > 0.0 or not tense   # reloading -> gun down
                 if bank.ok:
-                    bank.blit(screen, "soldier_idle" if slung else "soldier_ready",
+                    bank.blit(screen, "soldier_idle" if g_slung else "soldier_ready",
                               sx, sy, g.facing)
                     gkick = (g.recoil_t / ai.RECOIL_TIME
                              * sprites.RECOIL_M * PX_PER_M)
                     gwx = sx - math.cos(g.facing) * gkick
                     gwy = sy - math.sin(g.facing) * gkick
                     bank.blit(screen,
-                              "weapon_sling" if slung else sprites.weapon_art_for(g.weapon),
+                              "weapon_sling" if g_slung else sprites.weapon_art_for(g.weapon),
                               gwx, gwy, g.facing)
-                    if not slung:
+                    if not g_slung:
                         draw_muzzle(sprites.weapon_art_for(g.weapon), gwx, gwy,
                                     g.facing, g.flash_t, g.flash_roll, g.flash_scale)
                     pygame.draw.circle(screen, col, (int(sx), int(sy)), 12, 1)
@@ -1064,6 +1327,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 if g.max_shields > 0 and g.shields > 0:
                     pygame.draw.rect(screen, (90, 160, 230),
                                      (sx - 9, sy - 17, int(18 * g.shields / g.max_shields), 2))
+                if g.stamina < 0.98:            # sprint fuel (only when spent)
+                    pygame.draw.rect(screen, (20, 20, 20), (sx - 9, sy - 20, 18, 2))
+                    pygame.draw.rect(
+                        screen,
+                        (120, 120, 120) if g.sprint_locked else (210, 185, 110),
+                        (sx - 9, sy - 20, int(18 * g.stamina), 2))
             elif band == 3:
                 pygame.draw.circle(screen, BLIP, (int(sx), int(sy)), 5, 2)
             elif g.id in memory:
@@ -1075,8 +1344,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 age = font.render(f"{now - mt:.0f}s", True, GHOST)
                 screen.blit(age, (gx + 9, gy - 18))
 
+        # the sound-field probe at the cursor is a debug visualisation only
+        # (it draws a line straight to the emitter) - hidden unless § is on
         probe_txt = "probe: nothing heard at cursor"
-        if sounds:
+        if show_debug and sounds:
             f = sounds[-1].field
             arr = f.arrival(*probe)
             if math.isfinite(arr):
@@ -1113,6 +1384,33 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     (p1[0] * PX_PER_M, p1[1] * PX_PER_M), 2 if air else 1)
         tracers = [tp for tp in tracers if now - tp[1] < TRACER_FADE]
 
+        for rk in rockets:                       # in-flight projectiles
+            rx, ry = rk["x"] * PX_PER_M, rk["y"] * PX_PER_M
+            if rk["w"].category in ("plasma", "energy", "laser"):
+                c_trail, c_core, tlen = (130, 220, 255), (235, 250, 255), 44
+            else:
+                c_trail, c_core, tlen = (250, 190, 120), (255, 235, 190), 22
+            tx = rx - rk["dx"] * tlen
+            ty = ry - rk["dy"] * tlen
+            pygame.draw.line(screen, c_trail, (tx, ty), (rx, ry), 3)
+            pygame.draw.circle(screen, c_core, (int(rx), int(ry)), 4)
+
+        for bb in backblasts:                    # rocket exhaust cone (placeholder)
+            age = (now - bb["t0"]) / BACKBLAST_FADE
+            if age >= 1.0:
+                continue
+            cxp, cyp = bb["x"] * PX_PER_M, bb["y"] * PX_PER_M
+            rr = int((0.5 + 1.7 * age) * PX_PER_M)
+            cs = pygame.Surface((rr * 2 + 4, rr * 2 + 4), pygame.SRCALPHA)
+            # TODO: blit one of the 3 backblast sprites by `age` once art lands
+            pts = [(rr + 2, rr + 2)]
+            for k in range(-3, 4):
+                aa = bb["ang"] + k * 0.17
+                pts.append((rr + 2 + math.cos(aa) * rr, rr + 2 + math.sin(aa) * rr))
+            pygame.draw.polygon(cs, (245, 175, 105, int(130 * (1.0 - age) ** 2)), pts)
+            screen.blit(cs, (cxp - rr - 2, cyp - rr - 2))
+        backblasts = [b for b in backblasts if now - b["t0"] < BACKBLAST_FADE]
+
         for (bx, by), br, t0 in blasts:
             age = (now - t0) / BLAST_FADE
             if age >= 1.0:
@@ -1144,6 +1442,9 @@ def main(map_path: str = "maps/arena.toml") -> None:
             elif reload_t > 0.0:
                 drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing)
                 bank.blit(screen, "weapon_sling", ppx, ppy, facing)
+            elif slung or raise_t > 0.0:
+                drew = bank.blit(screen, "soldier_idle", ppx, ppy, facing)
+                bank.blit(screen, "weapon_sling", ppx, ppy, facing)
             else:
                 drew = bank.blit(screen, "soldier_ready", ppx, ppy, facing)
                 kick = recoil_t / sprites.RECOIL_TIME * sprites.RECOIL_M * PX_PER_M
@@ -1160,13 +1461,85 @@ def main(map_path: str = "maps/arena.toml") -> None:
                                (int(ppx), int(ppy)), int(BODY_R * PX_PER_M))
 
         # lift the camera window out of the world and back to the real screen
-        window.fill(BG)
+        # (world is opaque and always covers the viewport, so no fill needed)
         window.blit(world, (-cam_x, -cam_y))
         screen = window
+
+        # crosshair (own cursor; system cursor is hidden) - fixed, tells nothing
+        mxp, myp = pygame.mouse.get_pos()
+        if myp < view_h:
+            for a, b in (((-11, 0), (-4, 0)), ((4, 0), (11, 0)),
+                         ((0, -11), (0, -4)), ((0, 4), (0, 11))):
+                pygame.draw.line(screen, (235, 235, 235), (mxp + a[0], myp + a[1]),
+                                 (mxp + b[0], myp + b[1]), 2)
 
         pygame.draw.rect(screen, HUD_BG, (0, view_h, view_w, HUD_H))
         cx, cy = m.cell_of(px_, py_)
         ch = m.chars[int(py_), int(px_)]
+        y0 = view_h
+        _w = weapons.ROSTER[loadout[wi]]
+        _fm = cur_fire_mode()
+
+        if not show_debug:
+            def _bar(x, y, wd, ht, frac, fg, bg=(44, 44, 48)):
+                pygame.draw.rect(screen, bg, (x, y, wd, ht))
+                fw = int(wd * max(0.0, min(1.0, frac)))
+                if fw > 0:
+                    pygame.draw.rect(screen, fg, (x, y, fw, ht))
+                pygame.draw.rect(screen, (12, 12, 14), (x, y, wd, ht), 1)
+
+            bx, bw = 22, 300
+            if player.max_shields > 0:
+                _bar(bx, y0 + 20, bw, 15,
+                     player.shields / player.max_shields, (90, 160, 235))
+                screen.blit(font_mid.render(
+                    f"SH {int(player.shields):3d}/{int(player.max_shields):<3d}",
+                    True, TEXT), (bx + bw + 12, y0 + 17))
+            hy = y0 + 42
+            hpf = player.health / max(1.0, player.max_health)
+            hpc = ((90, 200, 120) if hpf > 0.5 else
+                   (232, 200, 70) if hpf > 0.25 else (225, 70, 55))
+            _bar(bx, hy, bw, 22, hpf, hpc)
+            screen.blit(font_big.render(f"{max(0, int(player.health))}", True, TEXT),
+                        (bx + bw + 12, hy - 9))
+            screen.blit(font.render(
+                f"/ {int(player.max_health)}    armor {player.armor_lo:.0f}%",
+                True, DIM), (bx + bw + 74, hy + 7))
+            _bar(bx, y0 + 70, bw, 7, stamina,
+                 (120, 120, 130) if sprint_locked else (230, 205, 110))
+            if player.hp <= 0.0:
+                screen.blit(font_big.render("DOWN", True, (225, 70, 55)),
+                            (bx, y0 + 80))
+
+            wx = view_w // 2 - 130
+            screen.blit(font_mid.render(_w.name.upper(), True, TEXT), (wx, y0 + 16))
+            _st = ("SLUNG" if slung else "RAISING" if raise_t > 0 else
+                   "RELOADING" if reload_t > 0 else
+                   "SWITCHING" if swap_t > 0 else _fm.upper())
+            screen.blit(font.render(_st, True,
+                        (232, 200, 70) if (reload_t > 0 or swap_t > 0 or slung
+                                           or raise_t > 0) else DIM),
+                        (wx, y0 + 40))
+            _am = font_big.render(f"{mags[wi]:2d}", True,
+                                  (225, 70, 55) if mags[wi] == 0 else TEXT)
+            screen.blit(_am, (wx, y0 + 58))
+            _res = "∞" if reserves[wi] < 0 else str(reserves[wi])
+            screen.blit(font.render(f"/ {_w.mag}   res {_res}", True, DIM),
+                        (wx + _am.get_width() + 8, y0 + 74))
+
+            # no detection readout by design: the player reads the guards
+            # themselves and the sound world, nothing is spelled out
+
+            if msg and now - msg_t < 2.5:
+                _mm = font_mid.render(msg, True, (245, 220, 140))
+                screen.blit(_mm, (view_w // 2 - _mm.get_width() // 2,
+                                  y0 + HUD_H - 32))
+            screen.blit(font.render(f"{clock.get_fps():4.0f} fps    § = debug",
+                        True, DIM), (view_w - 170, y0 + HUD_H - 18))
+            pygame.display.flip()
+            continue
+
+        last_solve = "-"
         if sounds:
             s0 = sounds[-1]
             last_solve = (f"{s0.label} energy {s0.field.energy:.0f} "
@@ -1174,7 +1547,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                           f"solve {s0.solve_ms:.1f}ms")
         lines = [
             f"pos {px_:6.2f},{py_:6.2f}m  cell {cx:3d},{cy:3d}  tile '{ch}' "
-            f"{m.tiles[ch].name}  gait {gait}",
+            f"{m.tiles[ch].name}  gait {gait}"
+            f"{'  [CONCEALED]' if player.concealed else ('  [in bush - moving]' if in_bush else '')}",
             f"sounds {len(sounds)} (enemy {sum(1 for s_ in sounds if s_.enemy)})"
             f"  solving {len(jobs)}  own {'on' if show_own_sound else 'OFF'}"
             f"  enemy {('off', 'arcs', 'ripples')[enemy_mode]}"
@@ -1182,6 +1556,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
             probe_txt,
             (lambda w, fm: (
                 f"weapon {w.name:<15s} {mags[wi]:2d}/{w.mag:<2d}"
+                f"{'' if reserves[wi] < 0 else ' res' + str(reserves[wi])}"
                 f"  {w.dmg_lo:.0f}-{w.dmg_hi:.0f}dmg  "
                 f"acc {(w.auto_accuracy if fm == 'auto' else w.accuracy):.2f}"
                 f"  rng {w.range_m:.0f}m  pen {w.pen:.1f}"
@@ -1205,8 +1580,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
             f"guards live {live_n} ghosts {len(memory)}   "
             f"known {100.0*known.mean():4.1f}%   fog {'on' if show_fog else 'OFF'}   "
             f"{clock.get_fps():5.1f} fps{'  PAUSED' if paused else ''}",
-            "LMB fire  b fire-mode  r reload  wheel/1-7 weapon  f door  space knock  "
-            "c clear  m mute  F1-F8 overlays  F9 prof  F10 own snd  F11 enemy  v cones  p pause",
+            "LMB fire  b fire-mode  r reload  h sling(+20% move)  wheel/1-7 weapon  f door  space knock  "
+            "c clear  m mute  F1-F8 overlays  F9 prof  F10 own snd  F11 enemy  v cones  p pause  § game HUD",
         ]
         for i, ln in enumerate(lines):
             screen.blit(font.render(ln, True, TEXT if i < 6 else DIM),
