@@ -81,3 +81,13 @@ footstep_mult = 1.0
 pen_cost = 1.8
 door = true
 colour = [150, 118, 78]
+
+[tiles."b"]
+name = "bush"
+blocks_move = false
+blocks_sight = true
+blocks_bullets = false
+sound_cost = 1.0
+footstep_mult = 1.15
+bush = true
+colour = [64, 104, 58]
