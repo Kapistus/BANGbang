@@ -73,6 +73,19 @@ FOV_PERIPH = math.radians(95.0)   # half-angle of peripheral vision
 IDENT_RANGE_M = 15.0
 PERIPH_RANGE_M = 7.0
 
+# guards obey the same "you only see what is lit" rule as the player: a sighting
+# is dropped in the dark and its alert gain scales with the light on the player
+# (`player.see_light`, 0..1, set by main.py). A hunting guard in a dark spot
+# switches its own flashlight on.
+GUARD_SEE_DARK = 0.04            # below this light on the player -> not seen at all
+GUARD_FLASH_DARK = 0.30          # guard's own cell darker than this -> want light
+GUARD_FLASH_MIN_ON = 2.5        # seconds it stays on once lit (no strobing)
+GUARD_FLASH_HALF_DEG = 15.0     # beam half-angle
+GUARD_FLASH_RANGE_M = 13.0      # beam reach
+LOST_CHASE_S = 4.0             # after a COMBAT sighting is lost, push toward the
+LOST_CHASE_LEAD = 4.0          # player's flight line (this far past their last
+                              # spot) before falling back to a random search
+
 KEEP_MIN_M = 3.5      # back off if the player gets closer than this
 KEEP_MAX_M = 8.0      # advance if the player is further than this
 AUTO_RANGE_M = 7.0    # within this, an auto-capable guard hoses full-auto
@@ -176,6 +189,11 @@ class Guard(Combatant):
         self.fire_cd = 0.0
         self.reload_t = 0.0
         self._next_idle_in = self._roll_idle()
+        self.flashlight = False        # guard torch - on while hunting in the dark
+        self._flash_since = -1e9
+        self._pl_prev = None           # player pos last update, for a flight bearing
+        self._pl_head = None           # player's recent movement heading
+        self._chase_until = -1e9       # pushing along the flight line after losing sight
 
     # -- helpers --------------------------------------------------------
 
@@ -216,6 +234,9 @@ class Guard(Combatant):
         self.stamina = 1.0
         self.sprint_locked = False
         self._want_sprint = False
+        self.flashlight = False
+        self._flash_since = -1e9
+        self._chase_until = -1e9
 
     # -- perception ---------------------------------------------------
 
@@ -258,6 +279,38 @@ class Guard(Combatant):
                 ang = math.atan2(b[1], b[0]) if b else None
                 best = (rem, ang)
         return best
+
+    def _dark_ahead(self, m) -> bool:
+        """True if the guard stands in the dark, is hunting toward a dark spot,
+        or (idle) has clear line of sight to a dark patch a few metres ahead."""
+        lm = getattr(m, "lightmap", None)
+        if lm is None:
+            return True                          # a map with no lights = all dark
+        hh, ww = lm.shape
+
+        def _dk(cx, cy):
+            return 0 <= cy < hh and 0 <= cx < ww and lm[cy, cx] < GUARD_FLASH_DARK
+
+        gcx, gcy = self._cell()
+        if _dk(gcx, gcy):
+            return True
+        hunting = self.mode in (Mode.SEARCH, Mode.COMBAT)
+        if hunting and self.investigate is not None:
+            # keep it on toward where the guard is heading, corner or no corner
+            if _dk(int(self.investigate[0] * self.cpm),
+                   int(self.investigate[1] * self.cpm)):
+                return True
+        cx, cy = math.cos(self.facing), math.sin(self.facing)
+        for dm in (2.0, 4.0, 6.5):
+            scx = int((self.x + cx * dm) * self.cpm)
+            scy = int((self.y + cy * dm) * self.cpm)
+            if not (0 <= scy < hh and 0 <= scx < ww):
+                break
+            if not hunting and not line_of_sight(m.blocks_sight, gcx, gcy, scx, scy):
+                break                            # idle: don't light past a wall
+            if _dk(scx, scy):
+                return True
+        return False
 
     def _guess_source(self, heard):
         rem, ang = heard
@@ -385,13 +438,31 @@ class Guard(Combatant):
         if (rem < 0.5 or now >= self._poke_next or self._blocked
                 or self._stuck_t > STUCK_S):
             self._poke_next = now + rng.uniform(1.5, 3.0)
+            _was_blocked = self._blocked or self._stuck_t > STUCK_S
             self._blocked = False
-            for _ in range(6):
-                nx = self.x + rng.uniform(-3.5, 3.5)
-                ny = self.y + rng.uniform(-3.5, 3.5)
-                if m.can_stand(nx, ny, self.body_r):
-                    self.investigate = (nx, ny)
-                    break
+            if (now < self._chase_until and self._pl_head is not None
+                    and not _was_blocked):
+                # still chasing the lost target: keep pushing along its flight
+                # line, do not scatter to a random point
+                _adv = None
+                for step in (3.0, 5.5):
+                    nx = self.x + math.cos(self._pl_head) * step
+                    ny = self.y + math.sin(self._pl_head) * step
+                    if m.can_stand(nx, ny, self.body_r):
+                        _adv = (nx, ny)
+                if _adv is not None:
+                    self.investigate = _adv
+                else:
+                    self._chase_until = 0.0        # flight line walled - wander
+            else:
+                if _was_blocked:
+                    self._chase_until = 0.0        # bumped the corner - now scan
+                for _ in range(6):
+                    nx = self.x + rng.uniform(-3.5, 3.5)
+                    ny = self.y + rng.uniform(-3.5, 3.5)
+                    if m.can_stand(nx, ny, self.body_r):
+                        self.investigate = (nx, ny)
+                        break
 
     def _bullet_block_dist(self, bbul, ax, ay, bx, by):
         """Metres from (ax,ay) to the first bullet-blocking cell toward (bx,by),
@@ -696,7 +767,20 @@ class Guard(Combatant):
         elif self.mode != Mode.COMBAT and self.mag < self.weapon.mag:
             self.reload_t = self.weapon.reload_s      # top up between fights
 
+        if self._pl_prev is not None:
+            _vx = player.x - self._pl_prev[0]
+            _vy = player.y - self._pl_prev[1]
+            if _vx * _vx + _vy * _vy > 2.5e-4:
+                self._pl_head = math.atan2(_vy, _vx)
+        self._pl_prev = (player.x, player.y)
+
         band = self.sees(blocks_sight, player)
+        # same rule as the player: you only see what is lit. `see_light` (0..1)
+        # is the illumination on the player, set by main.py from the lightmap +
+        # every flashlight + muzzle flash.
+        see_light = getattr(player, "see_light", 1.0)
+        if band and see_light <= GUARD_SEE_DARK:
+            band = 0
         heard = self._hear(sounds, now)
 
         # taking fire is its own stimulus: a guard shot from outside its
@@ -709,11 +793,11 @@ class Guard(Combatant):
             self.investigate = self.hit_from        # head for the shooter
 
         if band == 1:
-            self.alert = min(1.0, self.alert + SIGHT_GAIN * dt)
+            self.alert = min(1.0, self.alert + SIGHT_GAIN * see_light * dt)
             self.investigate = (player.x, player.y)
             self.search_until = now + SEARCH_TIME
         elif band == 3:
-            self.alert = min(1.0, self.alert + PERIPH_GAIN * dt)
+            self.alert = min(1.0, self.alert + PERIPH_GAIN * see_light * dt)
             self.investigate = (player.x, player.y)
             self.search_until = now + SEARCH_TIME
         elif heard is not None:
@@ -764,11 +848,31 @@ class Guard(Combatant):
         if prev == Mode.COMBAT and self.mode != Mode.COMBAT:
             self.alert = max(self.alert, LOSE_SIGHT_ALERT)
             self.search_until = now + SEARCH_TIME
-            if self.investigate is None:
+            # break contact -> chase the flight line past their last spot (round
+            # the corner) before settling into a scattered search
+            self._chase_until = now + LOST_CHASE_S
+            if self._pl_head is not None:
+                _lx = player.x + math.cos(self._pl_head) * LOST_CHASE_LEAD
+                _ly = player.y + math.sin(self._pl_head) * LOST_CHASE_LEAD
+                self.investigate = ((_lx, _ly) if m.can_stand(_lx, _ly, self.body_r)
+                                    else (player.x, player.y))
+            elif self.investigate is None:
                 self.investigate = (player.x, player.y)
         if self.mode == Mode.SEARCH and prev != Mode.SEARCH:
             self.search_until = max(self.search_until, now + SEARCH_TIME)
             self._poke_next = now + 2.0
+
+        # flashlight: on when the guard is in the dark OR is looking into a dark
+        # patch it has clear LOS to (a lit guard peering down a black corridor
+        # lights it up). Sticky for GUARD_FLASH_MIN_ON so a head-sweep across a
+        # dark doorway doesn't strobe it.
+        want_light = self._dark_ahead(m)
+        if want_light and not self.flashlight:
+            self.flashlight = True
+            self._flash_since = now
+        elif (self.flashlight and not want_light
+              and now - self._flash_since > GUARD_FLASH_MIN_ON):
+            self.flashlight = False
 
         shots = []
         if self.mode == Mode.COMBAT:

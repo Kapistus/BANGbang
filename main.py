@@ -11,6 +11,8 @@ Weapons
     b              cycle fire mode. The combat rifle and SMG have a full-auto
                    alternate mode - hold to fire, SMG fast, rifle slower, both
                    less accurate. The rocket launcher reloads after every shot.
+                   Rail weapons HOLD to charge (0-3 s = +0-100% shot damage);
+                   the spool-up pitch rises and peaks at full charge.
     Roster and the shield/armor/accuracy model are ported from mechanics/;
     see sim/weapons.py and sim/combat.py. Damage lands on shields first
     (energy weapons hard, rail weapons barely), then armor cuts the health
@@ -55,6 +57,7 @@ and not the straight line back to the source.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 import sys
@@ -172,6 +175,16 @@ def muzzle_light_spec(w) -> tuple:
     if "flame" in n:
         return (255, 150, 65), 0.40, 2.0
     return (255, 224, 170), 0.9, 2.4            # ballistic + heavy
+
+
+def blast_flash_spec(w) -> tuple:
+    """(rgb, brightness, reach_m, life_s) for the light of an explosion - a
+    bigger, slightly longer muzzle_lights entry at the detonation point."""
+    if w.category == "plasma":
+        return (140, 255, 200), 1.1, max(w.blast_r * 2.2, 2.5), 0.20
+    if "rocket" in w.name.lower():
+        return (255, 210, 150), 1.35, max(w.blast_r * 1.8, 4.0), 0.24
+    return (255, 190, 120), 0.95, max(w.blast_r * 1.6, 2.0), 0.18   # flak / heavy
 NEAR_MISS_M = 1.3          # a shot passing this close to a guard = "shot at"
 INTERACT_RANGE = 1.6
 
@@ -197,10 +210,19 @@ A_REMEMBERED = 138    # seen before: geometry readable but clearly stale
 CONE_REVEAL = 0.35    # how far the vision cone lifts the veil (1 = clears it to
                       # a flashlight beam, lower = a faint lightening of the wedge)
 FLASHLIGHT_GAIN = 135    # additive brightness at the beam core (player `l` toggle)
-FLASHLIGHT_BLUR = 5      # fine-cell blur that softens the beam edge + tip
+FLASHLIGHT_HALF_DEG = 16.0  # beam half-angle (identify band is ~22deg)
+FLASHLIGHT_BLUR = 1     # tiny - just anti-alias the side edge, keep it sharp
 LIGHT_SEE_MIN = 0.20    # illumination below this reveals nothing (dark = blind)
 LIGHT_SEE_FULL = 0.50   # illumination at/above this gives full perception
 FLASHLIGHT_SELF = 0.55  # how much the flashlight lights the player holding it
+FLASHLIGHT_SELF_SEEN = 0.40  # how visible the player's own flashlight makes them
+GUARD_FLASH_GAIN = 105  # additive world brighten from a guard's flashlight beam
+GUARD_FLASH_POP = 70    # dimmer glow of that beam drawn over the fog (a tell)
+SHOT_GLOW = 0.75        # brief player-sprite brightness lift on each shot fired
+SHOT_GLOW_TIME = 0.13
+RAIL_IDS = ("rail_rifle", "rail_pistol")   # hold-to-charge weapons
+RAIL_CHARGE_MAX = 3.0   # seconds of hold for a full charge
+RAIL_CHARGE_BOOST = 1.0  # +100% released-shot damage at full charge
 FOG_BLUR_R = 3        # box-blur radius (fine cells) that feathers every fog edge
 ROOF_BLUR_R = 3      # same feather for the roof reveal edge (window / door peek)
 ROOF_REVEAL = 0.02   # cone intensity above which a roofed cell is shown through
@@ -669,6 +691,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
     swap_t = 0.0                   # weapon-change animation timer
     recoil_t = 0.0                 # gun-kick timer (player)
     flash_t = 0.0                  # muzzle-flash timer (player)
+    shot_glow_t = -9.0             # last-shot time - briefly lifts the player sprite
+    rail_charging = False          # rail weapon: trigger held, spooling up
+    rail_charge = 0.0              # seconds held so far (0..RAIL_CHARGE_MAX)
+    rail_charge_ch = None          # the spool-up sound channel, so it can be cut
     slung = False                  # gun lowered (h) - faster, cannot fire
     raise_t = 0.0                  # bringing a slung gun back up
     flashlight = False             # l - a beam the shape of the identify cone
@@ -743,7 +769,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
             vis_cache.invalidate()
             sfx("glass")
 
-    def player_fire(w, moving, acc=None, rounds=None):
+    def player_fire(w, moving, acc=None, rounds=None, charge=0.0):
         """One trigger pull: `rounds` (default the weapon's burst) x pellets,
         each with its own accuracy jitter; damage resolved inside fire_shot,
         plus a blast at impact for explosives. `acc` overrides the weapon's
@@ -801,10 +827,15 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     hit = live + [player] if player.alive else live
                     ballistics.blast(sh.impact, w.blast_r, w, hit, rng, now)
                     blasts.append((sh.impact, w.blast_r, now))
+                    _bc, _bg, _br, _bl = blast_flash_spec(w)
+                    muzzle_lights.append({"x": sh.impact[0], "y": sh.impact[1],
+                                          "t0": now, "col": _bc, "gain": _bg,
+                                          "reach": _br, "life": _bl})
         if _fired:
             _mcol, _mgain, _mreach = muzzle_light_spec(w)
             muzzle_lights.append({"x": ox, "y": oy, "t0": now, "col": _mcol,
-                                  "gain": _mgain, "reach": _mreach})
+                                  "gain": _mgain * (1.0 + 0.9 * charge),
+                                  "reach": _mreach * (1.0 + 0.6 * charge)})
         if w.backblast:
             backblasts.append({"x": px_ - math.cos(base) * 0.55,
                                "y": py_ - math.sin(base) * 0.55,
@@ -942,6 +973,18 @@ def main(map_path: str = "maps/arena.toml") -> None:
                             msg, msg_t = "weapon ready", now
                     elif reload_t > 0.0 or fire_cd > 0.0 or swap_t > 0.0 or player.hp <= 0.0:
                         pass
+                    elif loadout[wi] in RAIL_IDS:
+                        # rail weapons charge while the trigger is held; the
+                        # shot goes out on release (MOUSEBUTTONUP below)
+                        if mags[wi] > 0:
+                            rail_charging = True
+                            rail_charge = 0.0
+                            rail_charge_ch = (None if muted else
+                                              audio.play_channel("railcharge", 0.26))
+                        else:
+                            emit(m, cost, px_, py_, e_dry, "dryfire", sounds, now,
+                                 jobs=jobs)
+                            msg, msg_t = f"{w.name}: empty - press R", now
                     elif mags[wi] > 0:
                         # a tap always fires one action; holding streams via the
                         # auto poll below
@@ -952,6 +995,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                                     acc=w.auto_accuracy if auto else None,
                                     rounds=1 if auto else None)
                         sfx_fire(w)
+                        shot_glow_t = now
                         if w.blast_r <= 0.0:
                             recoil_t = sprites.RECOIL_TIME
                             flash_t = sprites.FLASH_TIME
@@ -962,6 +1006,31 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         emit(m, cost, px_, py_, e_dry, "dryfire", sounds, now,
                              jobs=jobs)
                         msg, msg_t = f"{w.name}: empty - press R", now
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1 and rail_charging:
+                rail_charging = False
+                if rail_charge_ch is not None:
+                    rail_charge_ch.fadeout(60)
+                    rail_charge_ch = None
+                frac = min(rail_charge / RAIL_CHARGE_MAX, 1.0)
+                rail_charge = 0.0
+                w = weapons.ROSTER[loadout[wi]]
+                if (mags[wi] > 0 and player.hp > 0.0 and fire_cd <= 0.0
+                        and swap_t <= 0.0 and not slung):
+                    mult = 1.0 + RAIL_CHARGE_BOOST * frac
+                    w_fired = dataclasses.replace(
+                        w, dmg_lo=w.dmg_lo * mult, dmg_hi=w.dmg_hi * mult)
+                    fire_cd = w.burst_time
+                    emit(m, cost, px_, py_, w.sound_reach_m * cpm, w.name,
+                         sounds, now, jobs=jobs)
+                    player_fire(w_fired, held_moving(), charge=frac)
+                    sfx_fire(w_fired, gain=min(1.0, 0.8 + 0.4 * frac))
+                    shot_glow_t = now
+                    recoil_t = sprites.RECOIL_TIME
+                    flash_t = sprites.FLASH_TIME
+                    flash_roll = rng.uniform(-180.0, 180.0)
+                    flash_scale = rng.uniform(0.85, 1.25) * (1.0 + 0.5 * frac)
+                    if frac >= 0.999:
+                        msg, msg_t = "rail: full charge", now
 
         if not paused:
             fire_cd = max(0.0, fire_cd - dt)
@@ -969,6 +1038,17 @@ def main(map_path: str = "maps/arena.toml") -> None:
             recoil_t = max(0.0, recoil_t - dt)
             flash_t = max(0.0, flash_t - dt)
             raise_t = max(0.0, raise_t - dt)
+            if rail_charging:
+                if (loadout[wi] not in RAIL_IDS or player.hp <= 0.0 or slung
+                        or swap_t > 0.0 or reload_t > 0.0
+                        or not pygame.mouse.get_pressed()[0]):
+                    rail_charging = False        # abandoned - no shot
+                    rail_charge = 0.0
+                    if rail_charge_ch is not None:
+                        rail_charge_ch.stop()
+                        rail_charge_ch = None
+                else:
+                    rail_charge = min(RAIL_CHARGE_MAX, rail_charge + dt)
             if reload_t > 0.0:
                 reload_t -= dt
                 if reload_t <= 0.0:
@@ -1006,6 +1086,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                      sounds, now, jobs=jobs)
                 player_fire(w, held_moving(), acc=w.auto_accuracy, rounds=1)
                 sfx_fire(w)
+                shot_glow_t = now
                 if w.blast_r <= 0.0:
                     recoil_t = sprites.RECOIL_TIME
                     flash_t = sprites.FLASH_TIME
@@ -1068,6 +1149,43 @@ def main(map_path: str = "maps/arena.toml") -> None:
         prev_px, prev_py = px_, py_
         player.concealed = in_bush and not moved_now and player.hp > 0.0
 
+        # `player.see_light`: how lit the player is right now (0..1). Guards use
+        # the same "you only see what is lit" rule the player does - a dim
+        # player is hard to spot. Sources: the baked lightmap, the player's own
+        # flashlight (a giveaway), any muzzle flash on them, any guard torch.
+        def _point_lit(sx, sy, sfac, half_deg, reach_m, tx, ty, gain):
+            dx, dy = tx - sx, ty - sy
+            d = math.hypot(dx, dy)
+            if d >= reach_m:
+                return 0.0
+            if half_deg < 179.0:
+                off = abs((math.atan2(dy, dx) - sfac + math.pi)
+                          % (2 * math.pi) - math.pi)
+                if off > math.radians(half_deg):
+                    return 0.0
+            scx, scy = m.cell_of(sx, sy)
+            tcx, tcy = m.cell_of(tx, ty)
+            if not line_of_sight(m.blocks_sight, scx, scy, tcx, tcy):
+                return 0.0
+            return gain * (1.0 - d / reach_m)
+
+        _il = float(m.lightmap[_bcy, _bcx]) if m.lightmap is not None else 0.0
+        if flashlight:
+            _il = max(_il, FLASHLIGHT_SELF_SEEN)
+        for _ml in muzzle_lights:
+            _il = max(_il, _point_lit(_ml["x"], _ml["y"], 0.0, 180.0,
+                                      _ml["reach"] * 1.2, px_, py_,
+                                      0.9 * _ml["gain"]))
+        for _g in guards:
+            if _g.alive and getattr(_g, "flashlight", False):
+                _il = max(_il, _point_lit(
+                    _g.x, _g.y, _g.facing, ai.GUARD_FLASH_HALF_DEG,
+                    ai.GUARD_FLASH_RANGE_M, px_, py_, 0.85))
+        _st = max(0.0, min(1.0, (_il - LIGHT_SEE_MIN)
+                           / (LIGHT_SEE_FULL - LIGHT_SEE_MIN)))
+        player.see_light = _st * _st * (3.0 - 2.0 * _st)
+        player_illum_now = _il          # also lifts the player sprite tint below
+
         if not paused and player.hp > 0.0:
             def _gemit(gx, gy, ge, glabel, cache=None):
                 emit(m, cost, gx, gy, ge, glabel, sounds, now,
@@ -1106,6 +1224,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                                         "t0": now})
                         else:
                             blasts.append((sh.impact, g.weapon.blast_r, now))
+                            _bc, _bg, _br, _bl = blast_flash_spec(g.weapon)
+                            muzzle_lights.append(
+                                {"x": sh.impact[0], "y": sh.impact[1], "t0": now,
+                                 "col": _bc, "gain": _bg, "reach": _br, "life": _bl})
                 # a guard stuck against a closed door ahead of it shoves it open
                 if getattr(g, "_blocked", False):
                     _ft = getattr(g, "_face_target", g.facing)
@@ -1141,6 +1263,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         tgts.append(player)
                     ballistics.blast(ctr, rk["w"].blast_r, rk["w"], tgts, rng, now)
                     blasts.append((ctr, rk["w"].blast_r, now))
+                    _bc, _bg, _br, _bl = blast_flash_spec(rk["w"])
+                    muzzle_lights.append({"x": ctr[0], "y": ctr[1], "t0": now,
+                                          "col": _bc, "gain": _bg, "reach": _br,
+                                          "life": _bl})
                     emit(m, cost, ctr[0], ctr[1], rk["w"].sound_reach_m * cpm,
                          "explosion", sounds, now, jobs=jobs)
                     sfx("boom")
@@ -1253,8 +1379,20 @@ def main(map_path: str = "maps/arena.toml") -> None:
         vx1, vy1 = (cam_x + view_w) / ppc, (cam_y + view_h) / ppc
         band = 2.5
         # only the last few sounds can still have a visible wavefront; cap the
-        # per-frame array work so a burst of gunfire cannot stall the frame
-        for snd in sounds[-8:]:
+        # per-frame array work so a burst of gunfire cannot stall the frame.
+        # collapse a burst of enemy fire: one ring per emitter (the newest), not
+        # a stack of concentric arcs sweeping the whole screen.
+        _ripple_src = []
+        _seen_org = set()
+        for _s in reversed(sounds[-8:]):
+            if _s.enemy:
+                _o = _s.field.origin
+                _ok = (round(_o[0] / 2.0), round(_o[1] / 2.0))
+                if _ok in _seen_org:
+                    continue
+                _seen_org.add(_ok)
+            _ripple_src.append(_s)
+        for snd in _ripple_src:
             # bail before any array work if this sound will not be drawn at all
             if snd.enemy and enemy_mode != 2:
                 continue
@@ -1311,19 +1449,17 @@ def main(map_path: str = "maps/arena.toml") -> None:
         prof["vision"] = (time.perf_counter() - _t) * 1000
         h_, w_ = inten_raw.shape
 
-        # player flashlight (l): a warm beam shaped like the identify band - the
-        # narrowest, longest LOS cone - softened at the edge.
+        # player flashlight (l): a tight beam - hard side edges, no outer spill,
+        # a smooth range gradient that fades out before the LOS cone edge.
         fl = None
         if flashlight and not in_bush:
-            fb = vf.bands(facing, cone)
-            # fade to nothing well inside the LOS range so the tip is never a
-            # hard cut-off at the cone edge, then blur the whole beam
+            _fd = np.abs((vf.ang - facing + np.pi) % (2 * np.pi) - np.pi)
+            ang_ok = (_fd <= math.radians(FLASHLIGHT_HALF_DEG)) & vf.visible
             reach = max(cone.identify_range * 0.9, 1.0)
             t = np.clip(1.0 - vf.dist / reach, 0.0, 1.0)
-            t = t * t * (3.0 - 2.0 * t)
-            fl = np.where(fb == 1, 1.0,
-                          np.where(fb == 2, 0.35, 0.0)).astype(np.float32) * t
-            fl = box_blur(fl, FLASHLIGHT_BLUR)
+            t = t * t * (3.0 - 2.0 * t)                 # smooth tip gradient
+            fl = np.where(ang_ok, t, 0.0).astype(np.float32)
+            fl = box_blur(fl, FLASHLIGHT_BLUR)          # 1 = just anti-alias the edge
 
         # active muzzle flashes as a brief radial light, shadow-cast from each
         # flash so a wall stops it, then masked to what the player can see.
@@ -1335,7 +1471,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
             _mf = np.zeros((h_, w_), np.float32)
             _mrgb = np.zeros((h_, w_, 3), np.float32)
             for ml in muzzle_lights:
-                _age = (now - ml["t0"]) / MUZZLE_LIGHT_TIME
+                _age = (now - ml["t0"]) / ml.get("life", MUZZLE_LIGHT_TIME)
                 if _age >= 1.0:
                     continue
                 _b = _age / 0.32 if _age < 0.32 else (1.0 - _age) / 0.68
@@ -1368,6 +1504,37 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 if _mrgb.max() > 0.0:
                     mflash_rgb = _mrgb
 
+        # guard flashlights: each lit guard's beam shadow-cast from that guard,
+        # masked to what the PLAYER can see - so you see the room a guard's
+        # torch lights, and the sweeping cone itself
+        gbeam = None
+        _lg = [g for g in guards
+               if g.alive and getattr(g, "flashlight", False)
+               and cam_x - 200 < g.x * PX_PER_M < cam_x + view_w + 200
+               and cam_y - 200 < g.y * PX_PER_M < cam_y + view_h + 200]
+        if _lg:
+            _gb = np.zeros((h_, w_), np.float32)
+            _grc = max(2, int(ai.GUARD_FLASH_RANGE_M * cpm))
+            _gha = math.radians(ai.GUARD_FLASH_HALF_DEG)
+            for g in _lg:
+                gcx, gcy = m.cell_of(g.x, g.y)
+                _gsf = shadowcast(m.blocks_sight, gcx, gcy, _grc)
+                _gd = np.abs((_gsf.ang - g.facing + np.pi) % (2 * np.pi) - np.pi)
+                _gt = np.clip(1.0 - _gsf.dist / _grc, 0.0, 1.0)
+                _gt = _gt * _gt * (3.0 - 2.0 * _gt)
+                _gl = np.where((_gd <= _gha) & _gsf.visible, _gt, 0.0).astype(np.float32)
+                _oy, _ox = _gsf.y0 - vf.y0, _gsf.x0 - vf.x0
+                _y0, _x0 = max(0, _oy), max(0, _ox)
+                _y1 = min(h_, _oy + _gl.shape[0])
+                _x1 = min(w_, _ox + _gl.shape[1])
+                if _y1 > _y0 and _x1 > _x0:
+                    np.maximum(_gb[_y0:_y1, _x0:_x1],
+                               _gl[_y0 - _oy:_y1 - _oy, _x0 - _ox:_x1 - _ox],
+                               out=_gb[_y0:_y1, _x0:_x1])
+            _gb *= vf.visible
+            if _gb.max() > 0.0:
+                gbeam = box_blur(_gb, 1)
+
         # STATIC illumination (baked lightmap + flashlight) gates what enters
         # fog memory: a room with no lamp and the flashlight off reveals nothing.
         if m.lightmap is not None:
@@ -1376,6 +1543,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
             illum = np.zeros((h_, w_), dtype=np.float32)
         if fl is not None:
             illum = np.maximum(illum, fl)
+        if gbeam is not None:
+            illum = np.maximum(illum, gbeam)
         see = np.clip((illum - LIGHT_SEE_MIN) / (LIGHT_SEE_FULL - LIGHT_SEE_MIN),
                       0.0, 1.0)
         gated = inten_raw * see
@@ -1394,6 +1563,9 @@ def main(map_path: str = "maps/arena.toml") -> None:
         if mflash is not None:
             _m2 = mflash * MUZZLE_LIGHT_GAIN
             add = _m2 if add is None else np.maximum(add, _m2)
+        if gbeam is not None:
+            _g2 = gbeam * GUARD_FLASH_GAIN
+            add = _g2 if add is None else np.maximum(add, _g2)
         if add is not None and add.max() > 1.0:
             g = np.clip(add, 0, 255).astype(np.uint8)
             warm = np.stack([g, (g * 0.94).astype(np.uint8),
@@ -1646,8 +1818,17 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
             screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
                         special_flags=pygame.BLEND_RGB_ADD)
-        muzzle_lights = [m for m in muzzle_lights
-                         if now - m["t0"] < MUZZLE_LIGHT_TIME]
+        muzzle_lights = [ml for ml in muzzle_lights
+                         if now - ml["t0"] < ml.get("life", MUZZLE_LIGHT_TIME)]
+
+        if gbeam is not None:                    # a guard torch beam over the fog
+            g = np.clip(gbeam * GUARD_FLASH_POP, 0, 255).astype(np.uint8)
+            cool = np.stack([g, g, (g * 1.0).astype(np.uint8)], axis=2)
+            tex = pygame.surfarray.make_surface(np.transpose(cool, (1, 0, 2)))
+            sc = pygame.transform.smoothscale(
+                tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
+            screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
+                        special_flags=pygame.BLEND_RGB_ADD)
 
         for (bx, by), br, t0 in blasts:
             age = (now - t0) / BLAST_FADE
@@ -1671,12 +1852,16 @@ def main(map_path: str = "maps/arena.toml") -> None:
         # cell (crushed toward a dark silhouette in shadow), lifted by the
         # flashlight when it is on
         _pl = float(m.lightmap[pcy, pcx]) if m.lightmap is not None else 0.0
+        _pl = max(_pl, player_illum_now)         # lamps + a guard's torch on you
         if flashlight:
             _pl = max(_pl, FLASHLIGHT_SELF)
         if mflash is not None:                   # your own / a nearby muzzle flash
             _ly, _lx = pcy - vf.y0, pcx - vf.x0
             if 0 <= _ly < h_ and 0 <= _lx < w_:
                 _pl = max(_pl, float(mflash[_ly, _lx]) * 1.4)
+        _sg = now - shot_glow_t                  # brief pop of light on each shot
+        if 0.0 <= _sg < SHOT_GLOW_TIME:
+            _pl = max(_pl, SHOT_GLOW * (1.0 - _sg / SHOT_GLOW_TIME) ** 0.6)
         _k = min(1.0, max(0.0, (_pl - 0.14) / 0.78))
         _k = _k * _k * (3.0 - 2.0 * _k)
         _v = int(3 + (255 - 3) * _k)
@@ -1773,6 +1958,15 @@ def main(map_path: str = "maps/arena.toml") -> None:
                          ((0, -11), (0, -4)), ((0, 4), (0, 11))):
                 pygame.draw.line(screen, (235, 235, 235), (mxp + a[0], myp + a[1]),
                                  (mxp + b[0], myp + b[1]), 2)
+            if rail_charging:                     # rail spool-up ring, own state
+                _cf = min(rail_charge / RAIL_CHARGE_MAX, 1.0)
+                pygame.draw.circle(screen, (60, 90, 150), (mxp, myp), 16, 1)
+                if _cf > 0.0:
+                    pygame.draw.arc(screen, (120, 190, 255),
+                                    (mxp - 16, myp - 16, 32, 32),
+                                    -math.pi / 2,
+                                    -math.pi / 2 + _cf * 2 * math.pi,
+                                    3 if _cf < 0.999 else 4)
 
         pygame.draw.rect(screen, HUD_BG, (0, view_h, view_w, HUD_H))
         cx, cy = m.cell_of(px_, py_)

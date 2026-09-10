@@ -73,6 +73,64 @@ def _boom(rng: random.Random) -> np.ndarray:
     return _norm(np.tanh((blast * 1.5 + rumble) * 1.8))
 
 
+def _railgun(rng: random.Random, light: bool = False) -> np.ndarray:
+    """Rail discharge: an instant crack, a harsh electric arc buzz sweeping
+    down, a bright spark fizz and a short metallic coil ring-out. No powder
+    body - the point is that it is electric and sharp, not a gunshot."""
+    n = int((0.10 if light else 0.14) * SR)
+    r = np.random.default_rng(rng.randrange(1 << 30))
+    t = np.arange(n) / SR
+
+    crack = r.uniform(-1, 1, n) * _decay(n, 0.0030, 0.0003)       # instant transient
+
+    sweep = np.linspace(rng.uniform(3400, 4400) * (0.9 if light else 1.0),
+                        rng.uniform(520, 760), n)
+    buzz = np.sign(np.sin(2 * np.pi * np.cumsum(sweep) / SR))     # square: rich harmonics
+    am = 0.55 + 0.45 * np.sin(2 * np.pi * rng.uniform(85, 150) * t)
+    arc = buzz * am * _decay(n, 0.011, 0.0006)
+
+    ring = np.zeros(n)
+    for fr in (rng.uniform(2500, 3100), rng.uniform(4400, 5400)):
+        ring += _sine(fr, n) * _decay(n, rng.uniform(0.018, 0.032)) \
+                * rng.uniform(0.12, 0.20)
+
+    hiss = r.uniform(-1, 1, n)
+    hiss = (hiss - _lp(hiss, 5)) * _decay(n, 0.006) * 0.5         # bright spark fizz
+
+    x = crack * 1.6 + arc * (0.62 if light else 0.82) + ring + hiss
+    return _norm(np.tanh(x * 2.4), 0.82 if light else 0.92)       # hard clip = edge
+
+
+def _railcharge(rng: random.Random) -> np.ndarray:
+    """A 3 s electric spool-up: the railgun character stretched out, pitch
+    rising from a low hum to a high whine that peaks exactly at full charge."""
+    dur = 3.0
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+    p = (t / dur) ** 1.35                            # eased 0..1, arrives at the top
+    f = 70.0 + p * (1500.0 - 70.0)
+    ph = 2 * np.pi * np.cumsum(f) / SR
+    # a mellow buzz: mostly sine with a little square edge (harsh square alone
+    # reads as loud); modest fizz
+    hum = 0.65 * np.sin(ph) + 0.35 * np.sign(np.sin(ph))
+    hum2 = 0.28 * np.sin(1.5 * ph)                   # a fifth up, shimmer
+    r = np.random.default_rng(rng.randrange(1 << 30))
+    fizz = (r.uniform(-1, 1, n) - _lp(r.uniform(-1, 1, n), 6)) * 0.05 * p
+    env = 0.10 + 0.70 * p ** 1.15                    # swells in, tops out gentler
+    return _norm(np.tanh((hum * 0.7 + hum2 + fizz) * env * 1.5), 0.42)
+
+
+def _shotgun(rng: random.Random) -> np.ndarray:
+    """A wide, deep blast: mid boom + low punch + a short spray of pellet hiss.
+    Boomier and lower than the generic gunshot, shorter than an explosion."""
+    n = int(0.28 * SR)
+    r = np.random.default_rng(rng.randrange(1 << 30))
+    blast = _lp(r.uniform(-1, 1, n), 5) * _decay(n, 0.085)
+    punch = _sine(rng.uniform(58, 78), n) * _decay(n, 0.05)
+    spray = _lp(r.uniform(-1, 1, n), 2) * _decay(n, 0.02) * 0.35
+    return _norm(np.tanh((blast * 1.6 + punch * 1.1 + spray) * 2.0))
+
+
 def _zap(rng: random.Random) -> np.ndarray:
     n = int(0.13 * SR)
     t = np.arange(n) / SR
@@ -160,6 +218,10 @@ def _dry(rng: random.Random) -> np.ndarray:
 _RECIPES = {
     "gunshot":       (lambda rng: _gunshot(rng, False), 4),
     "gunshot_heavy": (lambda rng: _gunshot(rng, True), 3),
+    "railgun":       (lambda rng: _railgun(rng, False), 3),
+    "railgun_light": (lambda rng: _railgun(rng, True), 3),
+    "railcharge":    (_railcharge, 2),
+    "shotgun":       (_shotgun, 3),
     "boom":          (_boom, 2),
     "zap":           (_zap, 3),
     "laser":         (_laser, 3),
@@ -225,6 +287,13 @@ _FIRE_BY_CATEGORY = {
     "energy": "zap", "laser": "laser", "plasma": "plasma",
 }
 
+# per-weapon overrides where the category clip is uncharacteristic
+_FIRE_BY_NAME = {
+    "rail rifle": "railgun",
+    "rail pistol": "railgun_light",
+    "combat shotgun": "shotgun",
+}
+
 
 def fire_clip(weapon) -> str:
     cat = getattr(weapon, "category", "")
@@ -233,11 +302,31 @@ def fire_clip(weapon) -> str:
     if getattr(weapon, "blast_r", 0.0) > 0.0 and cat not in (
             "energy", "plasma", "laser"):
         return "boom"
+    name = getattr(weapon, "name", "")
+    if name in _FIRE_BY_NAME:
+        return _FIRE_BY_NAME[name]
     return _FIRE_BY_CATEGORY.get(cat, "gunshot")
 
 
 def play_fire(weapon, gain: float = 1.0, pan: float = 0.0) -> None:
     play(fire_clip(weapon), gain, pan)
+
+
+def play_channel(name: str, gain: float = 1.0, pan: float = 0.0):
+    """Like play() but returns the pygame Channel so the caller can stop /
+    fade it (used for the hold-to-charge rail spool-up). None if no audio."""
+    if not _ready or gain <= 0.02:
+        return None
+    variants = _bank.get(name)
+    if not variants:
+        return None
+    ch = random.choice(variants).play()
+    if ch is None:
+        return None
+    g = max(0.0, min(1.0, gain))
+    p = max(-1.0, min(1.0, pan)) * 0.85
+    ch.set_volume(g * min(1.0, 1.0 - p), g * min(1.0, 1.0 + p))
+    return ch
 
 
 # label prefix (from ActiveSound.label, e.g. "g1/fire") -> clip for enemy events
