@@ -44,6 +44,8 @@ class Combatant:
     concealed: bool = False            # hidden (e.g. still inside a bush) - AI sight skips them
     last_hit_t: float = -1e9
     hit_from: Optional[tuple] = None   # world (x, y) the last damage came from
+    bleed_t: float = -1e9              # time of the last hit that cost HEALTH
+    bleed_variant: int = 0             # which blood sprite (0..2) for that hit
     _regen_at: float = field(default=-1e9, repr=False)
 
     def __post_init__(self):
@@ -86,6 +88,10 @@ class Combatant:
 
         arm = random.uniform(self.armor_lo, self.armor_hi) / 100.0
         arm = min(max(arm, 0.0), 0.80)
+        # a hit reaction (blood) only fires when HEALTH is actually lost - a
+        # shield-absorbed hit returns above and never reaches this line
+        self.bleed_t = now
+        self.bleed_variant = random.randrange(3)
         self.health -= remaining * health_mult * (1.0 - arm)
         if self.health <= 0.0:
             self.health = 0.0

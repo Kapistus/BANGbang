@@ -65,6 +65,52 @@ class Light:
 
 
 @dataclass
+class Item:
+    """One entry in an interactable's take-list (or the player's inventory
+    once taken). `category` decides what happens on take (main.py):
+    weapon/usable/mission actually move to the player; anything else (misc)
+    just gets `picked` flagged - lore-wise collected after the mission, not
+    mechanically carried yet."""
+    id: str
+    name: str
+    category: str = "misc"    # weapon | usable | mission | misc
+    qty: int = 1
+    picked: bool = False
+
+
+def _parse_interactables(raw: "list | None") -> "list[Interactable]":
+    """Shared by both loaders: doc['interactables'] (.map) / meta['interactables']
+    (.grid sidecar) -> [Interactable]. Missing key = no interactables."""
+    out = []
+    for i, e in enumerate(raw or []):
+        items = [
+            Item(id=it.get("id", f"item{k}"), name=it.get("name", "item"),
+                category=it.get("category", "misc"),
+                qty=int(it.get("qty", 1)), picked=bool(it.get("picked", False)))
+            for k, it in enumerate(e.get("items", []))
+        ]
+        out.append(Interactable(
+            id=e.get("id", f"e{i}"), kind=e.get("kind", "npc"),
+            pos=tuple(e["pos"]), name=e.get("name", "???"),
+            dialog=list(e.get("dialog", [])), items=items))
+    return out
+
+
+@dataclass
+class Interactable:
+    """An editor-placed NPC / trader / quest object. Which panel opening it
+    shows is decided by content, not `kind`: any `items` -> the take-list
+    (inventory) panel, else the `dialog` panel. `kind` is authoring/render
+    metadata (editor colour, default content shape)."""
+    id: str
+    kind: str                 # npc | trader | quest_item
+    pos: tuple[float, float]
+    name: str = "???"
+    dialog: list[str] = field(default_factory=list)
+    items: list[Item] = field(default_factory=list)
+
+
+@dataclass
 class TileMap:
     """Coarse authoring grid plus expanded fine-resolution property arrays."""
 
@@ -87,6 +133,7 @@ class TileMap:
     guards: list[GuardSpec] = field(default_factory=list)
     idle_spots: list[IdleSpot] = field(default_factory=list)
     lights: list[Light] = field(default_factory=list)
+    interactables: list[Interactable] = field(default_factory=list)
 
     # set by the JSON map loader (sim/mapfile.py); None for legacy .grid maps.
     # coarse (rows, cols) arrays of tile ids for a sprite renderer.
@@ -520,6 +567,7 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
             )
             for l in meta.get("lights", [])
         ],
+        interactables=_parse_interactables(meta.get("interactables", [])),
         roof_enc=en,
         roof_doorcells=dcz,
     )

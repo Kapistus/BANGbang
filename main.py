@@ -6,8 +6,17 @@ Movement
 
 Weapons
     left mouse      fire            r      reload
-    mouse wheel /   change weapon   f      interact (doors)
-    number keys 1-7
+    mouse wheel /   change weapon   f      interact (doors, and whatever is
+    number keys 1-7                        highlighted yellow - hover an NPC/
+                                            trader/quest object/corpse to
+                                            highlight it, f opens its dialog or
+                                            take-list)   i  your own inventory
+
+    a dialog panel: space/enter advances, f/esc closes. a take-list: up/down
+    select, enter takes the row (weapons/usable/mission items actually move to
+    you; anything else is just marked for pickup), t takes everything, f/esc
+    closes. No sim/AI pause while a panel is open, but movement and firing are
+    frozen so it can't double as free evasion.
     b              cycle fire mode. The combat rifle and SMG have a full-auto
                    alternate mode - hold to fire, SMG fast, rifle slower, both
                    less accurate. The rocket launcher reloads after every shot.
@@ -68,8 +77,9 @@ import numpy as np
 import pygame
 
 from sim import ai, audio, ballistics, combat, mapfile, sound, sprites, weapons
-from sim.tilemap import (FLOOR_DARKEN, WALL_LIGHTEN, TileMap, compute_roof,
-                         load_map, validate_patrols, validate_spawns)
+from sim.tilemap import (FLOOR_DARKEN, WALL_LIGHTEN, Item, TileMap,
+                         compute_roof, load_map, validate_patrols,
+                         validate_spawns)
 
 
 def load_any_map(path):
@@ -95,9 +105,13 @@ VIEW_PPM = 48          # 1920x1080 sweet spot: readable characters (~49 px), the
                        # whole vision cone visible when aiming sideways; aiming
                        # straight up/down clips the outer identify/recognise cone
 MAX_VIEW = (1860, 776)    # largest on-screen viewport: near-full width on a
-                          # 1920x1080 display; 776 + 224 HUD = 1000 clears the
-                          # taskbar. The world is usually bigger -> camera pans.
-HUD_H = 224
+                          # 1920x1080 display, well clear of the taskbar. The
+                          # world is usually bigger -> camera pans. No separate
+                          # HUD strip any more - the window IS the game view.
+HUD_MARGIN = 14           # corner inset for both HUD overlay panels
+HUD_PANEL_W = 250         # player info panel (bottom-left), always shown
+HUD_PANEL_H = 112
+DEBUG_PANEL_W = 900       # debug text panel (bottom-right), only when toggled
 
 # A sound field depends only on origin and geometry, so consecutive
 # footsteps close together can share one solve. This is the distance the
@@ -185,8 +199,68 @@ def blast_flash_spec(w) -> tuple:
     if "rocket" in w.name.lower():
         return (255, 210, 150), 1.35, max(w.blast_r * 1.8, 4.0), 0.24
     return (255, 190, 120), 0.95, max(w.blast_r * 1.6, 2.0), 0.18   # flak / heavy
+
+
 NEAR_MISS_M = 1.3          # a shot passing this close to a guard = "shot at"
 INTERACT_RANGE = 1.6
+INTERACT_HOVER_PX = 30    # mouse-to-entity screen distance counted as "hovered"
+UI_YELLOW = (240, 210, 60)    # interactable highlight colour
+ENT_COLOUR = {"npc": (90, 205, 195), "trader": (225, 185, 60),
+             "quest_item": (175, 115, 225)}   # no sprite art yet - flat markers
+TAKE_CATEGORIES = ("weapon", "usable", "mission")  # actually move to the player;
+                                                   # anything else just gets `picked` flagged
+
+
+def _wrap_text(text: str, font, max_w: int) -> list:
+    """Greedy word-wrap of `text` to fit `max_w` px in `font`."""
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        trial = f"{cur} {w}".strip()
+        if cur and font.size(trial)[0] > max_w:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+class _CorpseTarget:
+    """Duck-types enough of Interactable for a defeated guard's dropped loot
+    to go through the same hover/dialog/inventory path as an editor-placed
+    entity. The item LIST lives on the guard (`g.loot_items`, built once,
+    lazily) so re-wrapping a guard each frame doesn't lose taken items."""
+
+    __slots__ = ("guard",)
+
+    def __init__(self, guard):
+        self.guard = guard
+
+    @property
+    def kind(self):
+        return "corpse"
+
+    @property
+    def name(self):
+        return f"{self.guard.id}'s body"
+
+    @property
+    def dialog(self):
+        return []
+
+    @property
+    def pos(self):
+        return (self.guard.x, self.guard.y)
+
+    @property
+    def items(self):
+        if not hasattr(self.guard, "loot_items"):
+            self.guard.loot_items = [Item(id=f"{self.guard.id}_weapon",
+                                          name=self.guard.weapon.name,
+                                          category="weapon", qty=1)]
+        return self.guard.loot_items
 
 VIS_SPEED = 140.0    # fine-cells/sec: sound-propagation speed (gates the ripple
                       # AND when actors hear a sound). ~17.5 m/s at cpm 8, about
@@ -218,8 +292,11 @@ FLASHLIGHT_SELF = 0.55  # how much the flashlight lights the player holding it
 FLASHLIGHT_SELF_SEEN = 0.40  # how visible the player's own flashlight makes them
 GUARD_FLASH_GAIN = 105  # additive world brighten from a guard's flashlight beam
 GUARD_FLASH_POP = 70    # dimmer glow of that beam drawn over the fog (a tell)
+WARM_LIGHT_TINT = (1.0, 0.94, 0.82)   # player flashlight / muzzle-flash colour
+GUARD_LIGHT_TINT = (0.75, 0.85, 1.0)  # cool blue-white - reads as "not yours"
 SHOT_GLOW = 0.75        # brief player-sprite brightness lift on each shot fired
 SHOT_GLOW_TIME = 0.13
+BLOOD_FX_TIME = 0.6     # how long a hit-reaction blood sprite shows and fades
 RAIL_IDS = ("rail_rifle", "rail_pistol")   # hold-to-charge weapons
 RAIL_CHARGE_MAX = 3.0   # seconds of hold for a full charge
 RAIL_CHARGE_BOOST = 1.0  # +100% released-shot damage at full charge
@@ -419,6 +496,45 @@ def scale_to_view(surf, m: TileMap, cells_w: int, cells_h: int):
     return pygame.transform.scale(surf, (int(cells_w * ppc), int(cells_h * ppc)))
 
 
+def _vf_slice(sf, vf, h_: int, w_: int):
+    """A shadowcast field `sf` and the player's vision window `vf` are both
+    windows into the same fine grid, at different offsets/sizes. Returns the
+    ((y0,y1,x0,x1) slice of the (h_, w_) vf-sized array `sf` overlaps, (sy0,
+    sy1,sx0,sx1) the matching slice of `sf`'s own arrays) or None if they
+    don't overlap at all. Used to composite any point light into the window
+    the fog/perception code operates on."""
+    oy, ox = sf.y0 - vf.y0, sf.x0 - vf.x0
+    dh, dw = sf.visible.shape
+    y0, x0 = max(0, oy), max(0, ox)
+    y1, x1 = min(h_, oy + dh), min(w_, ox + dw)
+    if y1 <= y0 or x1 <= x0:
+        return None
+    return (y0, y1, x0, x1), (y0 - oy, y1 - oy, x0 - ox, x1 - ox)
+
+
+def _additive_blit(screen, field: np.ndarray, gain: float, vf, ppc: float,
+                   w_: int, h_: int, tint=(1.0, 1.0, 1.0)) -> None:
+    """Composite a fine-grid light field onto `screen` (world px, additive) -
+    the shared tail of every dynamic light (flashlight beam, muzzle flash,
+    guard torch): scale to bytes, build a Surface, scale to viewport px,
+    BLEND_RGB_ADD at the window's screen position. `field` is mono (h_, w_),
+    tinted by the `tint` RGB triple (0..1 each), or already-coloured
+    (h_, w_, 3) - e.g. a per-source-coloured muzzle flash - in which case
+    `tint` is ignored."""
+    if field.ndim == 2:
+        g = np.clip(field * gain, 0, 255).astype(np.uint8)
+        tr, tg, tb = tint
+        rgb = np.stack([(g * tr).astype(np.uint8), (g * tg).astype(np.uint8),
+                        (g * tb).astype(np.uint8)], axis=2)
+    else:
+        rgb = np.clip(field * gain, 0, 255).astype(np.uint8)
+    tex = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
+    sc = pygame.transform.smoothscale(
+        tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
+    screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
+                special_flags=pygame.BLEND_RGB_ADD)
+
+
 def static_overlay(field: np.ndarray, m: TileMap, lo, hi, rgb):
     norm = np.clip((field.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
     s = field_surface(field, rgb, norm * 190)
@@ -576,7 +692,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
     world_h = round(m.height_m * PX_PER_M)
     view_w = min(world_w, MAX_VIEW[0])
     view_h = min(world_h, MAX_VIEW[1])
-    window = pygame.display.set_mode((view_w, view_h + HUD_H))
+    window = pygame.display.set_mode((view_w, view_h))
     world = pygame.Surface((world_w, world_h))   # the full map is drawn here,
     screen = window                              # then a camera rect is blitted
     cam_x = cam_y = 0
@@ -698,6 +814,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
     slung = False                  # gun lowered (h) - faster, cannot fire
     raise_t = 0.0                  # bringing a slung gun back up
     flashlight = False             # l - a beam the shape of the identify cone
+    player_inventory: list = []    # Items actually taken (weapon/usable/mission)
+    ui_mode = None                 # None | "dialog" | "inventory" | "player_inv"
+    ui_target = None               # the Interactable / corpse a dialog/inventory panel is open on
+    ui_page = 0                    # dialog: which line is showing
+    ui_sel = 0                     # inventory: selected row
+    hover_target = None            # the interactable currently moused-over, in range + LOS
     stamina = 1.0                  # 0..1, drained by sprinting
     sprint_locked = False          # true when stamina bottomed out, until STAMINA_UNLOCK
     flash_roll = 0.0               # per-shot flash spin, degrees
@@ -851,12 +973,77 @@ def main(map_path: str = "maps/arena.toml") -> None:
         cam_x = int(min(max(px_ * PX_PER_M - view_w * 0.5, 0), max(0, world_w - view_w)))
         cam_y = int(min(max(py_ * PX_PER_M - view_h * 0.5, 0), max(0, world_h - view_h)))
 
+        # interactable hover: nearest candidate under the mouse, in range + LOS -
+        # this is what `f` opens and what gets the yellow highlight this frame
+        hover_target = None
+        if ui_mode is None:
+            _mxp, _myp = pygame.mouse.get_pos()
+            if _myp < view_h:
+                _best_px = INTERACT_HOVER_PX
+                _pcx, _pcy = m.cell_of(px_, py_)
+                for _c in (list(m.interactables)
+                          + [_CorpseTarget(g) for g in guards if not g.alive]):
+                    _cx, _cy = _c.pos
+                    if math.hypot(_cx - px_, _cy - py_) > INTERACT_RANGE:
+                        continue
+                    _dpx = math.hypot(_cx * PX_PER_M - cam_x - _mxp,
+                                      _cy * PX_PER_M - cam_y - _myp)
+                    if _dpx > _best_px:
+                        continue
+                    _tcx, _tcy = m.cell_of(_cx, _cy)
+                    if not line_of_sight(m.blocks_sight, _pcx, _pcy, _tcx, _tcy):
+                        continue
+                    hover_target, _best_px = _c, _dpx
+
         _t = time.perf_counter()
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
             elif ev.type == pygame.KEYDOWN:
-                if ev.key == pygame.K_ESCAPE:
+                if ui_mode is not None:
+                    # a dialog/inventory panel owns the keyboard while open -
+                    # nothing else in this chain runs
+                    if ev.key in (pygame.K_ESCAPE, pygame.K_f):
+                        ui_mode, ui_target = None, None
+                    elif ui_mode == "dialog":
+                        if ev.key in (pygame.K_SPACE, pygame.K_RETURN,
+                                     pygame.K_KP_ENTER):
+                            ui_page += 1
+                            if ui_page >= len(ui_target.dialog):
+                                ui_mode, ui_target = None, None
+                    elif ui_mode == "inventory":
+                        _items = ui_target.items
+                        if ev.key in (pygame.K_UP, pygame.K_w) and _items:
+                            ui_sel = (ui_sel - 1) % len(_items)
+                        elif ev.key in (pygame.K_DOWN, pygame.K_s) and _items:
+                            ui_sel = (ui_sel + 1) % len(_items)
+                        elif (ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER,
+                                        pygame.K_e) and _items
+                              and 0 <= ui_sel < len(_items)):
+                            _it = _items[ui_sel]
+                            if _it.category in TAKE_CATEGORIES:
+                                player_inventory.append(_it)
+                                _items.pop(ui_sel)
+                                msg, msg_t = f"took {_it.name}", now
+                            elif not _it.picked:
+                                _it.picked = True
+                                msg, msg_t = f"marked {_it.name} for pickup", now
+                            ui_sel = min(ui_sel, max(0, len(_items) - 1))
+                        elif ev.key == pygame.K_t and _items:
+                            _n = 0
+                            for _it in list(_items):
+                                if _it.category in TAKE_CATEGORIES:
+                                    player_inventory.append(_it)
+                                    _items.remove(_it)
+                                    _n += 1
+                                elif not _it.picked:
+                                    _it.picked = True
+                                    _n += 1
+                            ui_sel = 0
+                            msg, msg_t = f"took/marked {_n} item(s)", now
+                elif ev.key == pygame.K_i:
+                    ui_mode, ui_target, ui_sel = "player_inv", None, 0
+                elif ev.key == pygame.K_ESCAPE:
                     running = False
                 elif ev.key == pygame.K_F1:
                     show_grid = not show_grid
@@ -914,6 +1101,13 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         swap_t = sprites.SWAP_TIME
                         slung, raise_t = False, 0.0   # a new weapon comes up ready
                         msg, msg_t = f"switched to {weapons.ROSTER[loadout[wi]].name}", now
+                elif ev.key == pygame.K_f and hover_target is not None:
+                    if hover_target.items:
+                        ui_mode, ui_target, ui_sel = "inventory", hover_target, 0
+                    elif hover_target.dialog:
+                        ui_mode, ui_target, ui_page = "dialog", hover_target, 0
+                    else:
+                        msg, msg_t = f"{hover_target.name}: nothing there", now
                 elif ev.key == pygame.K_f:
                     best, bd = None, INTERACT_RANGE
                     for (r_, c_) in doors:
@@ -959,7 +1153,9 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     slung, raise_t = False, 0.0
                     msg, msg_t = f"switched to {weapons.ROSTER[loadout[wi]].name}", now
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                if pygame.mouse.get_pos()[1] < view_h:
+                if ui_mode is not None:
+                    pass                     # a panel is open - no firing
+                elif pygame.mouse.get_pos()[1] < view_h:
                     w = weapons.ROSTER[loadout[wi]]
                     auto = cur_fire_mode() == "auto"
                     # firing cancels a shell-by-shell reload in progress
@@ -1074,7 +1270,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                             reserves[wi] -= _take
                         msg, msg_t = "reloaded", now
             # full-auto alternate fire: fire while the button is held down
-            if (player.hp > 0.0 and cur_fire_mode() == "auto"
+            if (ui_mode is None and player.hp > 0.0 and cur_fire_mode() == "auto"
                     and fire_cd <= 0.0 and reload_t <= 0.0 and swap_t <= 0.0
                     and not slung and raise_t <= 0.0
                     and mags[wi] > 0
@@ -1122,7 +1318,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 if sprint_locked and stamina >= STAMINA_UNLOCK:
                     sprint_locked = False
 
-        if (vx or vy) and not paused:
+        if (vx or vy) and not paused and ui_mode is None:
             n = math.hypot(vx, vy)
             ox, oy = px_, py_
             px_, py_ = try_move(m, px_, py_, vx / n * speed * dt, vy / n * speed * dt)
@@ -1481,20 +1677,18 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 _fcx, _fcy = m.cell_of(ml["x"], ml["y"])
                 _rc = max(2, int(ml["reach"] * cpm * 1.3))
                 _sf = shadowcast(m.blocks_sight, _fcx, _fcy, _rc)
+                _sl = _vf_slice(_sf, vf, h_, w_)
+                if _sl is None:
+                    continue
+                (_y0, _y1, _x0, _x1), (_sy0, _sy1, _sx0, _sx1) = _sl
                 _lit = np.where(
-                    _sf.visible,
-                    np.clip(1.0 - _sf.dist / _rc, 0.0, 1.0) ** 1.6 * _b,
+                    _sf.visible[_sy0:_sy1, _sx0:_sx1],
+                    np.clip(1.0 - _sf.dist[_sy0:_sy1, _sx0:_sx1] / _rc,
+                           0.0, 1.0) ** 1.6 * _b,
                     0.0).astype(np.float32)
-                _oy, _ox = _sf.y0 - vf.y0, _sf.x0 - vf.x0
-                _y0, _x0 = max(0, _oy), max(0, _ox)
-                _y1 = min(h_, _oy + _lit.shape[0])
-                _x1 = min(w_, _ox + _lit.shape[1])
-                if _y1 > _y0 and _x1 > _x0:
-                    src = _lit[_y0 - _oy:_y1 - _oy, _x0 - _ox:_x1 - _ox]
-                    np.maximum(_mf[_y0:_y1, _x0:_x1], src,
-                               out=_mf[_y0:_y1, _x0:_x1])
-                    _col = np.array(ml["col"], np.float32) / 255.0
-                    _mrgb[_y0:_y1, _x0:_x1] += src[:, :, None] * _col
+                np.maximum(_mf[_y0:_y1, _x0:_x1], _lit, out=_mf[_y0:_y1, _x0:_x1])
+                _col = np.array(ml["col"], np.float32) / 255.0
+                _mrgb[_y0:_y1, _x0:_x1] += _lit[:, :, None] * _col
             if _mf.max() > 0.0:
                 _vis = vf.visible.astype(np.float32)
                 _mf = box_blur(_mf, MFLASH_BLUR) * _vis
@@ -1518,19 +1712,21 @@ def main(map_path: str = "maps/arena.toml") -> None:
             _gha = math.radians(ai.GUARD_FLASH_HALF_DEG)
             for g in _lg:
                 gcx, gcy = m.cell_of(g.x, g.y)
-                _gsf = shadowcast(m.blocks_sight, gcx, gcy, _grc)
-                _gd = np.abs((_gsf.ang - g.facing + np.pi) % (2 * np.pi) - np.pi)
-                _gt = np.clip(1.0 - _gsf.dist / _grc, 0.0, 1.0)
+                # through the shared cache, not a fresh shadowcast every frame -
+                # this was the stutter when a guard's torch came on nearby
+                _gsf = vis_cache.get(gcx, gcy, _grc)
+                _sl = _vf_slice(_gsf, vf, h_, w_)
+                if _sl is None:
+                    continue
+                (_y0, _y1, _x0, _x1), (_sy0, _sy1, _sx0, _sx1) = _sl
+                _ang = _gsf.ang[_sy0:_sy1, _sx0:_sx1]
+                _dist = _gsf.dist[_sy0:_sy1, _sx0:_sx1]
+                _vis_s = _gsf.visible[_sy0:_sy1, _sx0:_sx1]
+                _gd = np.abs((_ang - g.facing + np.pi) % (2 * np.pi) - np.pi)
+                _gt = np.clip(1.0 - _dist / _grc, 0.0, 1.0)
                 _gt = _gt * _gt * (3.0 - 2.0 * _gt)
-                _gl = np.where((_gd <= _gha) & _gsf.visible, _gt, 0.0).astype(np.float32)
-                _oy, _ox = _gsf.y0 - vf.y0, _gsf.x0 - vf.x0
-                _y0, _x0 = max(0, _oy), max(0, _ox)
-                _y1 = min(h_, _oy + _gl.shape[0])
-                _x1 = min(w_, _ox + _gl.shape[1])
-                if _y1 > _y0 and _x1 > _x0:
-                    np.maximum(_gb[_y0:_y1, _x0:_x1],
-                               _gl[_y0 - _oy:_y1 - _oy, _x0 - _ox:_x1 - _ox],
-                               out=_gb[_y0:_y1, _x0:_x1])
+                _gl = np.where((_gd <= _gha) & _vis_s, _gt, 0.0).astype(np.float32)
+                np.maximum(_gb[_y0:_y1, _x0:_x1], _gl, out=_gb[_y0:_y1, _x0:_x1])
             _gb *= vf.visible
             if _gb.max() > 0.0:
                 gbeam = box_blur(_gb, 1)
@@ -1567,14 +1763,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
             _g2 = gbeam * GUARD_FLASH_GAIN
             add = _g2 if add is None else np.maximum(add, _g2)
         if add is not None and add.max() > 1.0:
-            g = np.clip(add, 0, 255).astype(np.uint8)
-            warm = np.stack([g, (g * 0.94).astype(np.uint8),
-                             (g * 0.82).astype(np.uint8)], axis=2)
-            tex = pygame.surfarray.make_surface(np.transpose(warm, (1, 0, 2)))
-            sc = pygame.transform.smoothscale(
-                tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
-            screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
-                        special_flags=pygame.BLEND_RGB_ADD)
+            # a shared brighten of the world under whichever light is strongest
+            # here - one blended tint for this pass; the guard beam gets its
+            # own distinct cool tint below, where it reads as "whose light"
+            _additive_blit(screen, add, 1.0, vf, ppc, w_, h_, tint=WARM_LIGHT_TINT)
 
         _t = time.perf_counter()
         if show_fog:
@@ -1680,6 +1872,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 if g.alive:
                     draw_guard_cone(screen, g, PX_PER_M)
 
+        for _e in m.interactables:              # no sprite art yet - flat markers
+            _ex, _ey = _e.pos[0] * PX_PER_M, _e.pos[1] * PX_PER_M
+            _ecol = ENT_COLOUR.get(_e.kind, (200, 200, 200))
+            pygame.draw.circle(screen, _ecol, (int(_ex), int(_ey)), 9)
+            pygame.draw.circle(screen, (20, 20, 20), (int(_ex), int(_ey)), 9, 1)
+
         live_n = 0
         for g in guards:
             gcx, gcy = m.cell_of(g.x, g.y)
@@ -1689,6 +1887,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 if not (bank.ok and bank.blit(screen, "soldier_idle", sx, sy,
                                               g.facing, tint=(70, 70, 70), alpha=200)):
                     pygame.draw.circle(screen, DEAD, (int(sx), int(sy)), 7)
+                _bage = now - g.bleed_t
+                if bank.ok and 0.0 <= _bage < BLOOD_FX_TIME:
+                    _ba = int(255 * (1.0 - _bage / BLOOD_FX_TIME) ** 0.7)
+                    bank.blit(screen, f"blood_{g.bleed_variant + 1}", sx, sy,
+                              g.facing, alpha=_ba)
                 pygame.draw.line(screen, DEAD, (sx - 6, sy - 6), (sx + 6, sy + 6), 2)
                 pygame.draw.line(screen, DEAD, (sx - 6, sy + 6), (sx + 6, sy - 6), 2)
                 continue
@@ -1711,6 +1914,11 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     if not g_slung:
                         draw_muzzle(sprites.weapon_art_for(g.weapon), gwx, gwy,
                                     g.facing, g.flash_t, g.flash_roll, g.flash_scale)
+                    _bage = now - g.bleed_t
+                    if 0.0 <= _bage < BLOOD_FX_TIME:
+                        _ba = int(255 * (1.0 - _bage / BLOOD_FX_TIME) ** 0.7)
+                        bank.blit(screen, f"blood_{g.bleed_variant + 1}", sx, sy,
+                                  g.facing, alpha=_ba)
                     pygame.draw.circle(screen, col, (int(sx), int(sy)), 12, 1)
                 else:
                     pygame.draw.circle(screen, col, (int(sx), int(sy)), 7)
@@ -1812,23 +2020,14 @@ def main(map_path: str = "maps/arena.toml") -> None:
 
         if mflash_rgb is not None:               # coloured muzzle-flash glow,
             # already shadow-cast per flash + masked to player LOS - no bleed
-            g = np.clip(mflash_rgb * MFLASH_POP_GAIN, 0, 255).astype(np.uint8)
-            tex = pygame.surfarray.make_surface(np.transpose(g, (1, 0, 2)))
-            sc = pygame.transform.smoothscale(
-                tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
-            screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
-                        special_flags=pygame.BLEND_RGB_ADD)
+            _additive_blit(screen, mflash_rgb, MFLASH_POP_GAIN, vf, ppc, w_, h_)
         muzzle_lights = [ml for ml in muzzle_lights
                          if now - ml["t0"] < ml.get("life", MUZZLE_LIGHT_TIME)]
 
-        if gbeam is not None:                    # a guard torch beam over the fog
-            g = np.clip(gbeam * GUARD_FLASH_POP, 0, 255).astype(np.uint8)
-            cool = np.stack([g, g, (g * 1.0).astype(np.uint8)], axis=2)
-            tex = pygame.surfarray.make_surface(np.transpose(cool, (1, 0, 2)))
-            sc = pygame.transform.smoothscale(
-                tex, (max(1, round(w_ * ppc)), max(1, round(h_ * ppc))))
-            screen.blit(sc, (round(vf.x0 * ppc), round(vf.y0 * ppc)),
-                        special_flags=pygame.BLEND_RGB_ADD)
+        if gbeam is not None:                    # a guard torch beam over the fog -
+            # cool blue-white so it reads as someone ELSE's light, not yours
+            _additive_blit(screen, gbeam, GUARD_FLASH_POP, vf, ppc, w_, h_,
+                           tint=GUARD_LIGHT_TINT)
 
         for (bx, by), br, t0 in blasts:
             age = (now - t0) / BLAST_FADE
@@ -1903,12 +2102,31 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     bank.blit(screen, "light_on", ppx, ppy, facing)
                 else:
                     bank.blit(screen, "light_off", ppx, ppy, facing, tint=ptint)
+            if drew:
+                # blood hit-reaction: only when a hit cost HEALTH (a shield-
+                # absorbed hit never touches bleed_t), fades over BLOOD_FX_TIME
+                _bage = now - player.bleed_t
+                if 0.0 <= _bage < BLOOD_FX_TIME:
+                    _ba = int(255 * (1.0 - _bage / BLOOD_FX_TIME) ** 0.7)
+                    bank.blit(screen, f"blood_{player.bleed_variant + 1}",
+                              ppx, ppy, facing, tint=ptint, alpha=_ba)
         if not drew:
             pygame.draw.line(screen, FACING, (ppx, ppy),
                              (ppx + math.cos(facing) * 26,
                               ppy + math.sin(facing) * 26), 2)
             pygame.draw.circle(screen, DEAD if down else PLAYER,
                                (int(ppx), int(ppy)), int(BODY_R * PX_PER_M))
+
+        if hover_target is not None:
+            # mouse-over highlight - a pulsing yellow ring + name, the only
+            # readout an interactable gives; the roof pass below still covers
+            # it if it's indoors and you have no business seeing it
+            _hx, _hy = hover_target.pos
+            _hsx, _hsy = _hx * PX_PER_M, _hy * PX_PER_M
+            _hr = int(16 + 3 * (0.5 + 0.5 * math.sin(now * 6.0)))
+            pygame.draw.circle(screen, UI_YELLOW, (int(_hsx), int(_hsy)), _hr, 2)
+            _lbl = font.render(f"{hover_target.name}  [f]", True, UI_YELLOW)
+            screen.blit(_lbl, (_hsx - _lbl.get_width() / 2, _hsy - _hr - 20))
 
         # roof pass: a building's roof draws OVER everything - floor, walls,
         # characters, fx - so its interior is hidden until the vision cone
@@ -1968,72 +2186,129 @@ def main(map_path: str = "maps/arena.toml") -> None:
                                     -math.pi / 2 + _cf * 2 * math.pi,
                                     3 if _cf < 0.999 else 4)
 
-        pygame.draw.rect(screen, HUD_BG, (0, view_h, view_w, HUD_H))
-        cx, cy = m.cell_of(px_, py_)
-        ch = m.chars[int(py_), int(px_)]
-        y0 = view_h
+        # HUD is a compact overlay on the game view now, not a reserved strip
+        # that used to paint over (hide) the bottom slice of the world - player
+        # info always bottom-left, debug (toggled) bottom-right.
+        _t = time.perf_counter()
         _w = weapons.ROSTER[loadout[wi]]
         _fm = cur_fire_mode()
 
-        if not show_debug:
-            def _bar(x, y, wd, ht, frac, fg, bg=(44, 44, 48)):
-                pygame.draw.rect(screen, bg, (x, y, wd, ht))
-                fw = int(wd * max(0.0, min(1.0, frac)))
-                if fw > 0:
-                    pygame.draw.rect(screen, fg, (x, y, fw, ht))
-                pygame.draw.rect(screen, (12, 12, 14), (x, y, wd, ht), 1)
+        def _bar(x, y, wd, ht, frac, fg, bg=(44, 44, 48)):
+            pygame.draw.rect(screen, bg, (x, y, wd, ht))
+            fw = int(wd * max(0.0, min(1.0, frac)))
+            if fw > 0:
+                pygame.draw.rect(screen, fg, (x, y, fw, ht))
+            pygame.draw.rect(screen, (12, 12, 14), (x, y, wd, ht), 1)
 
-            bx, bw = 22, 300
-            if player.max_shields > 0:
-                _bar(bx, y0 + 20, bw, 15,
-                     player.shields / player.max_shields, (90, 160, 235))
-                screen.blit(font_mid.render(
-                    f"SH {int(player.shields):3d}/{int(player.max_shields):<3d}",
-                    True, TEXT), (bx + bw + 12, y0 + 17))
-            hy = y0 + 42
-            hpf = player.health / max(1.0, player.max_health)
-            hpc = ((90, 200, 120) if hpf > 0.5 else
-                   (232, 200, 70) if hpf > 0.25 else (225, 70, 55))
-            _bar(bx, hy, bw, 22, hpf, hpc)
-            screen.blit(font_big.render(f"{max(0, int(player.health))}", True, TEXT),
-                        (bx + bw + 12, hy - 9))
+        panel_x = HUD_MARGIN
+        panel_y = view_h - HUD_PANEL_H - HUD_MARGIN
+        _panel = pygame.Surface((HUD_PANEL_W, HUD_PANEL_H), pygame.SRCALPHA)
+        _panel.fill((*HUD_BG, 165))
+        screen.blit(_panel, (panel_x, panel_y))
+
+        bx = panel_x + 12
+        bw = HUD_PANEL_W - 24
+        ry = panel_y + 10
+        if player.max_shields > 0:
+            _bar(bx, ry, bw, 10, player.shields / player.max_shields, (90, 160, 235))
             screen.blit(font.render(
-                f"/ {int(player.max_health)}    armor {player.armor_lo:.0f}%",
-                True, DIM), (bx + bw + 74, hy + 7))
-            _bar(bx, y0 + 70, bw, 7, stamina,
-                 (120, 120, 130) if sprint_locked else (230, 205, 110))
-            if player.hp <= 0.0:
-                screen.blit(font_big.render("DOWN", True, (225, 70, 55)),
-                            (bx, y0 + 80))
+                f"SH {int(player.shields):3d}/{int(player.max_shields):<3d}",
+                True, TEXT), (bx + bw + 8, ry - 3))
+            ry += 16
+        hpf = player.health / max(1.0, player.max_health)
+        hpc = ((90, 200, 120) if hpf > 0.5 else
+               (232, 200, 70) if hpf > 0.25 else (225, 70, 55))
+        _bar(bx, ry, bw, 18, hpf, hpc)
+        screen.blit(font.render(
+            f"{max(0, int(player.health))}/{int(player.max_health)}"
+            f"   armor {player.armor_lo:.0f}%", True, TEXT), (bx + 6, ry + 2))
+        ry += 24
+        _bar(bx, ry, bw, 6, stamina,
+             (120, 120, 130) if sprint_locked else (230, 205, 110))
+        ry += 15
 
-            wx = view_w // 2 - 130
-            screen.blit(font_mid.render(_w.name.upper(), True, TEXT), (wx, y0 + 16))
-            _st = ("SLUNG" if slung else "RAISING" if raise_t > 0 else
-                   "RELOADING" if reload_t > 0 else
-                   "SWITCHING" if swap_t > 0 else _fm.upper())
-            screen.blit(font.render(_st, True,
-                        (232, 200, 70) if (reload_t > 0 or swap_t > 0 or slung
-                                           or raise_t > 0) else DIM),
-                        (wx, y0 + 40))
-            _am = font_big.render(f"{mags[wi]:2d}", True,
-                                  (225, 70, 55) if mags[wi] == 0 else TEXT)
-            screen.blit(_am, (wx, y0 + 58))
-            _res = "∞" if reserves[wi] < 0 else str(reserves[wi])
-            screen.blit(font.render(f"/ {_w.mag}   res {_res}", True, DIM),
-                        (wx + _am.get_width() + 8, y0 + 74))
+        screen.blit(font.render(_w.name.upper(), True, TEXT), (bx, ry))
+        _st = ("SLUNG" if slung else "RAISING" if raise_t > 0 else
+               "RELOADING" if reload_t > 0 else
+               "SWITCHING" if swap_t > 0 else _fm.upper())
+        _stw = font.render(_st, True,
+                           (232, 200, 70) if (reload_t > 0 or swap_t > 0 or slung
+                                              or raise_t > 0) else DIM)
+        screen.blit(_stw, (bx + bw - _stw.get_width(), ry))
+        ry += 20
+        _am = font_mid.render(f"{mags[wi]:2d}", True,
+                              (225, 70, 55) if mags[wi] == 0 else TEXT)
+        screen.blit(_am, (bx, ry))
+        _res = "inf" if reserves[wi] < 0 else str(reserves[wi])
+        screen.blit(font.render(f"/ {_w.mag}   res {_res}", True, DIM),
+                    (bx + _am.get_width() + 6, ry + 6))
 
-            # no detection readout by design: the player reads the guards
-            # themselves and the sound world, nothing is spelled out
+        # no detection readout by design: the player reads the guards
+        # themselves and the sound world, nothing is spelled out
 
-            if msg and now - msg_t < 2.5:
-                _mm = font_mid.render(msg, True, (245, 220, 140))
-                screen.blit(_mm, (view_w // 2 - _mm.get_width() // 2,
-                                  y0 + HUD_H - 32))
-            screen.blit(font.render(f"{clock.get_fps():4.0f} fps    § = debug",
-                        True, DIM), (view_w - 170, y0 + HUD_H - 18))
+        if player.hp <= 0.0:
+            _dn = font_big.render("DOWN", True, (225, 70, 55))
+            screen.blit(_dn, (panel_x, panel_y - _dn.get_height() - 4))
+        elif msg and now - msg_t < 2.5:
+            _mm = font_mid.render(msg, True, (245, 220, 140))
+            _mb = pygame.Surface((_mm.get_width() + 16, _mm.get_height() + 8),
+                                 pygame.SRCALPHA)
+            _mb.fill((*HUD_BG, 165))
+            _mb.blit(_mm, (8, 4))
+            screen.blit(_mb, (panel_x, panel_y - _mb.get_height() - 4))
+
+        if ui_mode == "dialog" and ui_target is not None:
+            _dlines = ui_target.dialog
+            _text = _dlines[min(ui_page, len(_dlines) - 1)] if _dlines else ""
+            _pw, _ph = 560, 130
+            _px, _py = (view_w - _pw) // 2, view_h - _ph - 90
+            _pnl = pygame.Surface((_pw, _ph), pygame.SRCALPHA)
+            _pnl.fill((*HUD_BG, 215))
+            pygame.draw.rect(_pnl, UI_YELLOW, _pnl.get_rect(), 1)
+            _pnl.blit(font_mid.render(ui_target.name, True, UI_YELLOW), (16, 12))
+            for i, ln in enumerate(_wrap_text(_text, font, _pw - 32)):
+                _pnl.blit(font.render(ln, True, TEXT), (16, 44 + i * 20))
+            _foot = (("space/enter: continue" if ui_page < len(_dlines) - 1
+                     else "space/enter: close") if _dlines else "f/esc: close")
+            _pnl.blit(font.render(_foot, True, DIM), (16, _ph - 22))
+            screen.blit(_pnl, (_px, _py))
+
+        elif ui_mode in ("inventory", "player_inv"):
+            _items = ui_target.items if ui_mode == "inventory" else player_inventory
+            _title = ui_target.name if ui_mode == "inventory" else "Inventory"
+            _pw = 460
+            _ph = 60 + max(1, len(_items)) * 22 + 30
+            _px, _py = (view_w - _pw) // 2, (view_h - _ph) // 2
+            _pnl = pygame.Surface((_pw, _ph), pygame.SRCALPHA)
+            _pnl.fill((*HUD_BG, 215))
+            pygame.draw.rect(_pnl, UI_YELLOW, _pnl.get_rect(), 1)
+            _pnl.blit(font_mid.render(_title, True, UI_YELLOW), (16, 12))
+            if not _items:
+                _pnl.blit(font.render("(empty)", True, DIM), (16, 44))
+            for i, it in enumerate(_items):
+                sel = ui_mode == "inventory" and i == ui_sel
+                col = (UI_YELLOW if sel else
+                      DIM if getattr(it, "picked", False) else TEXT)
+                tag = " (marked for pickup)" if getattr(it, "picked", False) else ""
+                row = f"{'> ' if sel else '  '}{it.name} x{it.qty} [{it.category}]{tag}"
+                _pnl.blit(font.render(row, True, col), (16, 44 + i * 22))
+            _foot = ("up/down select  enter take  t take-all  f/esc close"
+                    if ui_mode == "inventory" else "f/esc close")
+            _pnl.blit(font.render(_foot, True, DIM), (16, _ph - 22))
+            screen.blit(_pnl, (_px, _py))
+
+        if not show_debug:
+            _hint = font.render(f"{clock.get_fps():4.0f} fps   § debug", True, DIM)
+            screen.blit(_hint, (view_w - _hint.get_width() - HUD_MARGIN,
+                                view_h - _hint.get_height() - HUD_MARGIN))
+            prof["hud"] = (time.perf_counter() - _t) * 1000
+            _t = time.perf_counter()
             pygame.display.flip()
+            prof["flip"] = (time.perf_counter() - _t) * 1000
             continue
 
+        cx, cy = m.cell_of(px_, py_)
+        ch = m.chars[int(py_), int(px_)]
         last_solve = "-"
         if sounds:
             s0 = sounds[-1]
@@ -2076,11 +2351,18 @@ def main(map_path: str = "maps/arena.toml") -> None:
             f"known {100.0*known.mean():4.1f}%   fog {'on' if show_fog else 'OFF'}   "
             f"{clock.get_fps():5.1f} fps{'  PAUSED' if paused else ''}",
             "LMB fire  b fire-mode  r reload  h sling(+20% move)  wheel/1-7 weapon  f door  space knock  "
-            "c clear  m mute  F1-F8 overlays  F9 prof  F10 own snd  F11 enemy  v cones  p pause  § game HUD",
+            "c clear  m mute  F1-F8 overlays  F9 prof  F10 own snd  F11 enemy  v cones  p pause  § debug off",
         ]
+        _dbg_w = min(DEBUG_PANEL_W, view_w - 2 * HUD_MARGIN)
+        _dbg_h = len(lines) * 21 + 16 + (21 if show_prof else 0)
+        _dbg_x = view_w - _dbg_w - HUD_MARGIN
+        _dbg_y = view_h - _dbg_h - HUD_MARGIN
+        _dbg_panel = pygame.Surface((_dbg_w, _dbg_h), pygame.SRCALPHA)
+        _dbg_panel.fill((*HUD_BG, 165))
+        screen.blit(_dbg_panel, (_dbg_x, _dbg_y))
         for i, ln in enumerate(lines):
             screen.blit(font.render(ln, True, TEXT if i < 6 else DIM),
-                        (10, view_h + 8 + i * 21))
+                        (_dbg_x + 8, _dbg_y + 8 + i * 21))
 
         if show_prof:
             for k, v in prof.items():
@@ -2095,7 +2377,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 f"[ms] {parts}   sum {sum(prof_smooth.values()):5.1f}"
                 f"   peak {worst} {prof_peak[worst]:.1f}"
                 f"   frame {dt * 1000:5.1f}",
-                True, (250, 200, 120)), (10, view_h + 8 + 8 * 21))
+                True, (250, 200, 120)),
+                (_dbg_x + 8, _dbg_y + 8 + len(lines) * 21))
         prof["hud"] = (time.perf_counter() - _t) * 1000
 
         _t = time.perf_counter()

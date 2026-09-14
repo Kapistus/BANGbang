@@ -32,8 +32,8 @@ from pathlib import Path
 import numpy as np
 
 from sim.tilemap import (GuardSpec, IdleSpot, Light, Tile, TileMap, _expand,
-                         bake_lightmap, compute_roof, darken, lighten,
-                         WALL_PEN_COST, WALL_SOUND_COST)
+                         _parse_interactables, bake_lightmap, compute_roof,
+                         darken, lighten, WALL_PEN_COST, WALL_SOUND_COST)
 from sim.tileset import Tileset, load_tileset
 
 FORMAT = "bangbang-map/1"
@@ -57,6 +57,7 @@ def new_map(cols: int, rows: int, ts: Tileset, name: str = "untitled") -> dict:
         "guards": [],
         "idle_spots": [],
         "lights": [],
+        "interactables": [],
     }
 
 
@@ -187,6 +188,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
               intensity=float(l.get("intensity", 1.0)))
         for l in doc.get("lights", [])
     ]
+    interactables = _parse_interactables(doc.get("interactables", []))
 
     tm = TileMap(
         name=doc.get("name", Path(path).stem),
@@ -206,6 +208,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
         guards=guards,
         idle_spots=idle_spots,
         lights=lights,
+        interactables=interactables,
         floor_ids=floor_ids,
         object_ids=object_ids,
         tileset=ts,

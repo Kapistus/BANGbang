@@ -29,6 +29,9 @@ Keys
     k  add guard: click waypoints, Enter to finish, Backspace undo point
     L  light mode: click to place a lamp; wheel = intensity, shift+wheel = radius
        (or r / i keys, +shift to lower); RMB/Del remove
+    e  entity mode: click to place an npc/trader/quest_item ([ ] cycles kind);
+       prompts a name, then dialog lines (npc) or items (trader/quest_item);
+       RMB/Del remove
     [ ]  cycle the guard's weapon - the route under the cursor, or the
          default for the next route (combat rifle by default)
     c  clear all guards        del  erase hovered object
@@ -67,6 +70,9 @@ GUARD_C = (216, 90, 48)
 LIGHT_C = (240, 210, 120)
 DEF_LIGHT_RADIUS = 5.0
 DEF_LIGHT_INTENSITY = 1.0
+ENT_KINDS = ["npc", "trader", "quest_item"]
+ENT_COLOUR = {"npc": (90, 205, 195), "trader": (225, 185, 60),
+             "quest_item": (175, 115, 225)}
 
 MIN_ZOOM, MAX_ZOOM = 8, 48
 DEF_ZOOM = 18             # px per cell (a cell is mapfile cell_m metres)
@@ -165,6 +171,7 @@ class Editor:
         self.guard_skill = "veteran"        # aim tier for the next route (t cycles)
         self.light_radius = DEF_LIGHT_RADIUS      # next placed light ([ ] adjust)
         self.light_intensity = DEF_LIGHT_INTENSITY  # next placed light (, . adjust)
+        self.ent_kind = "npc"                # next placed entity ([ ] cycles)
         self.toast = ""
         self.toast_t = 0
         self.show_grid = True
@@ -277,6 +284,22 @@ class Editor:
                  "intensity": self.light_intensity})
             self.dirty = True
             return
+        if self.mode == "entity":
+            name = text_prompt(self.screen, self.font,
+                               f"{self.ent_kind} name:", "???")
+            if name is None:
+                return
+            dialog, items = [], []
+            if self.ent_kind == "npc":
+                dialog = self._prompt_lines("dialog line")
+            else:
+                items = self._prompt_items()
+            ents = self.doc.setdefault("interactables", [])
+            ents.append({"id": f"e{len(ents)}", "kind": self.ent_kind,
+                        "pos": [c + 0.5, r + 0.5], "name": name,
+                        "dialog": dialog, "items": items})
+            self.dirty = True
+            return
         if erase:
             if self.doc["object"][r][c]:
                 self.doc["object"][r][c] = ""
@@ -357,6 +380,62 @@ class Editor:
     def _flash(self, text):
         self.toast = text
         self.toast_t = pygame.time.get_ticks()
+
+    def _prompt_lines(self, label_prefix):
+        """Blocking: text_prompt for successive lines until one comes back
+        blank or cancelled."""
+        lines = []
+        while True:
+            s = text_prompt(self.screen, self.font,
+                            f"{label_prefix} {len(lines) + 1} (blank to finish):", "")
+            if not s:
+                break
+            lines.append(s)
+        return lines
+
+    def _prompt_items(self):
+        """Blocking: 'id,name,category,qty' lines until blank/cancelled.
+        category is weapon | usable | mission | misc (free text, main.py only
+        actually transfers the first three - misc just gets marked taken)."""
+        items = []
+        while True:
+            s = text_prompt(self.screen, self.font,
+                            "item  id,name,category,qty  (blank to finish):", "")
+            if not s:
+                break
+            parts = [p.strip() for p in s.split(",")]
+            iid = parts[0] if parts and parts[0] else f"item{len(items)}"
+            name = parts[1] if len(parts) > 1 and parts[1] else iid
+            cat = parts[2] if len(parts) > 2 and parts[2] else "misc"
+            try:
+                qty = max(1, int(parts[3])) if len(parts) > 3 else 1
+            except ValueError:
+                qty = 1
+            items.append({"id": iid, "name": name, "category": cat, "qty": qty})
+        return items
+
+    def entity_near(self, mx, my):
+        c, r = self.cell_at(mx, my)
+        cx, cy = c + 0.5, r + 0.5
+        best, bd = None, 1.2
+        for e in self.doc.get("interactables", []):
+            d = math.hypot(e["pos"][0] - cx, e["pos"][1] - cy)
+            if d < bd:
+                best, bd = e, d
+        return best
+
+    def delete_entity_near(self, mx, my):
+        e = self.entity_near(mx, my)
+        if e is not None:
+            self.doc["interactables"].remove(e)
+            self.dirty = True
+            return True
+        return False
+
+    def cycle_ent_kind(self, step):
+        i = ENT_KINDS.index(self.ent_kind)
+        self.ent_kind = ENT_KINDS[(i + step) % len(ENT_KINDS)]
+        self._flash(f"next entity kind -> {self.ent_kind}")
 
     def cycle_guard_weapon(self, mx, my, step):
         """[ ] or , . : retag the route whose waypoint is under the cursor,
@@ -466,6 +545,7 @@ class Editor:
         row("[ set player spawn ]  o", "mode", "spawn", active=self.mode == "spawn")
         row("[ guard route ]  k", "mode", "guard", active=self.mode == "guard")
         row("[ light ]  L", "mode", "light", active=self.mode == "light")
+        row("[ entity ]  e", "mode", "entity", active=self.mode == "entity")
         row("[ paint / erase ]  p", "mode", "erase", active=self.mode == "paint")
         y += 4
 
@@ -637,6 +717,16 @@ class Editor:
             pygame.draw.circle(self.screen, LIGHT_C, (lx, ly), 4)
             pygame.draw.circle(self.screen, (20, 20, 20), (lx, ly), 4, 1)
 
+        for e in self.doc.get("interactables", []):
+            ex, ey = self._wpt(e["pos"])
+            col = ENT_COLOUR.get(e.get("kind", "npc"), (200, 200, 200))
+            pygame.draw.circle(self.screen, col, (ex, ey), 7)
+            pygame.draw.circle(self.screen, (20, 20, 20), (ex, ey), 7, 1)
+            n_items = len(e.get("items", []))
+            tag = f"  [{n_items} item{'s' if n_items != 1 else ''}]" if n_items else ""
+            self.screen.blit(self.small.render(
+                f"{e.get('name', '???')}{tag}", True, TEXT), (ex + 9, ey - 6))
+
     def draw_status(self):
         w, h = self.screen.get_size()
         pygame.draw.rect(self.screen, PANEL_BG, (0, h - STATUS_H, w, STATUS_H))
@@ -653,7 +743,10 @@ class Editor:
                "light": (f"LIGHT  next r{self.light_radius} i{self.light_intensity}  "
                          f"LMB=place  wheel=intensity  shift+wheel=radius  "
                          f"(r/i keys, +shift to lower)  RMB/Del=remove  "
-                         f"({len(self.doc.get('lights', []))} placed)")
+                         f"({len(self.doc.get('lights', []))} placed)"),
+               "entity": (f"ENTITY  next [{self.ent_kind}] (: [ ] cycle)  "
+                         f"LMB=place (prompts name + dialog/items)  RMB/Del=remove  "
+                         f"({len(self.doc.get('interactables', []))} placed)"),
                }[self.mode]
         msg = (f"cell {cell:>7}   {cur}   |   {name}  {self.cols}x{self.rows} "
                f"z{self.zoom}   s save  l load  n new  o spawn  k guard  g grid"
@@ -750,6 +843,10 @@ class Editor:
             if self.mode == "guard":
                 self.commit_guard()          # k again = finish this, start next
             self.mode, self.guard_wip = "guard", []
+        elif k == pygame.K_e:
+            if self.mode == "guard":
+                self.commit_guard()
+            self.mode = "entity"
         elif k == pygame.K_c and self.mode != "guard":
             self.doc["guards"] = []
             self.dirty = True
@@ -768,6 +865,9 @@ class Editor:
                     dr={pygame.K_LEFTBRACKET: -0.5, pygame.K_RIGHTBRACKET: 0.5}
                     .get(k, 0.0),
                     di={pygame.K_COMMA: -0.1, pygame.K_PERIOD: 0.1}.get(k, 0.0))
+            elif self.mode == "entity":
+                if k in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
+                    self.cycle_ent_kind(-1 if k == pygame.K_LEFTBRACKET else 1)
             else:
                 back = k in (pygame.K_LEFTBRACKET, pygame.K_COMMA)
                 self.cycle_guard_weapon(mx, my, -1 if back else 1)
@@ -780,7 +880,8 @@ class Editor:
             self.guard_wip.pop()
         elif k in (pygame.K_DELETE, pygame.K_BACKSPACE):
             mx, my = pygame.mouse.get_pos()
-            if not self.delete_guard_near(mx, my) and not self.delete_light_near(mx, my):
+            if not (self.delete_guard_near(mx, my) or self.delete_light_near(mx, my)
+                   or self.delete_entity_near(mx, my)):
                 self.apply(mx, my, erase=True)
         return True
 
@@ -798,6 +899,8 @@ class Editor:
                 self.delete_guard_near(mx, my)   # RMB a route to remove it
             elif self.mode == "light":
                 self.delete_light_near(mx, my)
+            elif self.mode == "entity":
+                self.delete_entity_near(mx, my)
             else:
                 self.erasing = True
                 self.apply(mx, my, erase=True)
