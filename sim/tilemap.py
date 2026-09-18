@@ -202,6 +202,73 @@ class TileMap:
         return True
 
 
+def find_doors(m: "TileMap") -> dict:
+    """Map coarse (row, col) of every door tile to its open state."""
+    out = {}
+    for r in range(m.chars.shape[0]):
+        for c in range(m.chars.shape[1]):
+            tile = m.tiles.get(m.chars[r, c])
+            if tile is not None and tile.door:
+                out[(r, c)] = False
+    return out
+
+
+def set_door(m: "TileMap", cost, r: int, c: int, is_open: bool) -> None:
+    """Rewrite the fine arrays for one door tile. Callers must invalidate the
+    visibility cache and any held sound fields afterwards.
+
+    Like glass, a door is map state: opening one changes what can be seen,
+    shot and heard through it, so in multiplayer the server owns the toggle and
+    every client applies the same one."""
+    sub = m.subdiv
+    y0, y1 = r * sub, (r + 1) * sub
+    x0, x1 = c * sub, (c + 1) * sub
+    t = m.tiles[m.chars[r, c]]
+    m.blocks_move[y0:y1, x0:x1] = False if is_open else t.blocks_move
+    m.blocks_sight[y0:y1, x0:x1] = False if is_open else t.blocks_sight
+    m.blocks_bullets[y0:y1, x0:x1] = False if is_open else t.blocks_bullets
+    val = 1.0 if is_open else t.sound_cost
+    m.sound_cost[y0:y1, x0:x1] = val
+    if cost is not None:
+        cost[y0:y1, x0:x1] = val
+
+
+def break_glass_cells(m: "TileMap", fine_cells, cost: "np.ndarray | None" = None,
+                      broken: "set | None" = None) -> list:
+    """Turn every glass tile named by `fine_cells` into an open hole: bullets
+    and sight pass through, the frame still blocks movement, and sound crosses
+    almost freely. Returns the COARSE (row, col) cells newly broken.
+
+    This mutates the map, which is why multiplayer has the server do it and
+    broadcast the result: a pane broken on one machine and not another would
+    give those players different walls to see, shoot and listen through.
+
+    `cost` is the sound-cost array the caller is solving fields against, kept in
+    step with the map's own. `broken` is a set of coarse cells already broken,
+    so repeated hits on the same pane are cheap and idempotent.
+    """
+    sub = m.subdiv
+    out = []
+    for ci, cj in fine_cells:
+        r, c = cj // sub, ci // sub
+        if broken is not None and (r, c) in broken:
+            continue
+        tile = m.tiles.get(m.chars[r, c])
+        if tile is None or not tile.glass:
+            continue
+        if broken is not None:
+            broken.add((r, c))
+        y0, y1, x0, x1 = r * sub, (r + 1) * sub, c * sub, (c + 1) * sub
+        m.blocks_bullets[y0:y1, x0:x1] = False
+        m.blocks_sight[y0:y1, x0:x1] = False
+        m.glass[y0:y1, x0:x1] = False
+        m.sound_cost[y0:y1, x0:x1] = BROKEN_GLASS_SOUND_COST
+        if cost is not None:
+            cost[y0:y1, x0:x1] = BROKEN_GLASS_SOUND_COST
+        out.append((int(r), int(c)))
+    return out
+
+
 def validate_patrols(m: "TileMap", radius: float = 0.30,
                      step: float = 0.10) -> list[str]:
     """Check every patrol segment is actually walkable.
@@ -262,6 +329,7 @@ ROOF_MAX_CELLS = 800             # a sealed blob bigger than this (coarse cells)
 # just art. For readability the two roles render at different brightness:
 # floor cells are darkened, wall cells are lightened toward white.
 WALL_SOUND_COST = 40.0
+BROKEN_GLASS_SOUND_COST = 1.5   # a shattered pane is barely a barrier at all
 WALL_PEN_COST = 3.5
 FLOOR_DARKEN = 0.55      # floor cell brightness, fraction of the tile
 WALL_LIGHTEN = 0.40      # wall cell blend toward white, 0 = tile .. 1 = white

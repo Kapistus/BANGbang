@@ -76,8 +76,10 @@ from pathlib import Path
 import numpy as np
 import pygame
 
-from sim import ai, audio, ballistics, combat, mapfile, sound, sprites, weapons
+from sim import (ai, audio, ballistics, combat, mapfile, movement,
+                 perception, sound, sprites, weapons)
 from sim.tilemap import (FLOOR_DARKEN, WALL_LIGHTEN, Item, TileMap,
+                         break_glass_cells, find_doors, set_door,
                          compute_roof, load_map, validate_patrols,
                          validate_spawns)
 
@@ -143,16 +145,16 @@ STAMINA_UNLOCK = 0.25     # sprint re-enables once stamina climbs back to this
 # cadence and the audible step rhythm. Walking patters (short spacing),
 # running lands heavier and further apart, crawling is slow and, for the
 # player, produces no step SFX at all (see the sfx call below).
-STRIDE = {"crawl": 1.50, "walk": 0.70, "run": 1.10}
+STRIDE = perception.STRIDE
 
 # Sound energies are the METRES a sound carries in open air. Converted to
 # cell units at load, so changing subdiv no longer rescales how far
 # everything is audible.
-FOOTSTEP_REACH_M = {"crawl": 2.0, "walk": 5.5, "run": 11.0}
-KNOCK_REACH_M = 22.0
-DRYFIRE_REACH_M = 3.5
-MAGDROP_REACH_M = 7.5
-GLASS_BREAK_REACH_M = 15.0
+FOOTSTEP_REACH_M = perception.FOOTSTEP_REACH_M
+KNOCK_REACH_M = perception.KNOCK_REACH_M
+DRYFIRE_REACH_M = perception.DRYFIRE_REACH_M
+MAGDROP_REACH_M = perception.MAGDROP_REACH_M
+GLASS_BREAK_REACH_M = perception.GLASS_BREAK_REACH_M
 MAX_ACTIVE = 14
 
 # Ammo is unlimited in reserve but finite per magazine, so reloading is the
@@ -318,7 +320,7 @@ CUE_RADIUS_M = 2.3
 CUE_FADE = 1.7
 CUE_NARROW_DEG = 14.0
 CUE_WIDE_DEG = 75.0
-CUE_MIN_ENERGY = 0.10
+CUE_MIN_ENERGY = perception.CUE_MIN_ENERGY   # the check itself lives there
 
 BG = (28, 28, 26)
 HUD_BG = (20, 20, 19)
@@ -551,31 +553,6 @@ def seg_point_dist(px, py, ax, ay, bx, by):
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
-def find_doors(m: TileMap) -> dict[tuple[int, int], bool]:
-    """Map coarse (row, col) of every door tile to its open state."""
-    out = {}
-    for r in range(m.chars.shape[0]):
-        for c in range(m.chars.shape[1]):
-            if m.tiles[m.chars[r, c]].door:
-                out[(r, c)] = False
-    return out
-
-
-def set_door(m: TileMap, cost, r: int, c: int, is_open: bool) -> None:
-    """Rewrite the fine arrays for one door tile. Callers must invalidate
-    the visibility cache and any held sound fields afterwards."""
-    s = m.subdiv
-    y0, y1 = r * s, (r + 1) * s
-    x0, x1 = c * s, (c + 1) * s
-    t = m.tiles[m.chars[r, c]]
-    m.blocks_move[y0:y1, x0:x1] = False if is_open else t.blocks_move
-    m.blocks_sight[y0:y1, x0:x1] = False if is_open else t.blocks_sight
-    m.blocks_bullets[y0:y1, x0:x1] = False if is_open else t.blocks_bullets
-    val = 1.0 if is_open else t.sound_cost
-    m.sound_cost[y0:y1, x0:x1] = val
-    cost[y0:y1, x0:x1] = val
-
-
 def draw_cue(screen, cx, cy, ang, half_deg, alpha, ppm):
     """An arc centred on the listener, facing where the sound came from."""
     r_out = CUE_RADIUS_M * ppm
@@ -621,11 +598,10 @@ def draw_guard_cone(screen, g, ppm):
 
 
 def try_move(m: TileMap, x, y, dx, dy):
-    if m.can_stand(x + dx, y, BODY_R):
-        x += dx
-    if m.can_stand(x, y + dy, BODY_R):
-        y += dy
-    return x, y
+    """Per-axis collision so you slide along walls. The body of this lives in
+    sim/movement.py so the multiplayer server moves players with exactly the
+    same numbers; this wrapper keeps main.py's call sites unchanged."""
+    return movement.try_move(m, x, y, dx, dy, BODY_R)
 
 
 def emit(m: TileMap, cost, x, y, energy, label, sounds, now, cache=None,
@@ -871,22 +847,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
         bullets and sight pass, the frame still blocks movement, and the
         break is loud."""
         nonlocal audible_open
-        s = m.subdiv
-        changed = False
-        for ci, cj in fine_cells:
-            r, c = cj // s, ci // s
-            if (r, c) in broken_glass or not m.tiles[m.chars[r, c]].glass:
-                continue
-            broken_glass.add((r, c))
-            changed = True
-            y0, y1, x0, x1 = r * s, (r + 1) * s, c * s, (c + 1) * s
-            m.blocks_bullets[y0:y1, x0:x1] = False
-            m.blocks_sight[y0:y1, x0:x1] = False
-            m.glass[y0:y1, x0:x1] = False
-            m.sound_cost[y0:y1, x0:x1] = 1.5
-            cost[y0:y1, x0:x1] = 1.5
+        broke = break_glass_cells(m, fine_cells, cost, broken_glass)
+        for r, c in broke:
             emit(m, cost, c + 0.5, r + 0.5, e_glass, "glass", sounds, now, jobs=jobs)
-        if changed:
+        if broke:
             audible_open = m.sound_cost < SOUND_RENDER_MAX_COST
             vis_cache.invalidate()
             sfx("glass")
@@ -1506,30 +1470,27 @@ def main(map_path: str = "maps/arena.toml") -> None:
         for snd in sounds:
             if not snd.enemy or snd.cued:
                 continue
-            f = snd.field
-            tv = f.arrival_time(*pc)
-            if not math.isfinite(tv):
+            # the arrival/attenuation/bearing model lives in sim/perception.py
+            # so multiplayer hears the world the same way this does
+            status, heard = perception.perceive(
+                snd.field, pc, snd.energy, snd.elapsed_cells(now))
+            if status is perception.Arrival.PENDING:
                 if snd.done(now):
                     snd.cued = True
                 continue
-            if f.arrival(*pc) > snd.energy:
-                snd.cued = True
+            snd.cued = True
+            if heard is None:                 # arrived with nothing left
                 continue
-            if snd.elapsed_cells(now) >= tv:
-                snd.cued = True
-                rem = f.remaining(*pc)
-                b = f.bearing(*pc)
-                cues.append({
-                    "x": px_, "y": py_, "t": now,
-                    "ang": math.atan2(b[1], b[0]) if b else 0.0,
-                    "rem": rem,
-                    "dir": b is not None and rem >= CUE_MIN_ENERGY,
-                })
-                _cg = min(1.0, rem * 1.3)
-                if snd.label.endswith("/step"):
-                    _cg *= 0.4                # footsteps are a faint cue, not loud
-                sfx(audio.enemy_clip(snd.label), gain=_cg,
-                    pan=(float(b[0]) if b else 0.0))
+            cues.append({
+                "x": px_, "y": py_, "t": now,
+                "ang": heard.angle,
+                "rem": heard.remaining,
+                "dir": heard.directional,
+            })
+            _cg = heard.gain
+            if snd.label.endswith("/step"):
+                _cg *= 0.4                    # footsteps are a faint cue, not loud
+            sfx(audio.enemy_clip(snd.label), gain=_cg, pan=heard.pan)
         cues = [c for c in cues if now - c["t"] < CUE_FADE]
 
         sounds = [s for s in sounds if not s.done(now)]

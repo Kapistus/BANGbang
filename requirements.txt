@@ -8,6 +8,10 @@
 numpy>=1.26
 pygame>=2.5
 
+# Wire format for multiplayer (net/protocol.py). Pure-Python fallback included,
+# so no compiler is needed on any platform.
+msgpack>=1.0
+
 # JIT-compiles the sound solver to machine code. 25-30x faster than the pure
 # Python fallback: a pistol field drops from ~115 ms to ~4 ms. Output matches
 # the pure solver to within 1e-5.
