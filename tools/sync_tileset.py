@@ -9,7 +9,7 @@ Tiles are pure art now - a stanza is just png / name / colour / group. How a
 painted cell behaves (Floor vs Wall) is the editor's toggle, not the tile.
 
 Everything in tileset.toml ABOVE the marker line is left untouched (the
-[meta] block and the hand-authored tiles - blank, door, window, bush).
+[meta] block and the hand-authored tiles - blank, doors, window).
 Everything below it is rewritten from the managed folders each run, so
 deleting a PNG drops its entry too.
 

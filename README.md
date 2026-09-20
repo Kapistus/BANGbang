@@ -58,6 +58,40 @@ Map editor:
 py editor.py maps/foo.map
 ```
 
+Every editor hotkey is a single unshifted key on the number row or the top
+letter row, so none of them need AltGr on a Nordic layout. Modes are
+`q` paint, `e` entity, `r` light, `t` guard, `y` player spawn, `u` multiplayer
+spawn. `w` swaps placing tiles as Floor or Wall, `i` toggles the grid, `o` the
+roof preview, `p` pages the palette. `1` `2` and `3` `4` adjust whatever is
+under the cursor — team tag and facing on a spawn, radius and intensity on a
+lamp, kind on an entity, weapon on a guard — with shift taking the coarse step
+on a lamp. `5` `6` cycle a guard's skill, `7` clears every guard, `8` saves
+(shift = save as), `9` loads, `0` starts a new map. Enter, Backspace, Del,
+arrows, space-drag and Esc are unchanged.
+
+`e` enters entity mode and `1` `2` cycle the kind. Alongside npc, trader and
+quest_item there are **health** and **ammo** packs — those two place straight
+away with no prompts, since there is nothing to author on one, and they draw
+with a ring at the radius a player has to reach to take it.
+
+`u` enters multiplayer spawn mode: click to place a start point, the wheel (or
+`3` `4`) turns it, `1` `2` tag it for team A, team B or anyone, right-click or
+Del removes it. Spawns draw at the character's real collision size with a facing
+line, and `main.py` warns on load about any that sit inside geometry — or about
+a map that tags one team but not the other.
+
+Two door tiles are in the palette — **Door (0.35s)** and **Blast door (5s)** —
+and they replace the single door that used to be there. Set either into a wall
+run: the panels retract into whatever is solid beside them, so a door with
+walls to its left and right slides sideways and one with walls above and below
+slides up and down. The editor turns the icon to match, so you can see which
+way a door will open as you place it. A doorway with nothing either side still
+works; it just picks an axis.
+
+The same two tiles exist in the legacy char-grid format as `+` and `B` in
+`maps/tiles.toml`. Adding a third kind is a tile entry with a different
+`door_time`, not a code change.
+
 ---
 
 ## Multiplayer
@@ -81,6 +115,14 @@ In the lobby everyone sets name, colour, team (in team mode) and ready; the host
 also picks the map, the mode and the match length. The match starts when
 everyone is ready, or when the host forces it. Minimum two players.
 
+You can arrive late. Connect while a match is running and you drop straight into
+it, at the spawn point furthest from anyone still fighting, with the doors and
+broken windows as they stand rather than as the map file has them. Esc steps you
+out again without dropping your connection: you land back in the lobby, your
+score stays on the board, and a JOIN MATCH button puts you back in. In team mode
+a latecomer goes to the thinner side. A match everybody walks out of ends by
+itself rather than running on empty.
+
 In the match:
 
 ```
@@ -88,23 +130,75 @@ WASD / arrows   move        shift run        ctrl crawl
 mouse           aim         left mouse fire (hold for auto, or to charge rail)
 1-7 / wheel     weapon      r reload         b fire mode
 f               open or close a door you are standing next to
-tab             scoreboard  esc quit
+l               flashlight
+tab             scoreboard  esc step out to the lobby (still connected)
 ```
 
 The full seven-weapon loadout works — pistol, combat rifle, SMG, combat shotgun,
 rail rifle, laser rifle, rocket launcher — with magazines, reloads, fire modes,
-rail charge-up and rocket flight time. Damage runs through the same
+rail charge-up and rocket flight time. Ammo is **capped**: every gun carries
+three to six spare magazines (the rocket launcher, three rockets ever), so a
+firefight you cannot walk away from is one you have to finish. Damage runs through the same
 shields → armor → health model as single-player, bullets spend the same
 penetration budget against cover, and glass shatters for everyone at once.
 
-Doors work: opening one changes what can be seen, shot and heard through it for
-everyone, and it will not close on a body standing in the leaf. Other players are
+Muzzle flashes are the single-player ones: two sprite layers pinned to the
+barrel with a random roll and scale per shot, the gun kicking back and settling
+over `RECOIL_TIME`, and a real light cast from the muzzle that briefly shows the
+room — orange for slugthrowers, blue for rail, blue-green for plasma, cyan for
+laser. A rocket detonating gets a bigger, longer one. The light is shadow-cast
+from the flash, so it stops at walls, and it lifts the fog only while it burns:
+a room you saw for a twelfth of a second by somebody's gunfire is not a room you
+remember.
+
+Players wear the colour they picked in the lobby as **art**: `soldier_ready` in
+red is `assets/characters/soldier_ready_red.png`. A pose with no coloured
+version falls back to the base sprite, so the palette can be filled one file at
+a time (see *Colour art* under Work in progress). There is a ring of the same
+colour at their feet either way — in an unlit room a body is a silhouette and
+the ring is all there is to read. The gun stays gunmetal: a red rifle reads as a
+toy.
+
+Light works as it does in single-player, out of `sim/lighting.py`, which both
+modes now call. What you can see is gated on what is lit: a room with no lamp
+and no torch reveals nothing, so darkness is cover. Your flashlight (`l`) is a
+16° beam cast from your own position, and everyone else's is cast from theirs —
+you see the room their beam lights and the sweeping cone itself, drawn in a cool
+white so it reads as somebody else's. Which cuts both ways: the lamp is also the
+clearest thing on the map about where you are. A map with no lights baked into
+it is dark, full stop — light is placed, not assumed, so an unlit map needs a
+flashlight to play at all.
+
+Health and ammo packs are placed in the editor and taken by walking over one.
+A health pack is worth 35, an ammo pack tops up **every carried weapon by 30%
+of its own cap**. A pack that would do nothing is not consumed — walk over a
+health pack at full health and it stays there for whoever needs it. In
+multiplayer the server decides who reached it first, and a taken pack comes
+back after 30 seconds (health) or 20 (ammo), which turns the pack spots into
+map control.
+
+Doors are two steel panels that part along the wall and retract into the jambs.
+There are two kinds, and the difference is time: a powered door (`+`) is open
+in about a third of a second, and a blast door (`B`) takes five. Neither is
+passable, transparent or quiet until the panels are fully home, in either
+direction — a door part-way open is not a gap to squeeze through, and one
+part-way shut is not a gap to dive back out of. That is the whole design of the
+slow one: five seconds standing in the open, watching an amber lamp go yellow,
+is a cost somebody can make you pay. A door already moving ignores the key,
+so there is no cancelling it once it starts.
+
+Opening one changes what can be seen, shot and heard through it for everyone,
+and it will not close on a body standing in the doorway. Other players are
 hidden by fog of war exactly like anything else — if you cannot see into a room,
 you cannot see who is in it, and their tracers and muzzle flashes are hidden with
-them.
+them. What their gunfire LIGHTS is still visible, which is usually the more
+useful tell.
 
-What you hear of another player arrives as an arc at your own position, pointing
-the way the sound travelled. Arrivals from the same direction refresh one arc
+Each source keeps one reusable propagation field per kind of sound, so a weapon
+on full auto costs about one field solve rather than one per round — measured at
+56 shots per 2 solves — and a source that moves more than a metre gets a fresh
+one. What you hear of another player arrives as an arc at your own position,
+pointing the way the sound travelled. Arrivals from the same direction refresh one arc
 rather than stacking: a sprinter emits five footsteps a second, and one arc per
 step rings you completely and tells you nothing.
 
@@ -127,7 +221,13 @@ An authoritative server runs in a daemon thread inside the host process. TCP,
 one length-prefixed msgpack frame per message (`net/protocol.py`), default port
 **47801**, protocol version 3 — a mismatched client is rejected outright.
 
-The server ticks at 30 Hz and broadcasts snapshots at 20 Hz. Input is a queue of
+The server ticks at 30 Hz and broadcasts snapshots at 20 Hz. Every connection
+has an outbox drained by its own thread, so the tick loop never blocks on a
+socket: one player whose connection backs up costs themselves their backlog and
+nobody else their frame rate. Under pressure a queue sheds what is cheapest to
+lose — a snapshot is a whole picture of the world, so only the newest is ever
+queued, then tracers and sound events go, and state (lobby, kills, doors, glass)
+is delivered or the client is cut off. Input is a queue of
 fixed-size commands, one per tick, and the server applies at most one per tick,
 so simulated time can never run ahead of real time and a client that floods
 inputs gains no speed. It moves players with `sim/movement.py` and resolves
@@ -153,10 +253,13 @@ but fog of war is already client-side, so it could already see through walls —
 this is the same trust model, and it keeps a 4 ms (or 115 ms without numba)
 solve off the tick loop.
 
-Spawn points come from `net/maps.py`: whatever the map file declares
-(`spawn_points` in a `.map`, or `spawn_points = [[x, y], ...]` in a `.toml`), and
-otherwise derived by farthest-point sampling over standable ground, which is
-deterministic — every machine derives the same set.
+Spawn points are map objects. Place them in the editor (`m`), each with a facing
+and an optional team tag; team modes then start each side on its own spawns, and
+you arrive looking the way the spawn says rather than always due north. A map
+that declares none falls back to farthest-point sampling over standable ground,
+which is deterministic — every machine derives the same set — but knows only
+that the ground is standable, not what can see it. That is the reason to place
+them.
 
 LAN only. There is no matchmaking, no NAT punch-through, no relay. If the host
 machine has a firewall, allow inbound TCP on 47801.
@@ -176,6 +279,32 @@ Console commands (`ready`, `unready`, `team a|b`, `start`, `end`, `score`,
 `quit`) are **ignored on Windows**: stdin polling uses POSIX-only `select()`.
 The connection and the match run fine regardless.
 
+### Tile art
+
+`assets/tiles/*.png` is real art, sliced from the sheets in
+`assets/tiles/tilesets/` by `tools/slice_sheet.py`. `tools/gen_sprites.py`
+fills in **missing** PNGs with flat placeholder motifs and leaves everything
+else alone — it will not redraw art that is already there unless you ask:
+
+```
+py tools/gen_sprites.py                        # fill in what is missing
+py tools/gen_sprites.py --force --only door    # redraw just these
+py tools/gen_sprites.py --force                # redraw everything (destructive)
+```
+
+That default matters. The editor calls the generator automatically whenever any
+one PNG is absent, so before this it only took adding a tile to `tileset.toml`
+to flatten every sliced tile in the folder into a grey square.
+
+The two door icons are drawn by the renderer itself (`main.draw_door`, shut),
+so the palette icon is literally what a placed door looks like in game rather
+than an impression of one that can drift.
+
+`metal_grating`, `metal_grid` and `metal_yellow` are currently generated
+motifs — bars, a lattice and hazard stripes — standing in for sliced art that
+was lost. Re-slice them from a sheet and they stop being placeholders; nothing
+else needs to change.
+
 ### Tests
 
 ```
@@ -183,13 +312,29 @@ py -m net.smoke_test        # lobby -> match -> kill -> respawn -> end -> lobby
 py -m net.movement_test     # speeds, stance, input clamping, walls
 py -m net.combat_test       # firing, damage, mags, cover, kills, glass,
                             #   doors, sound
+py -m net.backpressure_test # a client that stops reading must not stall the
+                            #   server for everyone else
+py -m net.rejoin_test       # joining, leaving and rejoining a running match
+py -m net.spawn_points_test # authored spawns: format, teams, facing, fallback
+py -m net.doors_test        # slide axis, travel time, a moving door is a wall
+py -m net.pickups_test      # ammo caps, the 30% rule, respawns, who got there
+                            #   first
 py mp_smoke_test.py         # the real client, headless, for six seconds
 py mp_smoke_test.py vessel_interior
+py editor_test.py           # the editor opens every map and draws every mode
 ```
 
-All four are headless. `mp_smoke_test.py` drives the actual `MatchView` with
+All ten are headless. `mp_smoke_test.py` drives the actual `MatchView` with
 scripted input against a dummy video driver, so it exercises rendering,
-prediction, shooting and the sound path without opening a window.
+prediction, shooting, muzzle flashes and the sound path without opening a
+window. It then runs four more passes: the lobby's late-join path; field
+reuse — that a stationary shooter costs one solve, that a moving one does not
+keep reusing a stale field, that footsteps never inherit a gunshot's loudness,
+and that opening a door throws every cached field away; colour — that every
+lobby swatch has a sprite set of its own and that a missing one falls back; and
+lighting — that an unlit room hides a player, that a beam reveals only what it
+lights, that another player's torch reaches you, and that a muzzle flash lights
+a room without writing it into fog memory.
 
 ---
 
@@ -203,6 +348,7 @@ lobby.py            pygame start screen and lobby (host and join)
 run_host.py         headless host harness
 run_client.py       headless client harness
 mp_smoke_test.py    headless test of the networked client
+editor_test.py      headless test that the editor draws and edits
 net/
   protocol.py       wire format, enums, message tags, input bits, kill verbs
   server.py         authoritative server: threads, ticks, movement, scoring
@@ -213,9 +359,15 @@ net/
   mappicker.py      host-only map selection panel
   smoke_test.py     headless netcode test
   movement_test.py  headless movement test
+  spawn_points_test.py  authored spawns, teams, facing
+  rejoin_test.py    joining, leaving and rejoining
+  backpressure_test.py  a client that stops reading
 sim/
   movement.py       speeds, collision, input clamping — one definition, shared
   perception.py     loudness, and what a listener makes of a sound — shared
+  lighting.py       beams, point lights, and the light gate on sight — shared
+  doors.py          sliding-door state machine: axis, travel time, arrival
+  pickups.py        health/ammo packs: what they give, and when they return
   sound.py          Eikonal solver, separate attenuation + travel-time fields
   vision.py         recursive shadowcasting, three-band vision cones
   ai.py             guard state machine (idle / patrol / search / combat)
@@ -242,19 +394,19 @@ mechanics/          legacy design docs, keybindings, older asset sets
 1. **No guards, no AI.** Matches are player-versus-player only. Guards would
    need to run server-side and ship in snapshots, and they already hear the same
    sound field, so most of the work is netcode rather than behaviour.
-2. **No mid-match join and no spectating.** Latecomers are rejected with "match
-   in progress" and wait for the lobby; leaving a match means leaving the server.
+2. **No spectating.** You can join, leave and rejoin a match, but not watch one
+   you are not playing in — stepping out puts you on the lobby screen, not a
+   camera. Worth deciding whether a spectator should see through the fog of war
+   before building it, since in a stealth game that leaks positions to anyone
+   sitting in the same room.
 3. **No stamina.** Sprinting is unlimited over the network; single-player drains
    and regenerates it.
 4. **No interactables beyond doors.** Single-player has traders, corpses, quest
    objects and an inventory behind the same key; multiplayer has doors only.
-5. **Lighting is not modelled for other players.** A muzzle flash is a flat
-   bright disc, not the shadow-cast light single-player throws, so a shot in a
-   dark room does not briefly light it for everyone who can see in.
-6. **Missing feedback the single-player renderer has:** blood hit-reactions, the
-   weapon-swap animation frames, recoil kick on the gun sprite, the rail
-   spool-up sound while charging, the slung/raise weapon states, and the
-   flashlight.
+5. **Missing feedback the single-player renderer has:** blood hit-reactions,
+   the weapon-swap animation frames, the rail spool-up sound while charging,
+   and the slung/raise weapon states. Muzzle flashes, recoil, the flashlight
+   and the shadow model are done.
 7. **No ripple view.** Single-player can show the sound wavefront itself
    (F11 cycles arcs / full ripples / off, and ripples are its default);
    multiplayer draws the arrival arcs only.
@@ -265,6 +417,29 @@ mechanics/          legacy design docs, keybindings, older asset sets
 9. **Sound is emitted authoritatively but heard client-side**, which is a
    deliberate trade (see above) and the place to revisit first if this ever
    needs to be cheat-resistant.
+10. **If the host quits, the match ends for everyone.** The server lives inside
+    the host's process. The `is_host` flag migrates between players, but it
+    cannot move the server, so nobody can take over; `net/smoke_test.py`'s
+    migration check passes only because the test itself owns the server.
+
+### Colour art
+
+Players wear their colour as painted art rather than a filter over one sprite.
+The loader globs every PNG under `assets/characters`, so a coloured set is a
+drop-in: no code change, no registration.
+
+Name a file `<pose>_<colour>.png` in `assets/characters/`, where `<pose>` is one
+of `soldier_ready`, `soldier_idle`, `soldier_ded` and `<colour>` is one of the
+ten palette names in `sim/sprites.py` — `red`, `blue`, `green`, `yellow`,
+`orange`, `purple`, `cyan`, `white`, `grey`, `black`. Same 200 px canvas, same
+centre, same up-facing orientation as the base art; the game only swaps which
+file it draws.
+
+Anything missing falls back to the base sprite, so a palette half-painted is
+fine and one file is enough to see it working. `python mp_smoke_test.py` prints
+which coloured sets it found. `sprites.PALETTE` is also what the lobby swatches
+are built from, so adding a colour there adds it to the lobby — but a swatch
+with no art is a soldier in khaki wearing a coloured ring.
 
 ### Map picker
 

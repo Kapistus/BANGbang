@@ -48,7 +48,11 @@ class Weapon:
     accuracy: float        # 0 .. 0.999
     mag: int
     reload_s: float
-    reserve: int = -1          # rounds available beyond the starting mag; -1 = unlimited
+    reserve: int = -1          # rounds available beyond the starting mag; -1 = unlimited.
+                               # Every gun is capped: a firefight you cannot
+                               # walk away from is one you have to finish, and
+                               # an ammo pack is worth crossing a room for.
+                               # Quoted in whole magazines in the roster below.
     backblast: bool = False    # vents exhaust behind the shooter on firing
     pen: float = 0.0            # wall-penetration budget (spends tile pen_cost)
     pellets: int = 1           # >1 for shotguns
@@ -157,43 +161,43 @@ ROSTER: dict[str, Weapon] = {
     # to drop an isolated guard without bringing the room
     "pistol": Weapon(
         "pistol", "ballistic", 5, 7, 16, 1.6, 0.97, 8, 1.0,
-        pen=2.0, sound_reach_m=50.0, weight=1.0, str_req=8, module_slots=1),
+        reserve=48, pen=2.0, sound_reach_m=50.0, weight=1.0, str_req=8, module_slots=1),
     # the generalist baseline: no weakness, no specialty, most customisable
     # (3 module slots); burst is the reliable mid-range answer, auto for panic
     "combat_rifle": Weapon(
         "combat rifle", "ballistic", 4, 6, 20, 3.0, 0.96, 25, 1.75,
-        pen=2.2, burst=3, burst_cycle=0.50, auto_rof=6.0, auto_accuracy=0.83,
+        reserve=125, pen=2.2, burst=3, burst_cycle=0.50, auto_rof=6.0, auto_accuracy=0.83,
         sound_reach_m=105.0, weight=3.8, str_req=12.5, module_slots=3),
     "smg": Weapon(
         "sub-machinegun", "ballistic", 2, 5, 16, 8.0, 0.87, 25, 2.0,
-        pen=1.8, auto_rof=13.0, auto_accuracy=0.70,
+        reserve=150, pen=1.8, auto_rof=13.0, auto_accuracy=0.70,
         sound_reach_m=100.0, weight=2.7, str_req=12.5, module_slots=2),
     "combat_shotgun": Weapon(
         "combat shotgun", "ballistic", 5, 9, 26, 2.0, 0.92, 8, 3.0,
-        pen=1.6, pellets=5, spread_deg=9.0, shell_reload_s=1.0,
+        reserve=40, pen=1.6, pellets=5, spread_deg=9.0, shell_reload_s=1.0,
         sound_reach_m=115.0, weight=3.5, str_req=12.5, module_slots=1),
     # rail: anti-armour, shreds cover, feeble against shields. pistol = the
     # quick peek-and-wallbang sidearm (punches one wall), rifle = the heavy
     # anti-materiel piece (the wall is irrelevant; slow, deliberate, deletes)
     "rail_pistol": Weapon(
         "rail pistol", "ballistic", 11, 16, 36, 1.6, 0.95, 8, 2.5,
-        pen=2.5, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
+        reserve=32, pen=2.5, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
         sound_reach_m=95.0, weight=1.4, str_req=8, module_slots=1),
     "rail_rifle": Weapon(
         "rail rifle", "ballistic", 20, 28, 40, 0.8, 0.97, 5, 3.2,
-        pen=6.0, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
+        reserve=20, pen=6.0, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
         sound_reach_m=110.0, weight=4.5, str_req=10, module_slots=2),
     # the reliable hard hitter: one big ballistic round, the longest dependable
     # ballistic range, best per-shot against a shielded target (normal mults)
     "heavy_rifle": Weapon(
         "heavy rifle", "heavy", 15, 25, 38, 0.9, 0.98, 8, 2.5,
-        pen=2.5, sound_reach_m=120.0, weight=10.2, str_req=16, module_slots=2),
+        reserve=32, pen=2.5, sound_reach_m=120.0, weight=10.2, str_req=16, module_slots=2),
     # breacher: a 3-round burst of frag rounds, each a small blast in a tight
     # cone - clears a doorway, murders anything close, hazardous to fire point
     # blank (the shooter is in its own blast)
     "flak_cannon": Weapon(
         "flak cannon", "heavy", 8, 12, 12, 1.0, 0.80, 5, 2.0,
-        pen=1.0, burst=3, spread_deg=7.0, blast_r=1.0,
+        reserve=15, pen=1.0, burst=3, spread_deg=7.0, blast_r=1.0,
         sound_reach_m=120.0, weight=9.7, str_req=17, module_slots=1),
     # bible lists 2 shots before reload; overridden per request - reload every shot.
     # bible blast radius is "2-5 units"; 4 m radius = 8 m kill diameter.
@@ -206,26 +210,26 @@ ROSTER: dict[str, Weapon] = {
     # one walks down this hallway and nothing stays in that doorway
     "flamethrower": Weapon(
         "flamethrower", "heavy", 3, 6, 8, 10.0, 0.92, 200, 10.0,
-        pen=0.0, pellets=4, spread_deg=14.0, health_mult=1.5,
+        reserve=300, pen=0.0, pellets=4, spread_deg=14.0, health_mult=1.5,
         sound_reach_m=60.0, min_dev_m=0.0, weight=20.0, str_req=15,
         module_slots=1),
     # shield sniper: hitscan, the longest reach and tightest accuracy of any
     # gun, low mag - strip shielded targets from across the map
     "pulse_carbine": Weapon(
         "pulse carbine", "energy", 5, 12, 46, 2.0, 0.99, 8, 2.5,
-        pen=1.5, shield_mult=1.9, health_mult=1.0, sound_reach_m=70.0,
+        reserve=32, pen=1.5, shield_mult=1.9, health_mult=1.0, sound_reach_m=70.0,
         weight=4.5, str_req=13, module_slots=3),
     # near-silent anti-shield sidearm that passes through an unshielded body -
     # line two guards up and drop both without a sound
     "laser_pistol": Weapon(
         "laser pistol", "laser", 3, 7, 30, 2.5, 0.985, 20, 3.0,
-        pen=1.0, pierce_bodies=True, shield_mult=1.9, health_mult=1.0,
+        reserve=100, pen=1.0, pierce_bodies=True, shield_mult=1.9, health_mult=1.0,
         sound_reach_m=45.0, weight=1.0, str_req=8, module_slots=1),
     # a slow-ish travelling plasma bolt (like the rocket, small splash) that
     # hits hard, especially against shields
     "laser_rifle": Weapon(
         "plasma rifle", "plasma", 12, 18, 40, 1.6, 0.99, 24, 3.5,
-        pen=0.0, blast_r=1.2, projectile_speed=46.0, shield_mult=1.9,
+        reserve=96, pen=0.0, blast_r=1.2, projectile_speed=46.0, shield_mult=1.9,
         health_mult=1.0, sound_reach_m=75.0, weight=4.7, str_req=11,
         module_slots=2),
     # plasma family = travelling bolts w/ splash, balanced mults. pistol: a
@@ -233,12 +237,12 @@ ROSTER: dict[str, Weapon] = {
     # heavy lob with a big splash - the rocket's repeatable understudy.
     "plasma_pistol": Weapon(
         "plasma pistol", "plasma", 4, 8, 25, 2.0, 0.96, 12, 2.5,
-        pen=0.0, blast_r=1.3, projectile_speed=55.0,
+        reserve=60, pen=0.0, blast_r=1.3, projectile_speed=55.0,
         shield_mult=1.2, health_mult=1.2,
         sound_reach_m=80.0, weight=1.1, str_req=10, module_slots=1),
     "plasma_rifle": Weapon(
         "plasma cannon", "plasma", 10, 12, 36, 1.0, 0.97, 20, 3.0,
-        pen=0.0, blast_r=2.6, projectile_speed=34.0,
+        reserve=60, pen=0.0, blast_r=2.6, projectile_speed=34.0,
         shield_mult=1.2, health_mult=1.2,
         sound_reach_m=95.0, weight=6.2, str_req=13, module_slots=2),
 }

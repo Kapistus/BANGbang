@@ -4,6 +4,11 @@ One TileDef per palette entry. The four editor booleans (is_see_through,
 is_walkable, blocks_los, blocks_shots) are authoritative; sound_cost,
 footstep_mult and pen_cost are read if present and otherwise derived from
 those booleans so a hand-added tile only needs the four.
+
+`door_time` is how long a door's panels take to travel, and it is the only
+thing separating a powered door from a blast door — everything else about the
+heavy one, the darker plate, the weightier sound, the HUD countdown, keys off
+that number. A third kind is a tile entry, not a code path.
 """
 
 from __future__ import annotations
@@ -29,8 +34,8 @@ class TileDef:
     footstep_mult: float
     pen_cost: float
     door: bool
+    door_time: float            # seconds a door's panels take to travel
     glass: bool
-    bush: bool
     overlay: bool               # draw ON TOP of characters (foliage canopy etc.)
     encloses: bool              # a full-height barrier that seals a room for roofing
     group: str                  # editor palette group ("" = base); purely UI
@@ -101,9 +106,9 @@ def load_tileset(path: str | Path | None = None) -> Tileset:
             footstep_mult=float(spec.get("footstep_mult", 1.0)),
             pen_cost=float(spec.get("pen_cost", _derive_pen_cost(wk, bl, bs))),
             door=bool(spec.get("door", False)),
+            door_time=float(spec.get("door_time", 0.35)),
             glass=gl,
-            bush=bool(spec.get("bush", tid == "bush")),
-            overlay=bool(spec.get("overlay", spec.get("bush", tid == "bush"))),
+            overlay=bool(spec.get("overlay", False)),
             encloses=bool(spec.get("encloses", enc)),
             group=str(spec.get("group", "")),
             colour=tuple(spec.get("colour", (180, 180, 180))),

@@ -10,27 +10,28 @@ A map_id is a bare filename stem as used on the wire ("arena", "compound").
 resolve() turns it into a real path, preferring the JSON .map format over the
 legacy char-grid + TOML sidecar.
 
-Spawn points come from the map file when it declares them:
+Spawn points come from the map file when it declares them — placed in the
+editor, carried on TileMap.spawn_points, each with a facing and an optional
+team tag.
 
-    .map (JSON):   "spawn_points": [[x, y], [x, y], ...]
-    .toml:         spawn_points = [[x, y], ...]      (top level or under [meta])
-
-When it doesn't — which is every map in this project today — they are derived
-geometrically by farthest-point sampling over standable ground, so any map is
-playable without being re-authored. Derived spawns are deterministic for a
-given map: same map in, same spawns out, on every machine.
+When a map declares none, they are derived geometrically by farthest-point
+sampling over standable ground, so any map is playable without being
+re-authored. Derived spawns are deterministic for a given map: same map in,
+same spawns out, on every machine. What they cannot know is anything about
+sightlines — derived spawns know the ground is standable and nothing else —
+which is the reason to author them.
 """
 from __future__ import annotations
 
-import json
 import math
-import tomllib
+import random
 from pathlib import Path
 
 import numpy as np
 
 from sim import mapfile
-from sim.tilemap import TileMap, load_map as load_grid_map
+from sim.tilemap import SpawnPoint, TileMap, load_map as load_grid_map
+from sim.tilemap import parse_spawn_points
 
 DEFAULT_MAPS_DIR = Path(__file__).resolve().parent.parent / "maps"
 
@@ -77,35 +78,10 @@ def load(map_id: str, maps_dir: str | Path = DEFAULT_MAPS_DIR) -> TileMap:
 
 # ------------------------------------------------------------------ spawns
 
-def _explicit_spawns(path: Path) -> list[tuple[float, float]]:
-    """Spawn points declared by the map file itself, or [] if it declares none.
-    Never raises on a malformed entry — it just skips it, because a typo in a
-    map should not take the server down."""
-    try:
-        if path.suffix == ".map":
-            with open(path, "r", encoding="utf-8") as f:
-                doc = json.load(f)
-        else:
-            with open(path, "rb") as f:
-                doc = tomllib.load(f)
-    except (OSError, ValueError, tomllib.TOMLDecodeError):
-        return []
-    raw = doc.get("spawn_points")
-    if raw is None and isinstance(doc.get("meta"), dict):
-        raw = doc["meta"].get("spawn_points")
-    if not isinstance(raw, list):
-        return []
-    out: list[tuple[float, float]] = []
-    for item in raw:
-        if isinstance(item, dict):
-            item = [item.get("x"), item.get("y")]
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        try:
-            out.append((float(item[0]), float(item[1])))
-        except (TypeError, ValueError):
-            continue
-    return out
+def as_spawn_list(items) -> list:
+    """Normalise whatever a caller hands us into SpawnPoints — plain (x, y)
+    tuples included, because tests and older code pin spawns that way."""
+    return parse_spawn_points(list(items or []))
 
 
 def _candidates(m: TileMap, clearance: float, step: float) -> np.ndarray:
@@ -121,7 +97,7 @@ def _candidates(m: TileMap, clearance: float, step: float) -> np.ndarray:
 def derive(m: TileMap, want: int = WANT_SPAWNS,
            clearance: float = SPAWN_CLEARANCE_M,
            min_separation: float = MIN_SEPARATION_M,
-           step: float = SAMPLE_STEP_M) -> list[tuple[float, float]]:
+           step: float = SAMPLE_STEP_M) -> list:
     """Farthest-point sampling over standable ground: repeatedly take the
     candidate furthest from everything chosen so far. That spreads spawns to
     opposite ends of the map and into separate rooms without knowing anything
@@ -130,7 +106,8 @@ def derive(m: TileMap, want: int = WANT_SPAWNS,
     if len(pts) == 0:
         # Nothing standable at spawn clearance. Fall back to the single-player
         # spawn even if it is tight; better than refusing to start a match.
-        return [tuple(float(v) for v in m.player_spawn)]
+        sx, sy = (float(v) for v in m.player_spawn)
+        return [SpawnPoint(sx, sy)]
 
     # Seed from the authored player spawn when it is usable, so map authors
     # keep some say in where a match begins.
@@ -149,32 +126,68 @@ def derive(m: TileMap, want: int = WANT_SPAWNS,
             break                      # map is too cramped for more spread
         chosen.append((float(pts[i, 0]), float(pts[i, 1])))
         d2 = np.minimum(d2, ((pts - pts[i]) ** 2).sum(1))
-    return chosen
+    return [SpawnPoint(x, y) for x, y in chosen]
 
 
 def spawn_points(map_id: str, m: TileMap | None = None,
                  maps_dir: str | Path = DEFAULT_MAPS_DIR,
-                 want: int = WANT_SPAWNS) -> list[tuple[float, float]]:
-    """Spawn points for a map: whatever the file declares, filtered to those
-    that are actually standable, topped up by derivation if there are too few.
+                 want: int = WANT_SPAWNS) -> list:
+    """Spawn points for a map: whatever the map declares, filtered to those that
+    are actually standable, topped up by derivation if there are too few.
 
     Pass `m` if you have already loaded the map, to avoid loading it twice.
     """
-    path = resolve(map_id, maps_dir)
     if m is None:
         m = load(map_id, maps_dir)
-    explicit = [p for p in _explicit_spawns(path)
-                if m.can_stand(p[0], p[1], SPAWN_CLEARANCE_M)]
-    if len(explicit) >= 2:
-        return explicit
-    derived = derive(m, want=want)
+    authored = [sp for sp in m.spawn_points
+                if m.can_stand(sp.x, sp.y, SPAWN_CLEARANCE_M)]
+    if len(authored) >= 2:
+        return authored
     # keep authored spawns first, then fill with derived ones that aren't
     # sitting on top of them
-    out = list(explicit)
-    for p in derived:
-        if all(math.hypot(p[0] - q[0], p[1] - q[1]) > 1.0 for q in out):
-            out.append(p)
+    out = list(authored)
+    for sp in derive(m, want=want):
+        if all(math.hypot(sp.x - q.x, sp.y - q.y) > 1.0 for q in out):
+            out.append(sp)
     return out
+
+
+def for_team(spawns: list, team) -> list:
+    """The spawns a player on this team may use.
+
+    A map that tags spawns for a side is making a statement about where that
+    side starts, so those are used exclusively when they exist. Untagged spawns
+    are the neutral pool; if a map tags none, everyone shares everything."""
+    tag = ""
+    name = getattr(team, "name", str(team)).lower()
+    if name in ("a", "b"):
+        tag = name
+    if tag:
+        mine = [sp for sp in spawns if sp.team == tag]
+        if mine:
+            return mine
+    neutral = [sp for sp in spawns if not sp.team]
+    return neutral or list(spawns)
+
+
+def pick(spawns: list, team=None, away_from=(), rng=None, top: int = 1):
+    """One spawn, as far from everyone in `away_from` as the map allows.
+
+    `top` widens the choice to the best N: 1 for somebody joining a match in
+    progress, where landing in a firefight is the thing to avoid, and more for
+    respawns, where always reappearing in the same corner is an invitation to
+    be camped."""
+    options = for_team(spawns, team) if team is not None else list(spawns)
+    if not options:
+        options = list(spawns)
+    live = [(float(x), float(y)) for x, y in away_from]
+    if not live:
+        return (rng or random).choice(options)
+    ranked = sorted(options,
+                    key=lambda sp: min(math.hypot(sp.x - x, sp.y - y)
+                                       for x, y in live),
+                    reverse=True)
+    return (rng or random).choice(ranked[:max(1, min(top, len(ranked)))])
 
 
 def load_with_spawns(map_id: str, maps_dir: str | Path = DEFAULT_MAPS_DIR

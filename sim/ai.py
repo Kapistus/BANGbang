@@ -242,8 +242,8 @@ class Guard(Combatant):
 
     def sees(self, blocks_sight, player) -> int:
         """0 nothing, 1 identified (in the narrow cone), 3 peripheral only."""
-        if not player.alive or getattr(player, "concealed", False):
-            return 0                              # e.g. holding still in a bush
+        if not player.alive:
+            return 0
         dx, dy = player.x - self.x, player.y - self.y
         dist = math.hypot(dx, dy)
         if dist > VIEW_RANGE_M:

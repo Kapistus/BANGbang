@@ -9,7 +9,8 @@
 # `footstep_mult` / `sound_cost` on a tile are still read for a Floor cell so
 # a grating floor can be loud.
 #
-# The exceptions are the three SPECIAL tiles below - door, window, bush - which
+# The exceptions are the SPECIAL tiles below - the two doors and the window -
+# which
 # keep fixed behaviour and ignore the Floor/Wall toggle (they always place on
 # the object layer).
 #
@@ -42,32 +43,38 @@ sound_cost = 6.0
 pen_cost = 0.3
 colour = [176, 198, 206]
 
+# Doors split down the middle and retract into the jambs, into whatever is
+# solid beside them. The two kinds differ in one number: how long that takes.
+# Neither is passable, transparent or quiet until the panels are fully home.
 [tiles.door]
 png = "door.png"
 layer = "object"
-name = "Door"
+name = "Door (0.35s)"
 is_see_through = false
 is_walkable = false
 blocks_los = true
 blocks_shots = true
 door = true
+door_time = 0.35
 sound_cost = 10.0
 pen_cost = 1.8
-colour = [150, 118, 78]
+colour = [134, 142, 150]
 
-[tiles.bush]
-png = "bush.png"
+# Thick enough to be worth shooting the wall instead, slow enough that opening
+# one in the open is a decision somebody can punish.
+[tiles.blast_door]
+png = "blast_door.png"
 layer = "object"
-name = "Bush (concealment)"
+name = "Blast door (5s)"
 is_see_through = false
-is_walkable = true
+is_walkable = false
 blocks_los = true
-blocks_shots = false
-footstep_mult = 1.1
-sound_cost = 1.0
-pen_cost = 0.0
-overlay = true          # canopy draws over characters; texture gaps let them peek
-colour = [86, 120, 66]
+blocks_shots = true
+door = true
+door_time = 5.0
+sound_cost = 34.0
+pen_cost = 3.2
+colour = [96, 104, 114]
 
 # === auto-generated tiles below (tools/sync_tileset.py) — edits here are overwritten ===
 

@@ -20,22 +20,43 @@ Mouse
     middle / space+drag   pan
     wheel          zoom (over the grid) / scroll the palette (over the panel)
 
-Keys
-    s  save        S  save as        l  load        n  new map
-    g  grid on/off      p  paint mode      f  roof preview on/off
-    w  toggle placing tiles as Floor / Wall (walls are solid + drawn darker)
-    Tab / Shift+Tab  next / prev tileset page in the palette
-    o  set player spawn (then click a cell)
-    k  add guard: click waypoints, Enter to finish, Backspace undo point
-    L  light mode: click to place a lamp; wheel = intensity, shift+wheel = radius
-       (or r / i keys, +shift to lower); RMB/Del remove
-    e  entity mode: click to place an npc/trader/quest_item ([ ] cycles kind);
-       prompts a name, then dialog lines (npc) or items (trader/quest_item);
-       RMB/Del remove
-    [ ]  cycle the guard's weapon - the route under the cursor, or the
-         default for the next route (combat rifle by default)
-    c  clear all guards        del  erase hovered object
-    arrows  pan        esc  quit
+Keys — every one is a single unshifted press on the number row or the top
+letter row, so none of them need AltGr on any layout.
+
+    Modes (top letter row)
+    q  paint       e  entity      r  light       t  guard
+    y  player spawn              u  multiplayer spawn
+
+    View and placement
+    w  place tiles as Floor / Wall (walls are solid + drawn darker)
+    i  grid on/off               o  auto-roof preview on/off
+    p  next tileset page in the palette (shift = previous; Tab also works)
+
+    Adjust what is under the cursor (number row)
+    1 2  mpspawn: tag team A / B / anyone     light: radius (shift = coarse)
+         entity: cycle kind                   otherwise: the guard's weapon
+    3 4  mpspawn: turn the start point        light: intensity (shift = coarse)
+                                              otherwise: the guard's weapon
+    5 6  cycle the guard's skill
+
+    File and bulk
+    8  save (shift = save as)    9  load       0  new map       7  clear guards
+
+    Unchanged: Enter finishes a guard route, Backspace undoes a waypoint,
+    Del erases what is hovered, arrows and space+drag pan, Esc quits.
+
+Mode notes
+    t  guard: click waypoints, Enter to finish, Backspace undoes a point;
+       pressing t again finishes the current route and starts the next
+    r  light: click to place a lamp; wheel = intensity, shift+wheel = radius
+    u  multiplayer spawn: click to place a start point, wheel or 3/4 to turn
+       it, 1/2 to tag it for team A / B / anyone; RMB/Del removes. A map with
+       none gets spawns derived from its geometry, which knows the ground is
+       standable and nothing about sightlines - place them if the map matters.
+    e  entity: 1/2 cycles npc / trader / quest_item / health / ammo. The first
+       three prompt for a name, then dialog lines (npc) or items (trader,
+       quest_item); a health or ammo pack is placed straight away, since there
+       is nothing to author on one. RMB/Del removes.
 """
 
 from __future__ import annotations
@@ -49,6 +70,9 @@ import pygame
 
 from sim import mapfile, sprites, weapons
 from sim.tilemap import FLOOR_DARKEN, WALL_LIGHTEN, enclosed_mask
+from sim.doors import axis_from_solid
+from sim import pickups
+from sim.pickups import KINDS as PICKUP_KINDS
 from sim.tileset import load_tileset
 
 ROOT = Path(__file__).resolve().parent
@@ -56,6 +80,10 @@ MAPS_DIR = ROOT / "maps"
 GUARD_WEAPONS = ["combat_rifle", "smg", "combat_shotgun", "pistol",
                  "rail_rifle", "laser_rifle", "rocket_launcher"]
 GUARD_SKILLS = ["veteran", "seasoned", "rookie"]
+SPAWN_TEAMS = ["", "a", "b"]           # anyone, team A, team B
+DEFAULT_LIGHT_R = 6.0                  # for lights authored before these keys
+DEFAULT_LIGHT_I = 1.0                  # existed
+TEAM_C = {"": (90, 200, 120), "a": (80, 140, 230), "b": (230, 110, 80)}
 PANEL_W = 240
 STATUS_H = 26
 TILE_ICON = 96          # palette preview size (was 24)
@@ -70,9 +98,10 @@ GUARD_C = (216, 90, 48)
 LIGHT_C = (240, 210, 120)
 DEF_LIGHT_RADIUS = 5.0
 DEF_LIGHT_INTENSITY = 1.0
-ENT_KINDS = ["npc", "trader", "quest_item"]
+ENT_KINDS = ["npc", "trader", "quest_item", "health", "ammo"]
 ENT_COLOUR = {"npc": (90, 205, 195), "trader": (225, 185, 60),
-             "quest_item": (175, 115, 225)}
+             "quest_item": (175, 115, 225),
+             "health": (225, 70, 80), "ammo": (235, 190, 60)}
 
 MIN_ZOOM, MAX_ZOOM = 8, 48
 DEF_ZOOM = 18             # px per cell (a cell is mapfile cell_m metres)
@@ -147,6 +176,7 @@ class Editor:
         self.bank.load()
         self.zoom = DEF_ZOOM
         self.disp = {}
+        self._door_turned = {}
         self._rescale()
 
         self.path = None
@@ -165,7 +195,9 @@ class Editor:
         self.place_role = "floor"           # floor | wall  (w toggles; specials ignore)
         self.groups = self._tile_groups()   # palette pages: "base" + each group
         self.tile_group = self.groups[0]
-        self.mode = "paint"                 # paint | spawn | guard
+        self.mode = "paint"        # paint | spawn | mpspawn | guard | light | entity
+        self.spawn_facing = 0.0             # degrees, for the next MP spawn
+        self.spawn_team = ""                # "", "a" or "b"
         self.guard_wip = []
         self.guard_weapon = "combat_rifle"  # gun for the next route ([ ] / , . cycle)
         self.guard_skill = "veteran"        # aim tier for the next route (t cycles)
@@ -225,8 +257,7 @@ class Editor:
             row = obj[r]
             for c in range(self.cols):
                 o = row[c]
-                # any object cell seals a room except a bush (walkable foliage)
-                if o and o in ts and not ts[o].bush:
+                if o and o in ts:
                     enc[r, c] = True
         return enclosed_mask(enc)
 
@@ -238,6 +269,7 @@ class Editor:
         z = self.zoom
         self.disp = {k: pygame.transform.smoothscale(v, (z, z))
                      for k, v in self.native.items()}
+        self._door_turned = {}          # rebuilt with disp, at the new zoom
         # role-tinted copies (mirror sim/tilemap): floor darker, wall lighter
         dk = int(round(255 * FLOOR_DARKEN))
         lt = int(round(255 * WALL_LIGHTEN))
@@ -258,6 +290,34 @@ class Editor:
         r = int((my - self.cam_y) / self.zoom)
         return c, r
 
+    def _solid_at(self, r: int, c: int) -> bool:
+        """Is this cell something a door panel could retract into? Off the map
+        counts, so a door on the edge still has a jamb. Doors do not: two doors
+        side by side would each claim the other as a wall."""
+        if not (0 <= r < self.rows and 0 <= c < self.cols):
+            return True
+        oid = self.doc["object"][r][c]
+        if not oid or oid not in self.ts:
+            return False
+        td = self.ts[oid]
+        if td.door:
+            return False
+        return (not td.is_walkable) or not self._is_special(td)
+
+    def _door_icon(self, oid: str, r: int, c: int):
+        """The door sprite, turned to match the wall run it sits in. Same rule
+        the game uses (sim.doors.axis_from_solid), so what you see placing it
+        is what it does."""
+        base = self.disp[oid]
+        if axis_from_solid(self._solid_at, r, c) == "h":
+            return base
+        key = (oid, base.get_width())
+        turned = self._door_turned.get(key)
+        if turned is None:
+            turned = pygame.transform.rotate(base, 90)
+            self._door_turned[key] = turned
+        return turned
+
     def cell_rect(self, c, r):
         return pygame.Rect(self.cam_x + c * self.zoom,
                            self.cam_y + r * self.zoom, self.zoom, self.zoom)
@@ -275,6 +335,13 @@ class Editor:
             self.doc["player_spawn"] = [c + 0.5, r + 0.5]
             self.dirty = True
             return
+        if self.mode == "mpspawn":
+            pts = self.doc.setdefault("spawn_points", [])
+            pts.append({"pos": [c + 0.5, r + 0.5],
+                        "facing_deg": round(self.spawn_facing, 1),
+                        "team": self.spawn_team})
+            self.dirty = True
+            return
         if self.mode == "guard":
             self.guard_wip.append([c + 0.5, r + 0.5])
             return
@@ -285,6 +352,16 @@ class Editor:
             self.dirty = True
             return
         if self.mode == "entity":
+            ents = self.doc.setdefault("interactables", [])
+            if self.ent_kind in PICKUP_KINDS:
+                # a pack has nothing to author: it is the same pack everywhere,
+                # and what it gives is in sim/pickups.py
+                ents.append({"id": f"e{len(ents)}", "kind": self.ent_kind,
+                             "pos": [c + 0.5, r + 0.5],
+                             "name": self.ent_kind, "dialog": [], "items": []})
+                self.dirty = True
+                self._flash(f"placed a {self.ent_kind} pack")
+                return
             name = text_prompt(self.screen, self.font,
                                f"{self.ent_kind} name:", "???")
             if name is None:
@@ -294,7 +371,6 @@ class Editor:
                 dialog = self._prompt_lines("dialog line")
             else:
                 items = self._prompt_items()
-            ents = self.doc.setdefault("interactables", [])
             ents.append({"id": f"e{len(ents)}", "kind": self.ent_kind,
                         "pos": [c + 0.5, r + 0.5], "name": name,
                         "dialog": dialog, "items": items})
@@ -306,7 +382,7 @@ class Editor:
                 self.dirty = True
             return
         td = self.ts[self.sel]
-        # door / window / bush always land on the object layer; every other
+        # door / window always land on the object layer; every other
         # tile follows the Floor / Wall toggle
         as_wall = self._is_special(td) or self.place_role == "wall"
         grid = self.doc["object"] if as_wall else self.doc["floor"]
@@ -316,7 +392,7 @@ class Editor:
 
     @staticmethod
     def _is_special(td):
-        return bool(td.door or td.glass or td.bush)
+        return bool(td.door or td.glass)
 
     def commit_guard(self):
         if len(self.guard_wip) >= 1:
@@ -354,6 +430,43 @@ class Editor:
                 best, bd = lt, d
         return best
 
+    def mpspawn_near(self, mx, my):
+        c, r = self.cell_at(mx, my)
+        cx, cy = c + 0.5, r + 0.5
+        best, bd = None, 1.2
+        for sp in self.doc.get("spawn_points", []):
+            d = math.hypot(sp["pos"][0] - cx, sp["pos"][1] - cy)
+            if d < bd:
+                best, bd = sp, d
+        return best
+
+    def delete_mpspawn_near(self, mx, my):
+        sp = self.mpspawn_near(mx, my)
+        if sp is not None:
+            self.doc["spawn_points"].remove(sp)
+            self.dirty = True
+            return True
+        return False
+
+    def turn_mpspawn(self, mx, my, deg):
+        """Wheel turns the spawn under the cursor, else the next one placed."""
+        sp = self.mpspawn_near(mx, my)
+        if sp is not None:
+            sp["facing_deg"] = round((sp.get("facing_deg", 0.0) + deg) % 360, 1)
+            self.dirty = True
+        else:
+            self.spawn_facing = (self.spawn_facing + deg) % 360
+
+    def cycle_mpspawn_team(self, mx, my, step):
+        sp = self.mpspawn_near(mx, my)
+        if sp is not None:
+            i = SPAWN_TEAMS.index(sp.get("team", "") or "")
+            sp["team"] = SPAWN_TEAMS[(i + step) % len(SPAWN_TEAMS)]
+            self.dirty = True
+        else:
+            i = SPAWN_TEAMS.index(self.spawn_team)
+            self.spawn_team = SPAWN_TEAMS[(i + step) % len(SPAWN_TEAMS)]
+
     def delete_light_near(self, mx, my):
         lt = self.light_near(mx, my)
         if lt is not None:
@@ -367,8 +480,10 @@ class Editor:
         cursor, else the next-placed default."""
         lt = self.light_near(mx, my)
         if lt is not None:
-            lt["radius"] = round(min(40.0, max(1.0, lt["radius"] + dr)), 1)
-            lt["intensity"] = round(min(20.0, max(0.1, lt["intensity"] + di)), 2)
+            lt["radius"] = round(min(40.0, max(
+                1.0, lt.get("radius", DEFAULT_LIGHT_R) + dr)), 1)
+            lt["intensity"] = round(min(20.0, max(
+                0.1, lt.get("intensity", DEFAULT_LIGHT_I) + di)), 2)
             self.dirty = True
             self._flash(f"light  r{lt['radius']}  i{lt['intensity']}")
         else:
@@ -450,7 +565,7 @@ class Editor:
         else:
             i = GUARD_WEAPONS.index(self.guard_weapon)
             self.guard_weapon = GUARD_WEAPONS[(i + step) % len(GUARD_WEAPONS)]
-            hint = "" if self.mode == "guard" else "   (k = guard mode)"
+            hint = "" if self.mode == "guard" else "   (t = guard mode)"
             self._flash(f"next route weapon -> {self.guard_weapon}{hint}")
 
     def cycle_guard_skill(self, mx, my, step):
@@ -465,7 +580,7 @@ class Editor:
         else:
             i = GUARD_SKILLS.index(self.guard_skill)
             self.guard_skill = GUARD_SKILLS[(i + step) % len(GUARD_SKILLS)]
-            hint = "" if self.mode == "guard" else "   (k = guard mode)"
+            hint = "" if self.mode == "guard" else "   (t = guard mode)"
             self._flash(f"next route skill -> {self.guard_skill}{hint}")
 
     def do_new(self):
@@ -544,6 +659,9 @@ class Editor:
 
         row("[ set player spawn ]  o", "mode", "spawn", active=self.mode == "spawn")
         row("[ guard route ]  k", "mode", "guard", active=self.mode == "guard")
+        row(f"[ mp spawn ]  m   {self.spawn_team.upper() or 'ANY'} "
+            f"{self.spawn_facing:.0f}\u00b0", "mode", "mpspawn",
+            active=self.mode == "mpspawn")
         row("[ light ]  L", "mode", "light", active=self.mode == "light")
         row("[ entity ]  e", "mode", "entity", active=self.mode == "entity")
         row("[ paint / erase ]  p", "mode", "erase", active=self.mode == "paint")
@@ -620,8 +738,12 @@ class Editor:
                     otd = self.ts[obj] if obj in self.ts else None
                     if otd is not None and otd.overlay:
                         canopy.append((obj, rect))
+                    elif otd is not None and otd.door:
+                        # a door is drawn the way it will open, so placing one
+                        # shows you which jambs the panels go into
+                        self.screen.blit(self._door_icon(obj, r, c), rect)
                     elif otd is not None and self._is_special(otd):
-                        self.screen.blit(self.disp[obj], rect)      # door/window
+                        self.screen.blit(self.disp[obj], rect)      # window
                     else:
                         self.screen.blit(self.disp_wall[obj], rect)  # wall = lighter
         if self.show_grid and self.zoom >= 10:
@@ -678,6 +800,20 @@ class Editor:
             pygame.draw.circle(self.screen, SPAWN_C, (sx, sy), 6)
         self._draw_body(sx, sy, SPAWN_C)
         pygame.draw.circle(self.screen, SPAWN_C, (sx, sy), 3)
+        for sp in self.doc.get("spawn_points", []):
+            px, py = self._wpt(sp["pos"])
+            col = TEAM_C.get(sp.get("team", "") or "", TEAM_C[""])
+            face = math.radians(sp.get("facing_deg", 0.0))
+            self._draw_body(px, py, col)
+            pygame.draw.circle(self.screen, col, (px, py), 3)
+            reach = max(10, int(1.1 / self._cell_m() * self.zoom))
+            pygame.draw.line(self.screen, col, (px, py),
+                             (px + math.cos(face) * reach,
+                              py + math.sin(face) * reach), 2)
+            tag = sp.get("team", "") or ""
+            if tag:
+                self.screen.blit(self.small.render(tag.upper(), True, col),
+                                 (px + 6, py - 16))
         for g in self.doc["guards"]:
             route = g["patrol"]
             pts = [self._wpt(p) for p in route]
@@ -707,10 +843,14 @@ class Editor:
 
         for lt in self.doc.get("lights", []):
             lx, ly = self._wpt(lt["pos"])
-            rr = int(lt["radius"] / self._cell_m() * self.zoom)
+            # maps.demo has a light with no intensity, authored before the key
+            # existed. Defaults here rather than a KeyError that takes the
+            # whole editor down on the frame the map opens.
+            rr = int(lt.get("radius", DEFAULT_LIGHT_R) / self._cell_m() * self.zoom)
             if rr > 2:
                 halo = pygame.Surface((rr * 2, rr * 2), pygame.SRCALPHA)
-                a = int(24 + 46 * min(1.0, lt["intensity"]))
+                a = int(24 + 46 * min(1.0, lt.get("intensity",
+                                                  DEFAULT_LIGHT_I)))
                 pygame.draw.circle(halo, (*LIGHT_C, a), (rr, rr), rr)
                 self.screen.blit(halo, (lx - rr, ly - rr))
                 pygame.draw.circle(self.screen, LIGHT_C, (lx, ly), rr, 1)
@@ -719,7 +859,18 @@ class Editor:
 
         for e in self.doc.get("interactables", []):
             ex, ey = self._wpt(e["pos"])
-            col = ENT_COLOUR.get(e.get("kind", "npc"), (200, 200, 200))
+            kind = e.get("kind", "npc")
+            col = ENT_COLOUR.get(kind, (200, 200, 200))
+            if kind in PICKUP_KINDS:
+                # drawn through the same function the game draws it with, and
+                # ringed at the radius a player has to reach to take it
+                sprites.draw_pickup(self.screen, ex, ey, kind,
+                                    self.zoom / self._cell_m())
+                pygame.draw.circle(
+                    self.screen, tuple(c // 2 for c in col), (ex, ey),
+                    max(6, int(pickups.TAKE_RADIUS_M / self._cell_m()
+                               * self.zoom)), 1)
+                continue
             pygame.draw.circle(self.screen, col, (ex, ey), 7)
             pygame.draw.circle(self.screen, (20, 20, 20), (ex, ey), 7, 1)
             n_items = len(e.get("items", []))
@@ -737,20 +888,29 @@ class Editor:
         cur = {"paint": f"tile:{self.sel} [{self.tile_group}] as {self.place_role.upper()}",
                "spawn": "SET SPAWN (click a cell)",
                "guard": (f"GUARD  next [{self.guard_weapon} / {self.guard_skill}]  "
-                         f"LMB=waypoint  Enter=save  [ ],. =weapon  t=skill  "
+                         f"LMB=waypoint  Enter=save  1/2 3/4=weapon  5/6=skill  "
                          f"(hover a waypoint to retag)  RMB/Del=delete  "
                          f"wpts:{len(self.guard_wip)}"),
                "light": (f"LIGHT  next r{self.light_radius} i{self.light_intensity}  "
                          f"LMB=place  wheel=intensity  shift+wheel=radius  "
-                         f"(r/i keys, +shift to lower)  RMB/Del=remove  "
+                         f"1/2=radius  3/4=intensity (+shift coarse)  "
+                         f"RMB/Del=remove  "
                          f"({len(self.doc.get('lights', []))} placed)"),
-               "entity": (f"ENTITY  next [{self.ent_kind}] (: [ ] cycle)  "
+               "entity": (f"ENTITY  next [{self.ent_kind}] (1/2 cycles)  "
                          f"LMB=place (prompts name + dialog/items)  RMB/Del=remove  "
                          f"({len(self.doc.get('interactables', []))} placed)"),
-               }[self.mode]
+               "mpspawn": (f"MP SPAWN  next [{self.spawn_team.upper() or 'ANY'} "
+                           f"{self.spawn_facing:.0f}\u00b0]  LMB=place  "
+                           f"wheel/3 4=turn  1/2=team A/B/any  RMB/Del=remove  "
+                           f"({len(self.doc.get('spawn_points', []))} placed)"),
+               # .get, not [], so a mode added later shows a plain label
+               # instead of taking the editor down on the next frame
+               }.get(self.mode, self.mode.upper())
         msg = (f"cell {cell:>7}   {cur}   |   {name}  {self.cols}x{self.rows} "
-               f"z{self.zoom}   s save  l load  n new  o spawn  k guard  g grid"
-               f"  f roof{'' if self.show_roof else ':off'}")
+               f"z{self.zoom}   q paint  e entity  r light  t guard  y spawn"
+               f"  u mp-spawn  |  8 save  9 load  0 new"
+               f"  i grid{'' if self.show_grid else ':off'}"
+               f"  o roof{'' if self.show_roof else ':off'}")
         self.screen.blit(self.font.render(msg, True, DIM), (8, h - STATUS_H + 6))
         if self.toast and pygame.time.get_ticks() - self.toast_t < 2000:
             t = self.small.render(self.toast, True, SEL)
@@ -802,6 +962,21 @@ class Editor:
             self.clock.tick(60)
         pygame.quit()
 
+    # Every hotkey is on the number row or the top letter row. Both are
+    # single unshifted keys on any layout — the old map reached for [ ] and
+    # , . which are AltGr combinations on a Finnish keyboard, so half the
+    # editor needed two hands to drive.
+    MODE_KEYS = {
+        pygame.K_q: "paint",
+        pygame.K_r: "light",
+        pygame.K_t: "guard",
+        pygame.K_y: "spawn",
+        pygame.K_u: "mpspawn",
+        pygame.K_e: "entity",
+    }
+    CYCLE_A = {pygame.K_1: -1, pygame.K_2: 1}      # team / radius / kind / weapon
+    CYCLE_B = {pygame.K_3: -1, pygame.K_4: 1}      # facing / intensity / weapon
+
     def on_key(self, ev):
         k = ev.key
         shift = ev.mod & pygame.KMOD_SHIFT
@@ -810,70 +985,57 @@ class Editor:
                 self.guard_wip = []
                 return True
             return False
-        if k == pygame.K_s:
-            self.do_save(as_new=bool(shift))
-        elif k == pygame.K_l:
-            if shift:
-                if self.mode == "guard":
-                    self.commit_guard()
-                self.mode = "light"
-            else:
-                self.do_load()
-        elif k == pygame.K_n:
-            self.do_new()
-        elif k == pygame.K_g:
-            self.show_grid = not self.show_grid
-        elif k == pygame.K_TAB:
-            self.cycle_group(-1 if shift else 1)
+
+        if k in self.MODE_KEYS:
+            want = self.MODE_KEYS[k]
+            if self.mode == "guard":
+                self.commit_guard()      # never lose a route in progress
+            if want == "guard":
+                self.guard_wip = []      # t again = finish this, start the next
+            self.mode = want
         elif k == pygame.K_w:
             self.place_role = "wall" if self.place_role == "floor" else "floor"
             self._flash(f"placing as {self.place_role}")
-        elif k == pygame.K_f:
+        elif k == pygame.K_i:
+            self.show_grid = not self.show_grid
+        elif k == pygame.K_o:
             self.show_roof = not self.show_roof
             self._flash(f"auto-roof preview {'on' if self.show_roof else 'off'}")
-        elif k == pygame.K_p:
-            if self.mode == "guard":
-                self.commit_guard()          # don't lose a route in progress
-            self.mode = "paint"
-        elif k == pygame.K_o:
-            if self.mode == "guard":
-                self.commit_guard()
-            self.mode = "spawn"
-        elif k == pygame.K_k:
-            if self.mode == "guard":
-                self.commit_guard()          # k again = finish this, start next
-            self.mode, self.guard_wip = "guard", []
-        elif k == pygame.K_e:
-            if self.mode == "guard":
-                self.commit_guard()
-            self.mode = "entity"
-        elif k == pygame.K_c and self.mode != "guard":
+        elif k in (pygame.K_p, pygame.K_TAB):
+            self.cycle_group(-1 if shift else 1)
+        elif k == pygame.K_8:
+            self.do_save(as_new=bool(shift))
+        elif k == pygame.K_9:
+            self.do_load()
+        elif k == pygame.K_0:
+            self.do_new()
+        elif k == pygame.K_7 and self.mode != "guard":
             self.doc["guards"] = []
             self.dirty = True
-        elif k == pygame.K_r and self.mode == "light":
+            self._flash("cleared every guard route")
+        elif k in (pygame.K_5, pygame.K_6):
             mx, my = pygame.mouse.get_pos()
-            self.tune_light(mx, my, dr=-1.0 if shift else 1.0)
-        elif k == pygame.K_i and self.mode == "light":
+            self.cycle_guard_skill(mx, my, -1 if k == pygame.K_5 else 1)
+        elif k in self.CYCLE_A or k in self.CYCLE_B:
             mx, my = pygame.mouse.get_pos()
-            self.tune_light(mx, my, di=-0.25 if shift else 0.25)
-        elif k in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
-                   pygame.K_COMMA, pygame.K_PERIOD):
-            mx, my = pygame.mouse.get_pos()
-            if self.mode == "light":
+            a = self.CYCLE_A.get(k)
+            b = self.CYCLE_B.get(k)
+            if self.mode == "mpspawn":
+                if a is not None:
+                    self.cycle_mpspawn_team(mx, my, a)
+                else:
+                    self.turn_mpspawn(mx, my, b * 15.0)
+            elif self.mode == "light":
+                # shift takes the coarse step, which is what r and i used to be
                 self.tune_light(
                     mx, my,
-                    dr={pygame.K_LEFTBRACKET: -0.5, pygame.K_RIGHTBRACKET: 0.5}
-                    .get(k, 0.0),
-                    di={pygame.K_COMMA: -0.1, pygame.K_PERIOD: 0.1}.get(k, 0.0))
+                    dr=0.0 if a is None else a * (1.0 if shift else 0.5),
+                    di=0.0 if b is None else b * (0.25 if shift else 0.1))
             elif self.mode == "entity":
-                if k in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET):
-                    self.cycle_ent_kind(-1 if k == pygame.K_LEFTBRACKET else 1)
+                if a is not None:
+                    self.cycle_ent_kind(a)
             else:
-                back = k in (pygame.K_LEFTBRACKET, pygame.K_COMMA)
-                self.cycle_guard_weapon(mx, my, -1 if back else 1)
-        elif k == pygame.K_t:
-            mx, my = pygame.mouse.get_pos()
-            self.cycle_guard_skill(mx, my, -1 if shift else 1)
+                self.cycle_guard_weapon(mx, my, a if a is not None else b)
         elif k in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.mode == "guard":
             self.commit_guard()
         elif k == pygame.K_BACKSPACE and self.mode == "guard" and self.guard_wip:
@@ -881,32 +1043,10 @@ class Editor:
         elif k in (pygame.K_DELETE, pygame.K_BACKSPACE):
             mx, my = pygame.mouse.get_pos()
             if not (self.delete_guard_near(mx, my) or self.delete_light_near(mx, my)
-                   or self.delete_entity_near(mx, my)):
+                   or self.delete_entity_near(mx, my)
+                   or self.delete_mpspawn_near(mx, my)):
                 self.apply(mx, my, erase=True)
         return True
-
-    def on_mousedown(self, ev):
-        mx, my = ev.pos
-        if mx < PANEL_W:
-            if ev.button == 1:
-                self.panel_click(mx, my)
-            return
-        if ev.button == 1:
-            self.painting = True
-            self.apply(mx, my)
-        elif ev.button == 3:
-            if self.mode == "guard":
-                self.delete_guard_near(mx, my)   # RMB a route to remove it
-            elif self.mode == "light":
-                self.delete_light_near(mx, my)
-            elif self.mode == "entity":
-                self.delete_entity_near(mx, my)
-            else:
-                self.erasing = True
-                self.apply(mx, my, erase=True)
-        elif ev.button == 2:
-            self.panning = True
-            self.pan_from = ev.pos
 
     def on_motion(self, ev):
         mx, my = ev.pos
@@ -924,6 +1064,9 @@ class Editor:
         mx, my = pygame.mouse.get_pos()
         if mx < PANEL_W:
             self.panel_scroll = max(0, self.panel_scroll - ev.y * 40)
+            return
+        if self.mode == "mpspawn":
+            self.turn_mpspawn(mx, my, ev.y * 15.0)
             return
         if self.mode == "light":
             keys = pygame.key.get_pressed()

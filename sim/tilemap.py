@@ -31,10 +31,71 @@ class Tile:
     footstep_mult: float = 1.0
     pen_cost: float = 0.0       # penetration budget a bullet spends to pierce it
     door: bool = False
+    door_time: float = 0.35     # seconds the panels take to travel. A powered
+                                # door is quick; a blast door is not, and the
+                                # wait is the reason to place one
     glass: bool = False         # a bullet passes through but shatters the pane
-    bush: bool = False          # walkable concealment: hides a still occupant, blocks sight past
     encloses: bool = False      # full-height barrier: seals a room for auto-roofing
     colour: tuple[int, int, int] = (200, 200, 200)
+
+
+@dataclass
+class SpawnPoint:
+    """Somewhere a multiplayer match can put a player.
+
+    Authored in the map rather than derived from its geometry, because where a
+    fight starts is a design decision: a derived spawn knows the ground is
+    standable and nothing else, so it will happily drop you in the open at the
+    end of a long clean sightline.
+
+    `team` is "" for any player, or "a"/"b" to reserve it for one side in team
+    modes. `facing_deg` is which way you are looking when you arrive, so a spawn
+    in a corner does not start you staring at the wall."""
+    x: float
+    y: float
+    facing_deg: float = 0.0
+    team: str = ""
+
+    @property
+    def pos(self) -> tuple:
+        return (self.x, self.y)
+
+    def __iter__(self):
+        """A spawn point unpacks as the point it is: `x, y = spawn` still
+        works, so code that predates the facing and team fields — and anything
+        that just wants a position — does not have to care."""
+        yield self.x
+        yield self.y
+
+
+def parse_spawn_points(raw) -> list:
+    """Read a spawn list, tolerating every shape a map might use: the full
+    object form, a bare [x, y] pair, or {x, y}. A malformed entry is skipped
+    rather than taken as an error — a typo in one spawn should not stop a map
+    loading."""
+    out: list[SpawnPoint] = []
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for item in raw:
+        try:
+            if isinstance(item, SpawnPoint):
+                out.append(item)
+                continue
+            if isinstance(item, dict):
+                pos = item.get("pos")
+                if pos is None:
+                    pos = (item.get("x"), item.get("y"))
+                sp = SpawnPoint(float(pos[0]), float(pos[1]),
+                                float(item.get("facing_deg", 0.0)),
+                                str(item.get("team", "") or "").lower())
+            else:
+                sp = SpawnPoint(float(item[0]), float(item[1]))
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if sp.team not in ("", "a", "b"):
+            sp.team = ""
+        out.append(sp)
+    return out
 
 
 @dataclass
@@ -127,9 +188,11 @@ class TileMap:
     footstep_mult: np.ndarray   # f32   (fine)
     pen_cost: np.ndarray        # f32   (fine)  bullet penetration cost
     glass: np.ndarray           # bool  (fine)  shatters when shot through
-    bush: np.ndarray            # bool  (fine)  walkable concealment foliage
 
     player_spawn: tuple[float, float] = (1.5, 1.5)
+    # multiplayer starts. Empty means the map declares none, and the server
+    # derives them from the geometry instead (see net/maps.py).
+    spawn_points: list = field(default_factory=list)
     guards: list[GuardSpec] = field(default_factory=list)
     idle_spots: list[IdleSpot] = field(default_factory=list)
     lights: list[Light] = field(default_factory=list)
@@ -306,13 +369,23 @@ def validate_patrols(m: "TileMap", radius: float = 0.30,
 
 
 def validate_spawns(m: "TileMap", radius: float = 0.30) -> list[str]:
-    """Check the player spawn and every idle spot are standable."""
+    """Check the player spawn, every idle spot and every multiplayer spawn are
+    standable."""
     problems: list[str] = []
     if not m.can_stand(*m.player_spawn, radius):
         problems.append(f"player_spawn {m.player_spawn} is inside geometry")
     for i, s in enumerate(m.idle_spots):
         if not m.can_stand(*s.pos, radius):
             problems.append(f"idle_spot {i} ({s.tag}) at {s.pos} is inside geometry")
+    for i, sp in enumerate(m.spawn_points):
+        if not m.can_stand(sp.x, sp.y, radius):
+            problems.append(f"spawn_point {i} at ({sp.x:.1f}, {sp.y:.1f}) "
+                            f"is inside geometry")
+    teams = {sp.team for sp in m.spawn_points if sp.team}
+    if teams and teams != {"a", "b"}:
+        problems.append(f"spawn_points name team(s) {sorted(teams)} but not "
+                        f"both sides: team matches would start one side on "
+                        f"whatever is left over")
     return problems
 
 
@@ -521,8 +594,8 @@ def load_tiles(path: Path) -> tuple[dict[str, Tile], int, float]:
             footstep_mult=float(spec.get("footstep_mult", 1.0)),
             pen_cost=float(spec.get("pen_cost", 0.0)),
             door=bool(spec.get("door", False)),
+            door_time=float(spec.get("door_time", 0.35)),
             glass=bool(spec.get("glass", False)),
-            bush=bool(spec.get("bush", False)),
             encloses=bool(spec.get(
                 "encloses",
                 bool(spec.get("blocks_move", False))
@@ -573,7 +646,6 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
     fm = np.ones((rows, cols), dtype=np.float32)
     pc = np.zeros((rows, cols), dtype=np.float32)
     gl = np.zeros((rows, cols), dtype=bool)
-    bu = np.zeros((rows, cols), dtype=bool)
     en = np.zeros((rows, cols), dtype=bool)
     dcz = np.zeros((rows, cols), dtype=bool)
 
@@ -588,7 +660,6 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
         fm[m] = t.footstep_mult
         pc[m] = t.pen_cost
         gl[m] = t.glass
-        bu[m] = t.bush
         en[m] = t.encloses and not t.door
         dcz[m] = t.door
 
@@ -605,8 +676,8 @@ def load_map(sidecar: str | Path, tiles_path: str | Path | None = None) -> TileM
         footstep_mult=_expand(fm, subdiv),
         pen_cost=_expand(pc, subdiv),
         glass=_expand(gl, subdiv),
-        bush=_expand(bu, subdiv),
         player_spawn=tuple(meta.get("player_spawn", (1.5, 1.5))),
+        spawn_points=parse_spawn_points(meta.get("spawn_points")),
         guards=[
             GuardSpec(
                 id=g.get("id", f"g{i}"),

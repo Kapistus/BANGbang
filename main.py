@@ -76,10 +76,13 @@ from pathlib import Path
 import numpy as np
 import pygame
 
-from sim import (ai, audio, ballistics, combat, mapfile, movement,
+from sim import (ai, audio, ballistics, combat, lighting, mapfile, movement,
                  perception, sound, sprites, weapons)
+from sim.doors import DoorSet
+from sim.pickups import PickupSet
+from sim import pickups as pk
 from sim.tilemap import (FLOOR_DARKEN, WALL_LIGHTEN, Item, TileMap,
-                         break_glass_cells, find_doors, set_door,
+                         break_glass_cells, set_door,
                          compute_roof, load_map, validate_patrols,
                          validate_spawns)
 
@@ -288,8 +291,8 @@ CONE_REVEAL = 0.35    # how far the vision cone lifts the veil (1 = clears it to
 FLASHLIGHT_GAIN = 135    # additive brightness at the beam core (player `l` toggle)
 FLASHLIGHT_HALF_DEG = 16.0  # beam half-angle (identify band is ~22deg)
 FLASHLIGHT_BLUR = 1     # tiny - just anti-alias the side edge, keep it sharp
-LIGHT_SEE_MIN = 0.20    # illumination below this reveals nothing (dark = blind)
-LIGHT_SEE_FULL = 0.50   # illumination at/above this gives full perception
+LIGHT_SEE_MIN = lighting.SEE_MIN   # below this, darkness reveals nothing
+LIGHT_SEE_FULL = lighting.SEE_FULL  # at/above this, full perception
 FLASHLIGHT_SELF = 0.55  # how much the flashlight lights the player holding it
 FLASHLIGHT_SELF_SEEN = 0.40  # how visible the player's own flashlight makes them
 GUARD_FLASH_GAIN = 105  # additive world brighten from a guard's flashlight beam
@@ -341,10 +344,25 @@ MODE_COL = {
 TRACER_AIR = (255, 240, 180)
 TRACER_WALL = (150, 60, 45)
 DEAD = (72, 70, 66)
-DOOR_WOOD = (150, 118, 78)      # the door leaf
-DOOR_FRAME = (86, 66, 40)       # frame / seam on a closed door
+# Doors are two steel panels that part along the wall and retract into the
+# jambs. The status lamp on the leading edge is the read that matters in a
+# firefight: amber sealed, yellow travelling, green clear — and a blast door
+# spends five seconds on yellow.
+DOOR_PANEL = (126, 134, 145)      # brushed steel leaf
+DOOR_PANEL_HEAVY = (88, 96, 107)  # a blast door: thicker, darker plate
+DOOR_PANEL_EDGE = (40, 46, 54)    # panel outline and the leading edge
+DOOR_RIB = (158, 166, 176)        # stiffener across a panel: reads as metal
+DOOR_JAMB = (66, 72, 80)          # the track the panels run in
+DOOR_FLOOR = (196, 194, 186)      # deck showing through the opening. Close to
+                                  # the map's own floor on purpose: a fully
+                                  # open doorway should read as somewhere you
+                                  # can walk, not as a lighter door
+DOOR_LAMP_SHUT = (236, 146, 44)   # amber: sealed
+DOOR_LAMP_MOVE = (242, 214, 70)   # yellow: travelling, and not yet a doorway
+DOOR_LAMP_OPEN = (110, 205, 135)  # green: clear
 DOOR_OPEN_EDGE = (110, 175, 110)  # green outline marks a passable doorway
-DOOR_FLOOR = (206, 202, 190)    # what shows through an opened doorway
+DOOR_STUB = 0.16                  # how much of each panel still shows when it
+                                  # is fully home in the jamb
 GUARD_DOOR_REACH_M = 1.4        # a blocked guard shoves a door within this
 
 
@@ -396,7 +414,7 @@ def build_base_surface(m: TileMap) -> pygame.Surface:
     """The static map layer. For a .map (which carries floor/object id grids +
     the tileset) this blits the real tile PNGs, tinted by role - floor cells
     darker, wall cells lighter. Door cells are left to the dynamic door draw;
-    bush (overlay) is not on the base."""
+    an overlay tile is not on the base."""
     world_w = round(m.width_m * PX_PER_M)
     world_h = round(m.height_m * PX_PER_M)
     ts = getattr(m, "tileset", None)
@@ -440,9 +458,9 @@ def build_base_surface(m: TileMap) -> pygame.Surface:
             if not oid:
                 continue
             otd = ts.tiles.get(oid)
-            special = otd is not None and (otd.door or otd.glass or otd.bush)
+            special = otd is not None and (otd.door or otd.glass)
             if otd is not None and otd.overlay:
-                continue                      # bush canopy: not on the base
+                continue                      # canopy tile: not on the base
             if otd is not None and otd.door:
                 continue                      # door: the dynamic door draw owns it
             surf.blit(tile(oid, "obj" if special else "wall"), (x, y))
@@ -537,6 +555,68 @@ def _additive_blit(screen, field: np.ndarray, gain: float, vf, ppc: float,
                 special_flags=pygame.BLEND_RGB_ADD)
 
 
+def draw_door(screen, rect, frac: float, axis: str = "h",
+              heavy: bool = False) -> None:
+    """One sliding door, `frac` of the way open (0 sealed, 1 fully retracted).
+
+    Two panels part along the wall the door sits in and disappear into the
+    jambs either side, leaving a stub showing so the doorway still reads as a
+    door rather than as a hole. `axis` is "h" when they travel left and right,
+    "v" when they travel up and down.
+
+    The in-between only exists here. Movement, sight, bullets and sound all
+    read the door as shut for every instant of the travel, so what the lamp is
+    saying while it is yellow is "not yet"."""
+    horiz = axis == "h"
+    span = rect.w if horiz else rect.h      # the axis the panels travel along
+    cross = rect.h if horiz else rect.w
+    if span < 4 or cross < 4:
+        return
+
+    def box(a0, a1, c0, c1):
+        """A rect given in (along, across) -> screen coordinates."""
+        a0, a1 = int(a0), int(a1)
+        c0, c1 = int(c0), int(c1)
+        if horiz:
+            return pygame.Rect(rect.x + a0, rect.y + c0, a1 - a0, c1 - c0)
+        return pygame.Rect(rect.x + c0, rect.y + a0, c1 - c0, a1 - a0)
+
+    f = min(1.0, max(0.0, frac))
+    pygame.draw.rect(screen, DOOR_FLOOR, rect)
+    rail = max(1, int(cross * 0.10))
+    pygame.draw.rect(screen, DOOR_JAMB, box(0, span, 0, rail))
+    pygame.draw.rect(screen, DOOR_JAMB, box(0, span, cross - rail, cross))
+
+    stub = max(2, int(span * DOOR_STUB))
+    half = span / 2.0
+    pw = int(round(half - (half - stub) * f))
+    panel = DOOR_PANEL_HEAVY if heavy else DOOR_PANEL
+    lamp = (DOOR_LAMP_OPEN if f >= 0.999 else
+            DOOR_LAMP_SHUT if f <= 0.001 else DOOR_LAMP_MOVE)
+    c0, c1 = rail, cross - rail
+    lamp0, lamp1 = cross * 0.34, cross * 0.66
+    # the leading edge doubles as how thick the slab looks end-on, so a blast
+    # door gets a visibly heavier one
+    edge = max(2, int(span * (0.055 if heavy else 0.03)))
+    for outer, lead, inward in ((0, pw, 1), (span, span - pw, -1)):
+        a0, a1 = min(outer, lead), max(outer, lead)
+        pygame.draw.rect(screen, panel, box(a0, a1, c0, c1))
+        pygame.draw.rect(screen, DOOR_PANEL_EDGE, box(a0, a1, c0, c1), 1)
+        # the leading edge, where the panels meet when they are shut
+        e = lead - edge * inward
+        pygame.draw.rect(screen, DOOR_PANEL_EDGE,
+                         box(min(e, lead), max(e, lead), c0, c1))
+        pygame.draw.rect(screen, lamp,
+                         box(min(e, lead), max(e, lead), lamp0, lamp1))
+        if pw > 6:                       # stiffeners: a plate, not a card
+            for at in ((0.55,) if not heavy else (0.45, 0.75)):
+                rb = outer + (lead - outer) * at
+                pygame.draw.rect(screen, DOOR_RIB,
+                                 box(rb, rb + 1, c0 + 1, c1 - 1))
+    if f >= 0.999:
+        pygame.draw.rect(screen, DOOR_OPEN_EDGE, rect, 2)
+
+
 def static_overlay(field: np.ndarray, m: TileMap, lo, hi, rgb):
     norm = np.clip((field.astype(np.float32) - lo) / max(hi - lo, 1e-6), 0, 1)
     s = field_surface(field, rgb, norm * 190)
@@ -604,14 +684,42 @@ def try_move(m: TileMap, x, y, dx, dy):
     return movement.try_move(m, x, y, dx, dy, BODY_R)
 
 
+def _trim_sounds(sounds, jobs, cache, max_active):
+    """Drop the oldest sounds past the cap, and stop paying to solve a field
+    that nothing is listening for any more.
+
+    A cancelled job leaves its field permanently half-solved, so a field is
+    only abandoned when no remaining sound rides it AND no cache is holding it
+    for reuse — otherwise a later sound would inherit a wavefront frozen
+    mid-flight and never arrive."""
+    while len(sounds) > max_active:
+        dropped = sounds.pop(0)
+        if jobs is None:
+            continue
+        if any(s.field is dropped.field for s in sounds):
+            continue
+        if cache is not None and cache.get("field") is dropped.field:
+            continue
+        for j in list(jobs):
+            if getattr(j, "field", None) is dropped.field:
+                jobs.remove(j)
+
+
 def emit(m: TileMap, cost, x, y, energy, label, sounds, now, cache=None,
-         jobs=None, enemy=False):
-    """Emit a sound. If `cache` is given it is a one-slot reusable field for
-    the player: a fresh solve happens only once the player has moved
-    FIELD_REUSE_M, and nearer footsteps reuse it with their own energy."""
+         jobs=None, enemy=False, max_active=None):
+    """Emit a sound, and return the ActiveSound it queued (None if the origin
+    is unreachable).
+
+    If `cache` is given it is a one-slot reusable field: a fresh solve happens
+    only once the source has moved FIELD_REUSE_M, and quieter sounds from the
+    same spot reuse it with their own energy. That matters far more than it
+    looks — a field is the expensive thing here, and a weapon on full auto
+    makes ten noises a second from what is very nearly one place."""
+    if max_active is None:
+        max_active = MAX_ACTIVE
     cx, cy = m.cell_of(x, y)
     if not np.isfinite(cost[cy, cx]):
-        return
+        return None
     if cache is not None:
         f = cache.get("field")
         ox, oy = cache.get("pos", (1e9, 1e9))
@@ -619,10 +727,10 @@ def emit(m: TileMap, cost, x, y, energy, label, sounds, now, cache=None,
                  and f.energy >= energy
                  and math.hypot(x - ox, y - oy) <= FIELD_REUSE_M)
         if reuse:
-            sounds.append(ActiveSound(f, now, label, 0.0, energy, enemy))
-            while len(sounds) > MAX_ACTIVE:
-                sounds.pop(0)
-            return
+            snd = ActiveSound(f, now, label, 0.0, energy, enemy)
+            sounds.append(snd)
+            _trim_sounds(sounds, jobs, cache, max_active)
+            return snd
     t0 = time.perf_counter()
     f, job = sound.begin(cost, (cx, cy), energy)
     if job is not None and jobs is not None:
@@ -636,9 +744,10 @@ def emit(m: TileMap, cost, x, y, energy, label, sounds, now, cache=None,
     if cache is not None:
         cache["field"] = f
         cache["pos"] = (x, y)
-    sounds.append(ActiveSound(f, now, label, ms, energy, enemy))
-    while len(sounds) > MAX_ACTIVE:
-        sounds.pop(0)
+    snd = ActiveSound(f, now, label, ms, energy, enemy)
+    sounds.append(snd)
+    _trim_sounds(sounds, jobs, cache, max_active)
+    return snd
 
 
 def main(map_path: str = "maps/arena.toml") -> None:
@@ -704,8 +813,6 @@ def main(map_path: str = "maps/arena.toml") -> None:
     known = np.zeros(m.blocks_sight.shape, dtype=bool)
 
     px_, py_ = m.player_spawn
-    prev_px, prev_py = px_, py_
-    in_bush = False
     facing = -math.pi / 2
     since_step = 0.0
     sounds: list[ActiveSound] = []
@@ -770,7 +877,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
     enemy_mode = 2           # 0 off, 1 arcs, 2 full ripples (F11 cycles)
     cues: list = []
 
-    doors = find_doors(m)
+    doors = DoorSet(m)
+    packs = PickupSet(m)
     wi = 0
     mags = [weapons.ROSTER[n].mag for n in loadout]
     reserves = [weapons.ROSTER[n].reserve for n in loadout]   # -1 = unlimited
@@ -814,17 +922,60 @@ def main(map_path: str = "maps/arena.toml") -> None:
             audio.play_fire(w, gain, pan)
 
     def draw_muzzle(art, cx, cy, facing, ft, roll, sc):
-        """Two-layer muzzle flash at a weapon's muzzle: big + small core early,
-        fading core late. `cx, cy` is the weapon sprite's blit centre."""
-        if ft <= 0.0 or not bank.ok or art not in sprites.MUZZLE_PX:
-            return
-        half = sprites.FLASH_TIME * 0.5
-        if ft > half:
-            bank.flash(screen, art, "big", cx, cy, facing, roll, sc * 1.15, 255)
-            bank.flash(screen, art, "small", cx, cy, facing, -roll * 1.7, sc, 255)
-        else:
-            bank.flash(screen, art, "small", cx, cy, facing, roll, sc * 0.8,
-                       int(210 * ft / half))
+        """This screen's bank and surface, into sim/sprites.draw_muzzle — the
+        one definition of what a muzzle flash looks like."""
+        sprites.draw_muzzle(bank, screen, art, cx, cy, facing, ft, roll, sc)
+
+    def _door_name(d):
+        return "blast door" if d.heavy else "door"
+
+    def _door_msg(d, opening):
+        if d.heavy:
+            return f"blast door {'opening' if opening else 'sealing'} — {d.dur:.0f}s"
+        return f"door {'opened' if opening else 'closed'}"
+
+    def start_door(key, want_open, label_prefix, enemy=False):
+        """A door has begun to move. The servo starts now and is heard now —
+        the geometry does not change until the panels arrive."""
+        d = doors.door(key)
+        sfx("door_heavy" if d.heavy else "door")
+        emit(m, cost, key[1] + 0.5, key[0] + 0.5, e_knock * 0.7,
+             f"{label_prefix}door", sounds, now, jobs=jobs, enemy=enemy)
+
+    def door_arrived(key, is_open, changed=True, seat=True):
+        """The panels are home — or, for a door that has begun to seal, the
+        gap has just gone. When the geometry moves, every in-flight sound
+        field has to go with it: they were all solved against the old walls."""
+        if changed:
+            set_door(m, cost, key[0], key[1], is_open)
+            compute_roof(m, doors)
+            vis_cache.invalidate()
+            sounds.clear()
+        if seat and doors.door(key).heavy:
+            # the panels seating: a second, quieter cue that it has finished
+            emit(m, cost, key[1] + 0.5, key[0] + 0.5, e_knock * 0.45,
+                 "door", sounds, now, jobs=jobs)
+
+    def take_pack(p):
+        """Apply a pack the player is standing on. Returns the line to show,
+        or "" if it would do nothing — a full player walks over a health pack
+        and leaves it there."""
+        nonlocal reserves
+        if p.kind == pk.HEALTH:
+            got = pk.health_gain(player)
+            if got is None:
+                return ""
+            gained = got - player.health
+            player.health = got
+            sfx("magazine", 0.5)
+            return f"health pack: +{gained:.0f}"
+        got = pk.ammo_gain(loadout, reserves, weapons.ROSTER)
+        if got is None:
+            return ""
+        gained = sum(got) - sum(reserves)
+        reserves = got
+        sfx("magazine", 0.6)
+        return f"ammo pack: +{gained} rounds across the loadout"
 
     def cur_weapon():
         return weapons.ROSTER[loadout[wi]]
@@ -945,7 +1096,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
             if _myp < view_h:
                 _best_px = INTERACT_HOVER_PX
                 _pcx, _pcy = m.cell_of(px_, py_)
-                for _c in (list(m.interactables)
+                for _c in ([e for e in m.interactables
+                            if e.kind not in pk.KINDS]
                           + [_CorpseTarget(g) for g in guards if not g.alive]):
                     _cx, _cy = _c.pos
                     if math.hypot(_cx - px_, _cy - py_) > INTERACT_RANGE:
@@ -1078,8 +1230,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         d = math.hypot(c_ + 0.5 - px_, r_ + 0.5 - py_)
                         if d < bd:
                             best, bd = (r_, c_), d
+                    _bdoor = doors.door(best) if best else None
                     if best is None:
                         msg, msg_t = "nothing to interact with", now
+                    elif _bdoor.moving:
+                        # once a blast door starts, it finishes
+                        msg, msg_t = f"{_door_name(_bdoor)} is moving", now
                     else:
                         want_open = not doors[best]
                         _br, _bc = best
@@ -1087,19 +1243,17 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         _ny = min(max(py_, _br), _br + 1.0)
                         in_leaf = math.hypot(px_ - _nx, py_ - _ny) < BODY_R + 0.05
                         if not want_open and in_leaf:
-                            # closing the leaf on your own body traps you
+                            # sealing the panels on your own body traps you
                             msg, msg_t = "stand clear to close the door", now
                         else:
-                            doors[best] = want_open
-                            set_door(m, cost, best[0], best[1], want_open)
-                            compute_roof(m, doors)
-                            vis_cache.invalidate()
-                            sounds.clear()
-                            emit(m, cost, best[1] + 0.5, best[0] + 0.5,
-                                 e_knock * 0.7, "door", sounds, now, jobs=jobs)
-                            sfx("door")
-                            msg = f"door {'opened' if want_open else 'closed'}"
-                            msg_t = now
+                            _dd, _chg = doors.begin(best, want_open)
+                            if _dd is not None:
+                                if _chg:
+                                    door_arrived(best, _dd.is_open,
+                                                 seat=False)
+                                start_door(best, want_open, "")
+                                msg = _door_msg(_bdoor, want_open)
+                                msg_t = now
                 elif ev.key == pygame.K_p:
                     paused = not paused
                 elif ev.key == pygame.K_c:
@@ -1193,6 +1347,15 @@ def main(map_path: str = "maps/arena.toml") -> None:
                         msg, msg_t = "rail: full charge", now
 
         if not paused:
+            packs.step(dt)
+            _got = packs.at(px_, py_)
+            if _got is not None:
+                _msg = take_pack(_got)
+                if _msg:                       # a pack you cannot use is left
+                    packs.take(_got.id)        # standing for whoever needs it
+                    msg, msg_t = _msg, now
+            for _dk, _dopen, _dchg in doors.step(dt):
+                door_arrived(_dk, _dopen, _dchg)
             fire_cd = max(0.0, fire_cd - dt)
             swap_t = max(0.0, swap_t - dt)
             recoil_t = max(0.0, recoil_t - dt)
@@ -1301,14 +1464,6 @@ def main(map_path: str = "maps/arena.toml") -> None:
 
         player.x, player.y = px_, py_
 
-        # bush concealment: standing still inside foliage hides you from the AI;
-        # the moment you move you rustle it and become visible again
-        _bcx, _bcy = m.cell_of(px_, py_)
-        in_bush = bool(m.bush[_bcy, _bcx])
-        moved_now = (px_ != prev_px or py_ != prev_py)
-        prev_px, prev_py = px_, py_
-        player.concealed = in_bush and not moved_now and player.hp > 0.0
-
         # `player.see_light`: how lit the player is right now (0..1). Guards use
         # the same "you only see what is lit" rule the player does - a dim
         # player is hard to spot. Sources: the baked lightmap, the player's own
@@ -1329,6 +1484,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 return 0.0
             return gain * (1.0 - d / reach_m)
 
+        _bcx, _bcy = m.cell_of(px_, py_)
         _il = float(m.lightmap[_bcy, _bcx]) if m.lightmap is not None else 0.0
         if flashlight:
             _il = max(_il, FLASHLIGHT_SELF_SEEN)
@@ -1393,19 +1549,18 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     _ft = getattr(g, "_face_target", g.facing)
                     fx, fy = math.cos(_ft), math.sin(_ft)
                     for (r_, c_), is_open in doors.items():
-                        if is_open:
+                        if is_open or doors.door((r_, c_)).moving:
                             continue
                         vx_, vy_ = c_ + 0.5 - g.x, r_ + 0.5 - g.y
                         if (math.hypot(vx_, vy_) < GUARD_DOOR_REACH_M
                                 and vx_ * fx + vy_ * fy > 0.0):
-                            doors[(r_, c_)] = True
-                            set_door(m, cost, r_, c_, True)
-                            compute_roof(m, doors)
-                            vis_cache.invalidate()
-                            sounds.clear()
-                            emit(m, cost, c_ + 0.5, r_ + 0.5, e_knock * 0.7,
-                                 f"{g.id}/door", sounds, now, jobs=jobs, enemy=True)
-                            sfx("door")
+                            _gd, _gchg = doors.begin((r_, c_), True)
+                            if _gd is not None:
+                                if _gchg:
+                                    door_arrived((r_, c_), _gd.is_open,
+                                                 seat=False)
+                                start_door((r_, c_), True, f"{g.id}/",
+                                           enemy=True)
                             break
             player.tick(dt, now)
 
@@ -1501,20 +1656,12 @@ def main(map_path: str = "maps/arena.toml") -> None:
         if active_ov is not None:
             screen.blit(overlays[active_ov][1], (0, 0))
 
-        # door state, drawn under the fog: solid leaf = shut, hollow green =
-        # open (with the swung leaf tucked against a jamb)
-        for (r_, c_), is_open in doors.items():
-            drc = pygame.Rect(int(c_ * PX_PER_M), int(r_ * PX_PER_M),
+        # doors, drawn under the fog: a door you cannot see is a door whose
+        # state you do not know
+        for _key, _d in doors.doors.items():
+            drc = pygame.Rect(int(_d.c * PX_PER_M), int(_d.r * PX_PER_M),
                               int(PX_PER_M), int(PX_PER_M))
-            if is_open:
-                pygame.draw.rect(screen, DOOR_FLOOR, drc)
-                lw = max(3, int(PX_PER_M * 0.22))
-                pygame.draw.rect(screen, DOOR_WOOD, (drc.x, drc.y, lw, drc.h))
-                pygame.draw.rect(screen, DOOR_OPEN_EDGE, drc, 2)
-            else:
-                pygame.draw.rect(screen, DOOR_WOOD, drc)
-                pygame.draw.rect(screen, DOOR_FRAME, drc, 2)
-                pygame.draw.line(screen, DOOR_FRAME, drc.midtop, drc.midbottom, 1)
+            draw_door(screen, drc, _d.frac, _d.axis, _d.heavy)
         prof["base"] = (time.perf_counter() - _t) * 1000
 
         ppc = PX_PER_M / m.cells_per_metre
@@ -1609,13 +1756,10 @@ def main(map_path: str = "maps/arena.toml") -> None:
         # player flashlight (l): a tight beam - hard side edges, no outer spill,
         # a smooth range gradient that fades out before the LOS cone edge.
         fl = None
-        if flashlight and not in_bush:
-            _fd = np.abs((vf.ang - facing + np.pi) % (2 * np.pi) - np.pi)
-            ang_ok = (_fd <= math.radians(FLASHLIGHT_HALF_DEG)) & vf.visible
-            reach = max(cone.identify_range * 0.9, 1.0)
-            t = np.clip(1.0 - vf.dist / reach, 0.0, 1.0)
-            t = t * t * (3.0 - 2.0 * t)                 # smooth tip gradient
-            fl = np.where(ang_ok, t, 0.0).astype(np.float32)
+        if flashlight:
+            fl = lighting.cone_beam(vf.ang, vf.dist, vf.visible, facing,
+                                    FLASHLIGHT_HALF_DEG,
+                                    max(cone.identify_range * 0.9, 1.0))
             fl = box_blur(fl, FLASHLIGHT_BLUR)          # 1 = just anti-alias the edge
 
         # active muzzle flashes as a brief radial light, shadow-cast from each
@@ -1631,8 +1775,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 _age = (now - ml["t0"]) / ml.get("life", MUZZLE_LIGHT_TIME)
                 if _age >= 1.0:
                     continue
-                _b = _age / 0.32 if _age < 0.32 else (1.0 - _age) / 0.68
-                _b = max(0.0, _b) ** 1.25 * ml["gain"]
+                _b = lighting.pulse(_age) * ml["gain"]
                 if _b <= 0.02:
                     continue
                 _fcx, _fcy = m.cell_of(ml["x"], ml["y"])
@@ -1642,11 +1785,9 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 if _sl is None:
                     continue
                 (_y0, _y1, _x0, _x1), (_sy0, _sy1, _sx0, _sx1) = _sl
-                _lit = np.where(
-                    _sf.visible[_sy0:_sy1, _sx0:_sx1],
-                    np.clip(1.0 - _sf.dist[_sy0:_sy1, _sx0:_sx1] / _rc,
-                           0.0, 1.0) ** 1.6 * _b,
-                    0.0).astype(np.float32)
+                _lit = lighting.point_light(_sf.dist[_sy0:_sy1, _sx0:_sx1],
+                                            _sf.visible[_sy0:_sy1, _sx0:_sx1],
+                                            _rc, _b)
                 np.maximum(_mf[_y0:_y1, _x0:_x1], _lit, out=_mf[_y0:_y1, _x0:_x1])
                 _col = np.array(ml["col"], np.float32) / 255.0
                 _mrgb[_y0:_y1, _x0:_x1] += _lit[:, :, None] * _col
@@ -1670,7 +1811,6 @@ def main(map_path: str = "maps/arena.toml") -> None:
         if _lg:
             _gb = np.zeros((h_, w_), np.float32)
             _grc = max(2, int(ai.GUARD_FLASH_RANGE_M * cpm))
-            _gha = math.radians(ai.GUARD_FLASH_HALF_DEG)
             for g in _lg:
                 gcx, gcy = m.cell_of(g.x, g.y)
                 # through the shared cache, not a fresh shadowcast every frame -
@@ -1683,10 +1823,8 @@ def main(map_path: str = "maps/arena.toml") -> None:
                 _ang = _gsf.ang[_sy0:_sy1, _sx0:_sx1]
                 _dist = _gsf.dist[_sy0:_sy1, _sx0:_sx1]
                 _vis_s = _gsf.visible[_sy0:_sy1, _sx0:_sx1]
-                _gd = np.abs((_ang - g.facing + np.pi) % (2 * np.pi) - np.pi)
-                _gt = np.clip(1.0 - _dist / _grc, 0.0, 1.0)
-                _gt = _gt * _gt * (3.0 - 2.0 * _gt)
-                _gl = np.where((_gd <= _gha) & _vis_s, _gt, 0.0).astype(np.float32)
+                _gl = lighting.cone_beam(_ang, _dist, _vis_s, g.facing,
+                                         ai.GUARD_FLASH_HALF_DEG, _grc)
                 np.maximum(_gb[_y0:_y1, _x0:_x1], _gl, out=_gb[_y0:_y1, _x0:_x1])
             _gb *= vf.visible
             if _gb.max() > 0.0:
@@ -1694,21 +1832,13 @@ def main(map_path: str = "maps/arena.toml") -> None:
 
         # STATIC illumination (baked lightmap + flashlight) gates what enters
         # fog memory: a room with no lamp and the flashlight off reveals nothing.
-        if m.lightmap is not None:
-            illum = m.lightmap[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_].astype(np.float32)
-        else:
-            illum = np.zeros((h_, w_), dtype=np.float32)
+        illum = lighting.static_illumination(m.lightmap, vf.y0, vf.x0, h_, w_)
         if fl is not None:
             illum = np.maximum(illum, fl)
         if gbeam is not None:
             illum = np.maximum(illum, gbeam)
-        see = np.clip((illum - LIGHT_SEE_MIN) / (LIGHT_SEE_FULL - LIGHT_SEE_MIN),
-                      0.0, 1.0)
+        see = lighting.see_gate(illum, LIGHT_SEE_MIN, LIGHT_SEE_FULL)
         gated = inten_raw * see
-        if in_bush:
-            # hunkered in foliage: you can't see out, only the leaves around you
-            bsub = m.bush[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
-            gated = np.where(bsub, gated, 0.0)
         known[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_] |= gated > 0.03
         inten_raw = gated                        # fog cone-carve + roof peek use this
 
@@ -1834,10 +1964,16 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     draw_guard_cone(screen, g, PX_PER_M)
 
         for _e in m.interactables:              # no sprite art yet - flat markers
+            if _e.kind in pk.KINDS:
+                continue                        # packs are drawn below, by state
             _ex, _ey = _e.pos[0] * PX_PER_M, _e.pos[1] * PX_PER_M
             _ecol = ENT_COLOUR.get(_e.kind, (200, 200, 200))
             pygame.draw.circle(screen, _ecol, (int(_ex), int(_ey)), 9)
             pygame.draw.circle(screen, (20, 20, 20), (int(_ex), int(_ey)), 9, 1)
+
+        for _p in packs:                        # health and ammo packs
+            sprites.draw_pickup(screen, _p.x * PX_PER_M, _p.y * PX_PER_M,
+                                _p.kind, PX_PER_M, _p.live)
 
         live_n = 0
         for g in guards:
@@ -2278,8 +2414,7 @@ def main(map_path: str = "maps/arena.toml") -> None:
                           f"solve {s0.solve_ms:.1f}ms")
         lines = [
             f"pos {px_:6.2f},{py_:6.2f}m  cell {cx:3d},{cy:3d}  tile '{ch}' "
-            f"{m.tiles[ch].name}  gait {gait}"
-            f"{'  [CONCEALED]' if player.concealed else ('  [in bush - moving]' if in_bush else '')}",
+            f"{m.tiles[ch].name}  gait {gait}",
             f"sounds {len(sounds)} (enemy {sum(1 for s_ in sounds if s_.enemy)})"
             f"  solving {len(jobs)}  own {'on' if show_own_sound else 'OFF'}"
             f"  enemy {('off', 'arcs', 'ripples')[enemy_mode]}"

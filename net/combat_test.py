@@ -434,19 +434,46 @@ def door_test():
         time.sleep(0.25)
         assert srv.map.blocks_sight[fine], "the door started open"
 
-        def press():
+        door = srv.doors.door((dr, dc))
+
+        def press(settle=True):
+            """Tap f, then wait out the travel. The panels take time now, so a
+            fixed sleep either races the door or tests nothing — poll it."""
             a.send_input(0.0, 0.0, 0.0, BTN_INTERACT)
             time.sleep(0.1)
             a.send_input(0.0, 0.0, 0.0, 0)
-            time.sleep(0.25)
+            if settle:
+                t0 = time.monotonic()
+                while door.moving and time.monotonic() - t0 < 3.0:
+                    time.sleep(0.02)
+                time.sleep(0.15)
             return ([e for e in a.drain_events() if e["t"] == "door"],
                     [e for e in b.drain_events() if e["t"] == "door"])
 
-        mine, theirs = press()
+        # --- while the panels are travelling, the doorway is still a wall
+        a.send_input(0.0, 0.0, 0.0, BTN_INTERACT)
+        t0 = time.monotonic()
+        while not door.moving and time.monotonic() - t0 < 1.0:
+            time.sleep(0.005)
+        assert door.moving, "the door did not start moving"
+        assert srv.map.blocks_sight[fine], \
+            "a door that has only started opening already lets sight through"
+        assert srv.map.blocks_move[fine], \
+            "a door that has only started opening is already walkable"
+        print(f"  mid-travel: still solid, {door.left:.2f}s of "
+              f"{door.dur:.2f}s left")
+        a.send_input(0.0, 0.0, 0.0, 0)
+        while door.moving and time.monotonic() - t0 < 3.0:
+            time.sleep(0.02)
+        time.sleep(0.15)
+        mine = [e for e in a.drain_events() if e["t"] == "door"]
+        theirs = [e for e in b.drain_events() if e["t"] == "door"]
         print(f"  opening: shooter saw {len(mine)} door event(s), "
               f"watcher saw {len(theirs)}")
         assert mine and theirs, "the door never moved for both clients"
         assert mine[0]["open"] is True and not mine[0]["blocked"]
+        assert abs(mine[0]["dur"] - door.dur) < 1e-3, \
+            "clients were told the wrong travel time"
         assert srv.doors[(dr, dc)] is True, "the server did not open it"
         assert not srv.map.blocks_sight[fine], "an open door still blocks sight"
         assert not srv.map.blocks_move[fine], "an open door still blocks movement"
@@ -461,7 +488,7 @@ def door_test():
         srv.players[aid].x, srv.players[aid].y = dc + 0.5, dr + 0.5
         time.sleep(0.25)
         press()                                  # open it from inside
-        assert srv.doors[(dr, dc)] is True
+        assert srv.doors[(dr, dc)] is True, "could not reopen it"
         mine, _ = press()                        # now try to close on yourself
         print(f"  standing in the leaf, closing gave blocked="
               f"{mine[0]['blocked'] if mine else 'no event'}")

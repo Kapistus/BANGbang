@@ -65,6 +65,43 @@ WEAPON_ART = {
 }
 _ID_BY_NAME: dict[str, str] = {}
 
+# Player colours. The name is what the art file is suffixed with, the RGB is
+# what the lobby swatch shows and what the ring under a body is drawn in.
+#
+# Colour is art, not a filter: a soldier in red is `soldier_ready_red.png`,
+# painted as the sprite should look. Tinting the one khaki sprite was tried and
+# looked exactly like what it was — a coloured pane held over a photograph. Any
+# pose with no coloured version falls back to the base art, so the palette can
+# be filled in one file at a time.
+PALETTE = [
+    ("red",    (220, 40, 40)),
+    ("blue",   (40, 40, 220)),
+    ("green",  (40, 200, 60)),
+    ("yellow", (230, 210, 40)),
+    ("orange", (240, 140, 30)),
+    ("purple", (160, 60, 200)),
+    ("cyan",   (40, 200, 220)),
+    ("white",  (235, 235, 235)),
+    ("grey",   (130, 130, 130)),
+    ("black",  (20, 20, 20)),
+]
+SWATCHES = [rgb for _n, rgb in PALETTE]
+COLOUR_POSES = ("soldier_ready", "soldier_idle", "soldier_ded")
+
+
+def colour_name(rgb) -> str:
+    """The palette name closest to an arbitrary RGB triple.
+
+    Closest, not exact: a colour arrives over the wire as three numbers and
+    nothing guarantees the sender used this palette."""
+    r, g, b = (int(c) for c in rgb[:3])
+    best, bd = PALETTE[0][0], None
+    for name, (cr, cg, cb) in PALETTE:
+        d = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
+        if bd is None or d < bd:
+            best, bd = name, d
+    return best
+
 
 def weapon_art(weapon_id: str) -> str:
     return WEAPON_ART.get(weapon_id, "battle_rifle")
@@ -88,6 +125,63 @@ def weapon_art_for(weapon_obj) -> str:
         from sim import weapons
         _ID_BY_NAME.update({v.name: k for k, v in weapons.ROSTER.items()})
     return weapon_art(_ID_BY_NAME.get(getattr(weapon_obj, "name", ""), ""))
+
+
+def draw_muzzle(bank, screen, art: str, cx: float, cy: float, facing: float,
+                ft: float, roll: float, scale: float) -> None:
+    """Two-layer muzzle flash at a weapon's muzzle: big + small core early,
+    fading core late. `cx, cy` is the weapon sprite's blit centre, `ft` the
+    remaining flash time.
+
+    One copy, because single-player and multiplayer must not disagree about
+    what a gun going off looks like."""
+    if ft <= 0.0 or not bank.ok or art not in MUZZLE_PX:
+        return
+    half = FLASH_TIME * 0.5
+    if ft > half:
+        bank.flash(screen, art, "big", cx, cy, facing, roll, scale * 1.15, 255)
+        bank.flash(screen, art, "small", cx, cy, facing, -roll * 1.7, scale, 255)
+    else:
+        bank.flash(screen, art, "small", cx, cy, facing, roll, scale * 0.8,
+                   int(210 * ft / half))
+
+
+# Pickups have no art yet, so they are drawn as markers — but as ONE marker,
+# here, rather than three lookalikes in the editor, single-player and the
+# networked client.
+PICKUP_COLOUR = {"health": (225, 70, 80), "ammo": (235, 190, 60)}
+
+
+def draw_pickup(screen, cx: float, cy: float, kind: str, ppm: float,
+                live: bool = True) -> None:
+    """A health or ammo pack at world position (cx, cy) in pixels.
+
+    `live` False draws the empty socket it will come back to, which is the
+    information that matters while you wait for it."""
+    col = PICKUP_COLOUR.get(kind, (200, 200, 200))
+    r = max(5, int(0.30 * ppm))
+    box = pygame.Rect(int(cx - r), int(cy - r), r * 2, r * 2)
+    if not live:
+        pygame.draw.rect(screen, tuple(c // 3 for c in col), box, 1,
+                         border_radius=max(2, r // 3))
+        return
+    pygame.draw.rect(screen, (18, 18, 20), box.inflate(4, 4),
+                     border_radius=max(2, r // 3))
+    pygame.draw.rect(screen, col, box, border_radius=max(2, r // 3))
+    if kind == "health":
+        arm = max(1, r // 3)
+        pygame.draw.rect(screen, (250, 250, 250),
+                         (int(cx - arm // 2 - 1), int(cy - r + arm),
+                          arm + 2, (r - arm) * 2))
+        pygame.draw.rect(screen, (250, 250, 250),
+                         (int(cx - r + arm), int(cy - arm // 2 - 1),
+                          (r - arm) * 2, arm + 2))
+    else:
+        dk = tuple(int(c * 0.45) for c in col)
+        for i in (-1, 1):
+            pygame.draw.rect(screen, dk,
+                             (box.x + 2, int(cy + i * r * 0.42) - 1,
+                              box.w - 4, max(1, r // 4)))
 
 
 def orient_deg(facing: float) -> float:
@@ -119,6 +213,18 @@ class SpriteBank:
             self.scale = scale
             self._cache.clear()
 
+    def body_art(self, pose: str, colour: "str | None") -> str:
+        """`pose` in a player's colour if that art exists, else the base pose."""
+        if colour:
+            name = f"{pose}_{colour}"
+            if name in self.raw:
+                return name
+        return pose
+
+    def colours(self) -> list[str]:
+        """Palette names that have a coloured `soldier_ready` loaded."""
+        return [n for n, _rgb in PALETTE if f"soldier_ready_{n}" in self.raw]
+
     def get(self, name: str, facing: float) -> "pygame.Surface | None":
         raw = self.raw.get(name)
         if raw is None:
@@ -133,14 +239,26 @@ class SpriteBank:
 
     def blit(self, screen, name: str, cx: float, cy: float, facing: float,
              tint: "tuple[int, int, int] | None" = None,
-             alpha: "int | None" = None) -> bool:
+             alpha: "int | None" = None,
+             wash: "tuple[int, int, int] | None" = None) -> bool:
+        """Draw a sprite. `tint` multiplies (used for light and shadow), `wash`
+        adds (used for player colour).
+
+        The difference matters on this art, which is dark khaki averaging about
+        (59, 62, 40): multiplying by a player's colour can only take it further
+        down, so saturated colours become silhouettes and the darker swatches
+        become holes. Adding lifts the sprite toward the colour instead, keeps
+        the art's own shading intact, and separates the palette far better."""
         surf = self.get(name, facing)
         if surf is None:
             return False
-        if tint is not None or alpha is not None:
+        if tint is not None or alpha is not None or wash is not None:
             surf = surf.copy()
             if tint is not None:
                 surf.fill(tint + (255,), special_flags=pygame.BLEND_RGB_MULT)
+            if wash is not None:
+                # alpha component 0: transparent pixels stay transparent
+                surf.fill(tuple(wash) + (0,), special_flags=pygame.BLEND_RGB_ADD)
             if alpha is not None:
                 surf.set_alpha(alpha)
         screen.blit(surf, surf.get_rect(center=(int(cx), int(cy))))

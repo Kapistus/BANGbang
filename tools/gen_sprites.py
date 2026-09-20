@@ -1,10 +1,20 @@
 """Generate placeholder tile PNGs from assets/tiles/tileset.toml.
 
-Each tile gets a flat-colour square with a simple motif so the map editor
-and game have something to draw. Replace the PNGs with real art at the same
-size (meta.tile_px) and this script is no longer needed.
+Each tile gets a flat-colour square with a simple motif so the map editor and
+game have something to draw. Replace the PNGs with real art at the same size
+(meta.tile_px) and this script is no longer needed.
 
-    python tools/gen_sprites.py
+    python tools/gen_sprites.py            # fill in what is MISSING
+    python tools/gen_sprites.py --force --only door,blast_door
+    python tools/gen_sprites.py --force    # redraw everything (destructive)
+
+Missing-only is the default, and it matters: the editor calls this
+automatically whenever any one PNG is absent, so adding a single tile to
+tileset.toml used to redraw every sliced tile in the folder as a flat square.
+That is how 256 pieces of real art were once replaced by grey. Real art wins
+over a placeholder unless somebody explicitly asks otherwise.
+
+    python tools/slice_sheet.py            # is what puts real art there
 """
 
 from __future__ import annotations
@@ -57,15 +67,60 @@ def draw_tile(surf: "pygame.Surface", tid: str, col) -> None:
         pygame.draw.rect(surf, dk, (px // 2 - 3, 0, 6, px))
         pygame.draw.rect(surf, lt, (px // 2 - 3, 0, 6, px), 1)
     elif tid == "window":
-        pygame.draw.rect(surf, dk, surf.get_rect(), 3)
-        pygame.draw.line(surf, dk, (px // 2, 0), (px // 2, px), 2)
-        pygame.draw.line(surf, dk, (0, px // 2), (px, px // 2), 2)
-        pygame.draw.line(surf, lt, (4, 4), (px // 2 - 3, px // 2 - 3), 2)
-    elif tid == "door":
-        pygame.draw.rect(surf, dk, surf.get_rect(), 2)
-        for x in range(6, px, max(6, px // 4)):
-            pygame.draw.line(surf, dk, (x, 3), (x, px - 3))
-        pygame.draw.circle(surf, lt, (px - 8, px // 2), 2)
+        # a glazed opening seen from above: frame, four panes, and two glints
+        # across the glass, which is what makes it read as glass and not as a
+        # tiled floor
+        fr = max(3, px // 10)
+        bar = max(2, px // 28)
+        glass = _shade(col, 1.10)
+        frame = _shade(col, 0.42)
+        surf.fill(frame)
+        pygame.draw.rect(surf, glass, (fr, fr, px - fr * 2, px - fr * 2))
+        glint = pygame.Surface((px, px), pygame.SRCALPHA)
+        for off, wide, a in ((-px // 5, px // 7, 95), (px // 6, px // 14, 60)):
+            pygame.draw.polygon(glint, (255, 255, 255, a), (
+                (fr + off, px - fr), (fr + off + wide, px - fr),
+                (fr + off + wide + (px - fr * 2), fr), (fr + off + (px - fr * 2), fr)))
+        surf.blit(glint.subsurface((fr, fr, px - fr * 2, px - fr * 2)), (fr, fr))
+        mid = px // 2
+        pygame.draw.rect(surf, frame, (mid - bar // 2, fr, bar, px - fr * 2))
+        pygame.draw.rect(surf, frame, (fr, mid - bar // 2, px - fr * 2, bar))
+        pygame.draw.rect(surf, _shade(col, 0.30), surf.get_rect(), max(1, px // 32))
+        pygame.draw.rect(surf, lt, (fr, fr, px - fr * 2, px - fr * 2), 1)
+        pin = max(2, px // 24)
+        for cx_, cy_ in ((fr, fr), (px - fr - pin, fr),
+                         (fr, px - fr - pin), (px - fr - pin, px - fr - pin)):
+            pygame.draw.rect(surf, _shade(col, 0.28), (cx_, cy_, pin, pin))
+    elif tid in ("door", "blast_door"):
+        # drawn by the renderer itself, shut, so the palette icon is literally
+        # what a placed door looks like in the game rather than an impression
+        # of one that can drift away from it
+        from main import draw_door
+        draw_door(surf, surf.get_rect(), 0.0, "h", heavy=(tid == "blast_door"))
+    elif tid == "metal_grating":
+        # parallel bars with slots between them, and a frame
+        bar = max(2, px // 16)
+        for y in range(bar * 2, px - bar, bar * 2):
+            pygame.draw.rect(surf, dk, (bar, y, px - bar * 2, bar))
+        pygame.draw.rect(surf, _shade(col, 0.55), surf.get_rect(), max(2, px // 24))
+        pygame.draw.rect(surf, lt, surf.get_rect(), 1)
+    elif tid == "metal_grid":
+        # a square lattice: holes, not slots
+        step = max(4, px // 10)
+        for x in range(step, px, step):
+            pygame.draw.line(surf, dk, (x, 2), (x, px - 3), max(1, px // 48))
+        for y in range(step, px, step):
+            pygame.draw.line(surf, dk, (2, y), (px - 3, y), max(1, px // 48))
+        pygame.draw.rect(surf, _shade(col, 0.55), surf.get_rect(), max(2, px // 24))
+    elif tid == "metal_yellow":
+        # hazard stripes, which is what a yellow deck plate is for
+        w = max(4, px // 8)
+        dark = _shade(col, 0.35)
+        for i in range(-px // w, px * 2 // w + 1):
+            x = i * w * 2
+            pygame.draw.polygon(surf, dark, ((x, 0), (x + w, 0),
+                                             (x + w - px, px), (x - px, px)))
+        pygame.draw.rect(surf, _shade(col, 0.5), surf.get_rect(), max(2, px // 24))
     elif tid == "low_cover":
         pygame.draw.rect(surf, dk, (3, q + 2, px - 6, px - q - 5))
         pygame.draw.rect(surf, lt, (3, q + 2, px - 6, px - q - 5), 2)
@@ -73,20 +128,19 @@ def draw_tile(surf: "pygame.Surface", tid: str, col) -> None:
         pygame.draw.rect(surf, dk, (3, 3, px - 6, px - 6), 2)
         pygame.draw.line(surf, dk, (3, 3), (px - 3, px - 3), 2)
         pygame.draw.line(surf, dk, (px - 3, 3), (3, px - 3), 2)
-    elif tid == "bush":
-        random.seed(hash(tid) & 0xFFFF)
-        for _ in range(9):
-            r = random.randint(px // 6, px // 4)
-            pygame.draw.circle(
-                surf, _shade(col, random.uniform(0.8, 1.25)),
-                (random.randint(r, px - r), random.randint(r, px - r)), r)
     else:
         pygame.draw.rect(surf, dk, surf.get_rect(), 2)
 
 
-def main(tileset_path: str | None = None) -> list[str]:
-    """Render the placeholder PNGs. Safe to call from an app that already has
-    pygame running - it inits if needed and never quits."""
+def main(tileset_path: str | None = None, force: bool = False,
+         only: "set | None" = None) -> list[str]:
+    """Render the placeholder PNGs for tiles that have none.
+
+    Safe to call from an app that already has pygame running: it inits if
+    needed and never quits. With `force`, redraws every tile it is allowed to
+    touch, which OVERWRITES real art - only ever from an explicit command
+    line. `only` limits it to those tile ids, which is how you redraw one
+    motif without touching the rest of the folder."""
     if not pygame.get_init():
         pygame.init()
     ts = load_tileset(tileset_path)
@@ -97,6 +151,10 @@ def main(tileset_path: str | None = None) -> list[str]:
         # png in a subfolder = hand-placed real art; never overwrite it.
         if "/" in td.png or "\\" in td.png:
             continue
+        if only is not None and td.id not in only:
+            continue
+        if not force and (out_dir / td.png).exists():
+            continue                    # something is already there: leave it
         surf = pygame.Surface((ts.tile_px, ts.tile_px))
         draw_tile(surf, td.id, tuple(td.colour))
         pygame.image.save(surf, str(out_dir / td.png))
@@ -105,7 +163,19 @@ def main(tileset_path: str | None = None) -> list[str]:
 
 
 if __name__ == "__main__":
+    rest, only, force = [], None, False
+    it = iter(sys.argv[1:])
+    for a in it:
+        if a == "--force":
+            force = True
+        elif a == "--only":
+            only = {t.strip() for t in next(it, "").split(",") if t.strip()}
+        else:
+            rest.append(a)
     pygame.init()
-    names = main(sys.argv[1] if len(sys.argv) > 1 else None)
+    names = main(rest[0] if rest else None, force=force, only=only)
     pygame.quit()
-    print(f"wrote {len(names)} sprites: {', '.join(names)}")
+    if names:
+        print(f"wrote {len(names)} sprites: {', '.join(names)}")
+    else:
+        print("nothing missing; pass --force to redraw over existing art")

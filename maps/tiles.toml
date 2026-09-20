@@ -71,6 +71,8 @@ pen_cost = 0.3
 glass = true
 colour = [176, 198, 206]
 
+# Doors split down the middle and retract into the jambs. Neither kind is
+# passable, transparent or quiet until the panels are fully home.
 [tiles."+"]
 name = "door"
 blocks_move = true
@@ -80,14 +82,20 @@ sound_cost = 10.0
 footstep_mult = 1.0
 pen_cost = 1.8
 door = true
-colour = [150, 118, 78]
+door_time = 0.35
+colour = [134, 142, 150]
 
-[tiles."b"]
-name = "bush"
-blocks_move = false
+# Thick, slow and worth shooting the panel instead of waiting. Five seconds in
+# the open is a long time to stand still, which is the whole design of it.
+[tiles."B"]
+name = "blast door"
+blocks_move = true
 blocks_sight = true
-blocks_bullets = false
-sound_cost = 1.0
-footstep_mult = 1.15
-bush = true
-colour = [64, 104, 58]
+blocks_bullets = true
+sound_cost = 34.0
+footstep_mult = 1.0
+pen_cost = 3.2
+door = true
+door_time = 5.0
+colour = [96, 104, 114]
+

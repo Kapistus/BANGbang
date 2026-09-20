@@ -11,6 +11,8 @@ Structure (bangbang-map/1):
       "floor":  [["floor", ...], ...],   # rows x cols, every cell filled
       "object": [["", "wall", ...], ...],# rows x cols, "" = nothing on top
       "player_spawn": [x, y],
+      "spawn_points": [{"pos": [x, y], "facing_deg": 0, "team": ""}],
+                                     # multiplayer starts; team "" = anyone
       "guards": [{"id": "g1", "patrol": [[x, y], ...]}],
       "idle_spots": [{"pos": [x, y], "facing_deg": 0, "tag": "idle"}],
       "lights": [{"pos": [x, y], "radius": 6.0, "intensity": 1.0}]
@@ -32,6 +34,7 @@ from pathlib import Path
 import numpy as np
 
 from sim.tilemap import (GuardSpec, IdleSpot, Light, Tile, TileMap, _expand,
+                        parse_spawn_points,
                          _parse_interactables, bake_lightmap, compute_roof,
                          darken, lighten, WALL_PEN_COST, WALL_SOUND_COST)
 from sim.tileset import Tileset, load_tileset
@@ -54,6 +57,7 @@ def new_map(cols: int, rows: int, ts: Tileset, name: str = "untitled") -> dict:
         "floor": [[f] * cols for _ in range(rows)],
         "object": [[""] * cols for _ in range(rows)],
         "player_spawn": [1.5, 1.5],
+        "spawn_points": [],
         "guards": [],
         "idle_spots": [],
         "lights": [],
@@ -79,8 +83,8 @@ def load_doc(path: str | Path) -> dict:
 
 
 def _is_special(td) -> bool:
-    """door / window / bush keep their own behaviour and ignore Floor/Wall."""
-    return bool(td.door or td.glass or td.bush)
+    """door / window keep their own behaviour and ignore Floor/Wall."""
+    return bool(td.door or td.glass)
 
 
 def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
@@ -101,7 +105,6 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
     fm = np.ones((rows, cols), dtype=np.float32)
     pc = np.zeros((rows, cols), dtype=np.float32)
     gl = np.zeros((rows, cols), dtype=bool)
-    bu = np.zeros((rows, cols), dtype=bool)
     en = np.zeros((rows, cols), dtype=bool)      # static enclosing tile (no doors)
     dcz = np.zeros((rows, cols), dtype=bool)     # door tile here
 
@@ -117,7 +120,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
             otd = ts[oid] if (oid and oid in ts) else None
 
             if otd is not None and _is_special(otd):
-                # door / window / bush: keep the tile's own semantics
+                # door / window: keep the tile's own semantics
                 bm[r, c] = not otd.is_walkable
                 bs[r, c] = otd.blocks_los
                 bb[r, c] = otd.blocks_shots
@@ -125,8 +128,7 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
                 fm[r, c] = otd.footstep_mult
                 pc[r, c] = otd.pen_cost
                 gl[r, c] = otd.glass
-                bu[r, c] = otd.bush
-                en[r, c] = otd.encloses and not otd.door and not otd.bush
+                en[r, c] = otd.encloses and not otd.door
                 dcz[r, c] = otd.door
                 cell_td, role = otd, "obj"
             elif otd is not None:
@@ -156,8 +158,10 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
                     blocks_move=bool(bm[r, c]), blocks_sight=bool(bs[r, c]),
                     blocks_bullets=bool(bb[r, c]), sound_cost=float(sc[r, c]),
                     footstep_mult=float(fm[r, c]), pen_cost=float(pc[r, c]),
-                    door=bool(dcz[r, c]), glass=bool(gl[r, c]),
-                    bush=bool(bu[r, c]), encloses=bool(en[r, c]),
+                    door=bool(dcz[r, c]),
+                    door_time=float(getattr(cell_td, "door_time", 0.35)),
+                    glass=bool(gl[r, c]),
+                    encloses=bool(en[r, c]),
                     colour=col)
             chars[r, c] = ch
 
@@ -203,8 +207,8 @@ def load_map(path: str | Path, tileset: str | Path | None = None) -> TileMap:
         footstep_mult=_expand(fm, subdiv),
         pen_cost=_expand(pc, subdiv),
         glass=_expand(gl, subdiv),
-        bush=_expand(bu, subdiv),
         player_spawn=tuple(doc.get("player_spawn", (1.5, 1.5))),
+        spawn_points=parse_spawn_points(doc.get("spawn_points")),
         guards=guards,
         idle_spots=idle_spots,
         lights=lights,

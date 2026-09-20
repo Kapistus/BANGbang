@@ -36,6 +36,7 @@ import pygame
 from net import GameClient, GameServer
 from net.protocol import GameMode, ServerState, Team, DEFAULT_PORT
 from net.mappicker import MapPicker
+from sim import sprites
 
 
 # --------------------------------------------------------------------- palette
@@ -53,11 +54,9 @@ BAD = (220, 90, 90)
 TEAM_A = (80, 140, 230)
 TEAM_B = (230, 110, 80)
 
-SWATCHES = [
-    (220, 40, 40), (40, 40, 220), (40, 200, 60), (230, 210, 40),
-    (240, 140, 30), (160, 60, 200), (40, 200, 220), (235, 235, 235),
-    (130, 130, 130), (20, 20, 20),
-]
+# The lobby palette is the sprite palette: picking a swatch here picks which
+# coloured soldier art you wear in the match.
+SWATCHES = list(sprites.SWATCHES)
 
 W, H = 820, 620
 
@@ -145,9 +144,16 @@ class Lobby:
     call handle_event() and draw() each frame. Poll result each frame: if it is
     not None, the lobby is done (START/EXIT/DISCONNECT)."""
 
-    def __init__(self, client: GameClient, fonts, maps_dir="maps"):
+    def __init__(self, client: GameClient, fonts, maps_dir="maps",
+                 auto_join=False):
+        """auto_join: drop straight into a match already in progress. True when
+        the player has just connected — they clicked Connect, they want to play
+        — and False when they have stepped out of a match on purpose and are
+        sitting here deciding whether to go back in."""
         self.cli = client
         self.f_big, self.f, self.f_sm = fonts
+        self.auto_join = auto_join
+        self._join_sent = False
         self.result: LobbyResult | None = None
         self._colour_idx = 0
         self._buttons: list[Button] = []
@@ -201,6 +207,10 @@ class Lobby:
         # host force-start; server still requires >=2 players
         self.cli.force_start()
 
+    def _join_match(self):
+        self._join_sent = True
+        self.cli.join_match()
+
     def _exit(self):
         self.result = LobbyResult.EXIT
 
@@ -234,14 +244,22 @@ class Lobby:
                     self._pick_colour(i)
 
     def pump_events(self):
-        """Drain GameClient events; detect match start / disconnect."""
+        """Drain GameClient events; detect match start / disconnect.
+
+        A match being in progress is no longer the same thing as being in it:
+        a player who stepped out sits here watching the roster until they
+        choose to go back."""
         for e in self.cli.drain_events():
             if e["t"] == "match_start":
                 self.result = LobbyResult.START
             elif e["t"] == "disconnected":
                 self.result = LobbyResult.DISCONNECT
-        if self.cli.world.state == ServerState.MATCH and self.result is None:
+        w = self.cli.world
+        if w.state == ServerState.MATCH and w.playing and self.result is None:
             self.result = LobbyResult.START
+        elif (self.auto_join and not self._join_sent
+              and w.state == ServerState.MATCH and not w.playing):
+            self._join_match()
 
     # ---- layout constants ----
 
@@ -342,12 +360,25 @@ class Lobby:
 
         # ---- bottom bar: ready / host controls / exit ----
         ready_on = bool(me and me.ready)
-        ready_btn = Button(
-            (34, 470, 170, 48),
-            "READY  \u2713" if ready_on else "READY UP",
-            self._toggle_ready, tone=GOOD if ready_on else ACCENT)
-        ready_btn.draw(surf, self.f)
-        self._buttons.append(ready_btn)
+        mid_match = (self.cli.world.state == ServerState.MATCH
+                     and not self.cli.world.playing)
+        if mid_match:
+            # a match is running without us: the only useful button is the one
+            # that puts us in it
+            join_btn = Button((34, 470, 240, 48), "JOIN MATCH IN PROGRESS",
+                              self._join_match, tone=GOOD)
+            join_btn.draw(surf, self.f)
+            self._buttons.append(join_btn)
+            surf.blit(self.f_sm.render(
+                "you will spawn away from the fighting", True, TEXT_DIM),
+                (34, 524))
+        else:
+            ready_btn = Button(
+                (34, 470, 170, 48),
+                "READY  \u2713" if ready_on else "READY UP",
+                self._toggle_ready, tone=GOOD if ready_on else ACCENT)
+            ready_btn.draw(surf, self.f)
+            self._buttons.append(ready_btn)
 
         if w.is_host:
             mode_btn = Button((220, 470, 150, 48), "Mode: "
@@ -646,7 +677,10 @@ def run_lobby(default_ip="", existing_client: GameClient | None = None,
             return LobbyResult.EXIT, None, None
         cli, srv = join.client, join.server
 
-    lobby = Lobby(cli, fonts, maps_dir=maps_dir)
+    # a freshly made connection joins a running match on its own; one handed
+    # back to us (the player stepped out) waits to be asked
+    lobby = Lobby(cli, fonts, maps_dir=maps_dir,
+                  auto_join=existing_client is None)
     while lobby.result is None:
         for ev in pygame.event.get():
             lobby.handle_event(ev)

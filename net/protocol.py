@@ -19,7 +19,14 @@ DEFAULT_PORT = 47801
 # 3: weapons. Input carries the selected weapon and fire mode; the server
 #    resolves shots and broadcasts them, along with sound events, glass it
 #    shattered, and each player's health, shields and ammo.
-PROTOCOL_VERSION = 3
+# 4: joining, leaving and rejoining a match in progress. A connection is no
+#    longer the same thing as playing, so players carry a "playing" flag and a
+#    latecomer is caught up on the map state that has drifted from the file.
+# 5: spawn points are map objects with a facing and an optional team, so
+#    match_start says which way you are looking when you arrive.
+# 6: flashlights. An input bit toggles one, and snapshots carry whose is lit,
+#    because a beam is something everyone else can see coming.
+PROTOCOL_VERSION = 8
 
 
 # ---------------------------------------------------------------- enums
@@ -52,6 +59,8 @@ C_SET_COLOUR = "set_colour"  # {colour}
 C_SET_TEAM = "set_team"      # {team}          (team modes only)
 C_SET_READY = "set_ready"    # {ready}
 C_SET_CONFIG = "set_config"  # host only: {mode?, duration_s?, map_id?}
+C_JOIN_MATCH = "join_match"   # drop me into the match that is already running
+C_LEAVE_MATCH = "leave_match"  # take me out of it, but keep my connection
 C_START = "start"            # host only: force-start ignoring un-ready? (see server)
 C_END_MATCH = "end_match"    # host only
 C_INPUT = "input"            # {seq, mx, my, aim, buttons, wep, mode} in MATCH
@@ -62,19 +71,36 @@ C_INPUT = "input"            # {seq, mx, my, aim, buttons, wep, mode} in MATCH
 S_WELCOME = "welcome"        # {your_id, is_host}
 S_REJECT = "reject"          # {reason}
 S_LOBBY = "lobby"            # {state, mode, duration_s, map_id, host_id, players:[...]}
-S_MATCH_START = "match_start"  # {mode, duration_s, map_id, spawn:{x,y}, team, players:[...]}
+S_MATCH_START = "match_start"  # {mode, duration_s, map_id, spawn:{x,y,aim},
+                               #  team, players:[...]}
 S_SNAPSHOT = "snapshot"      # {tick, time_left, players:[{id,x,y,aim,alive,
-                             #   respawn_in, seq, hp, sh, wep, mag, rl}]}
+                             #   respawn_in, seq, hp, sh, wep, mag, rl, pl}]}
+                             #   pl = playing: connected players sitting out a
+                             #   match have no position worth drawing
                              #   hp/sh = health and shields, 0..1 of maximum
                              #   wep   = weapon index, mag = rounds in it
                              #   rl    = reloading (seconds left, 0 = not)
+                             #   fl    = flashlight lit: everyone can see a
+                             #           beam, so everyone is told about it
 S_SHOT = "shot"              # {id, x, y, heading, wep, charge, segs, impact,
                              #   blast}  one trigger pull, for tracers, muzzle
                              #   flash and the sound it makes
 S_SOUND = "sound"            # {x, y, energy, clip, label, id, stance}  something
                              #   audible happened here; the client's own
                              #   propagation field decides what it can hear
-S_DOOR = "door"              # {r, c, open, id, blocked}  a door moved, or
+S_MAP_STATE = "map_state"    # {doors: [[r, c, open, left], ...],
+                             #    glass: [[r, c], ...],
+                             #    pickups: [[id, live, left], ...]}  `left` is seconds of
+                             #   travel still to run, so a latecomer picks up a
+                             #   blast door already four seconds into its move
+                             #   everything about the map that has drifted from
+                             #   the file since the match began. Sent to a
+                             #   latecomer, who would otherwise be shooting at
+                             #   windows that are no longer there.
+S_PICKUP = "pickup"          # {pid, live, by, dur}  a health or ammo pack was
+                             #   taken, or came back. The server decides who
+                             #   reached it first; clients only draw it.
+S_DOOR = "door"              # {r, c, open, dur, id, blocked}  a door moved, or
                              #   someone tried and couldn't. Doors change
                              #   sight, sound and bullets, so like glass the
                              #   server owns the toggle and everyone applies it.
@@ -99,6 +125,7 @@ BTN_INTERACT = 1 << 1
 BTN_RELOAD = 1 << 2
 BTN_RUN = 1 << 3          # shift: sprint
 BTN_CRAWL = 1 << 4        # ctrl: crawl. Wins if both are held.
+BTN_LIGHT = 1 << 5        # flashlight, toggled on the press
 # reserve more bits as the sim grows
 
 

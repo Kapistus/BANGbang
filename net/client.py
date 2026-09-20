@@ -40,6 +40,7 @@ class RemotePlayer:
     team: Team = Team.NONE
     ready: bool = False
     is_host: bool = False
+    playing: bool = False       # in the current match, as opposed to sitting out
     # match state (interpolation buffer)
     x: float = 0.0
     y: float = 0.0
@@ -54,6 +55,7 @@ class RemotePlayer:
     wep: int = 0                # weapon index in their loadout
     mag: int = 0                # rounds left in it
     reload_t: float = 0.0       # seconds of reload remaining, 0 = not
+    flashlight: bool = False    # their beam is lit
     charge: float = 0.0         # rail spool-up, seconds
     # previous snapshot for interpolation
     prev_x: float = 0.0
@@ -98,11 +100,20 @@ class World:
     host_id: int | None = None
     my_id: int | None = None
     is_host: bool = False
+    playing: bool = False       # are WE in the match, or watching from the lobby
     my_spawn: tuple | None = None
+    my_spawn_aim: float | None = None    # which way the spawn point faces
     my_team: Team = Team.NONE
     time_left: float = 0.0
     end_count: int | None = None
     players: dict[int, RemotePlayer] = field(default_factory=dict)
+    # the map as it stands now, for a client that arrived after it changed.
+    # Held on the world rather than only fired as an event, because it lands
+    # while the lobby screen is draining events and the match render that needs
+    # it does not exist yet.
+    map_doors: list = field(default_factory=list)  # (row, col, is_open, left)
+    map_pickups: list = field(default_factory=list)   # (id, live, left)
+    map_glass: list = field(default_factory=list)    # (row, col) broken
     killfeed: list[KillFeedEntry] = field(default_factory=list)
     team_scores: dict[int, int] = field(default_factory=dict)
 
@@ -192,6 +203,14 @@ class GameClient:
             msg["map_id"] = map_id
         self._send(msg)
 
+    def join_match(self) -> None:
+        """Ask to be dropped into the match already in progress."""
+        self._send({"t": P.C_JOIN_MATCH})
+
+    def leave_match(self) -> None:
+        """Step out of the match but stay connected, so you can rejoin it."""
+        self._send({"t": P.C_LEAVE_MATCH})
+
     def force_start(self) -> None:
         self._send({"t": P.C_START})
 
@@ -233,7 +252,16 @@ class GameClient:
         while self._running:
             try:
                 msg = P.recv_msg(self.sock)
-            except (OSError, ValueError):
+            except OSError as e:
+                self.reject_reason = self.reject_reason or f"connection lost: {e}"
+                break
+            except ValueError as e:
+                # A frame we could not decode. Swallowing this silently ends
+                # the receive thread and the client simply stops hearing from
+                # the server with no explanation at all — which is exactly how
+                # an int-keyed team_scores dict hid for as long as it did.
+                self.reject_reason = f"bad frame from server: {e}"
+                print(f"[client] {self.reject_reason}")
                 break
             if msg is None:
                 break
@@ -271,6 +299,9 @@ class GameClient:
                     p.team = Team(pd["team"])
                     p.ready = pd["ready"]
                     p.is_host = pd["is_host"]
+                    p.playing = pd.get("playing", False)
+                    if pid == w.my_id:
+                        w.playing = p.playing
                     w.players[pid] = p
                 for pid in list(w.players):
                     if pid not in seen:
@@ -283,7 +314,9 @@ class GameClient:
                 w.duration_s = msg["duration_s"]
                 w.map_id = msg["map_id"]
                 w.my_spawn = (msg["spawn"]["x"], msg["spawn"]["y"])
+                w.my_spawn_aim = msg["spawn"].get("aim")
                 w.my_team = Team(msg["team"])
+                w.playing = True
                 w.end_count = None
                 w.killfeed.clear()
                 for pd in msg["players"]:
@@ -311,11 +344,15 @@ class GameClient:
                     p.acked_seq = pd.get("seq", -1)
                     p.alive = pd["alive"]
                     p.respawn_in = pd["respawn_in"]
+                    p.playing = pd.get("pl", True)
+                    if pid == w.my_id:
+                        w.playing = p.playing
                     p.hp = pd.get("hp", 1.0)
                     p.sh = pd.get("sh", 0.0)
                     p.wep = pd.get("wep", 0)
                     p.mag = pd.get("mag", 0)
                     p.reload_t = pd.get("rl", 0.0)
+                    p.flashlight = pd.get("fl", False)
                     p.charge = pd.get("chg", 0.0)
                     p.snap_t = now
 
@@ -359,12 +396,38 @@ class GameClient:
                     "at": now,
                 })
 
+            elif t == P.S_MAP_STATE:
+                # joining late: the doors and windows as they stand now, not as
+                # the map file has them
+                w.map_doors = [(int(row[0]), int(row[1]), bool(row[2]),
+                                float(row[3]) if len(row) > 3 else 0.0)
+                               for row in msg.get("doors", [])]
+                w.map_glass = [(int(r), int(c)) for r, c in msg.get("glass", [])]
+                w.map_pickups = [(str(row[0]), bool(row[1]),
+                                  float(row[2]) if len(row) > 2 else 0.0)
+                                 for row in msg.get("pickups", [])]
+                self._events.append({"t": "map_state", "doors": w.map_doors,
+                                     "glass": w.map_glass,
+                                     "pickups": w.map_pickups})
+
+            elif t == P.S_PICKUP:
+                # a pack was taken or came back. The server owns this
+                # completely: there is nothing to predict and nothing to
+                # argue with.
+                self._events.append({
+                    "t": "pickup", "pid": str(msg.get("pid", "")),
+                    "live": bool(msg.get("live", True)),
+                    "by": msg.get("by", 0),
+                    "dur": float(msg.get("dur", 0.0)),
+                })
+
             elif t == P.S_DOOR:
                 # a door moved, or somebody tried and was refused. Every client
                 # applies the same toggle, or their walls stop matching.
                 self._events.append({
                     "t": "door", "r": msg["r"], "c": msg["c"],
                     "open": bool(msg.get("open", False)),
+                    "dur": float(msg.get("dur", 0.0)),
                     "id": msg.get("id", 0),
                     "blocked": bool(msg.get("blocked", False)),
                 })

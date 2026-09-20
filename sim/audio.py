@@ -188,12 +188,61 @@ def _knock(rng: random.Random) -> np.ndarray:
     return _norm(x)
 
 
-def _door(rng: random.Random) -> np.ndarray:
-    n = int(0.22 * SR)
+def _sweep(f0: float, f1: float, n: int) -> np.ndarray:
+    """A sine gliding from f0 to f1 over n samples — a servo spinning up or
+    winding down."""
+    t = np.arange(n) / SR
+    f = np.linspace(f0, f1, n)
+    return np.sin(2.0 * np.pi * np.cumsum(f) / SR)
+
+
+def _slide(rng: random.Random, dur: float, heavy: bool) -> np.ndarray:
+    """A powered door moving: the pneumatic release, the servo carrying the
+    panels, and the clunk of them arriving home.
+
+    The old clip was a wooden thud plus a rumble, which is what a door on
+    hinges sounds like. These are panels on rails, so the body of the sound is
+    the travel itself — and a blast door's travel is long enough to hear all
+    the way through."""
+    n = int(dur * SR)
     r = np.random.default_rng(rng.randrange(1 << 30))
-    x = (_sine(rng.uniform(80, 100), n) * 0.8
-         + _lp(r.uniform(-1, 1, n), 10) * 0.35) * _decay(n, 0.05)
-    return _norm(x)
+
+    # release: a sharp hiss of pressure at the start
+    hiss_n = min(n, int(0.16 * SR))
+    hiss = np.zeros(n)
+    hiss[:hiss_n] = (r.uniform(-1, 1, hiss_n) - _lp(r.uniform(-1, 1, hiss_n), 14)
+                     ) * _decay(hiss_n, 0.05 if not heavy else 0.09)
+
+    # travel: a servo whine under a bed of rolling noise, both fading in and
+    # out so the clip has a middle rather than two ends
+    body = np.zeros(n)
+    t0, t1 = int(n * 0.06), int(n * 0.93)
+    tn = max(1, t1 - t0)
+    ramp = np.sin(np.linspace(0.0, np.pi, tn)) ** 0.6
+    lo = rng.uniform(58, 74) if heavy else rng.uniform(150, 185)
+    servo = _sweep(lo * 0.82, lo, tn) * (0.55 if heavy else 0.4)
+    roll = _lp(r.uniform(-1, 1, tn), 26 if heavy else 12) * (0.5 if heavy else 0.3)
+    body[t0:t1] = (servo + roll) * ramp
+
+    # arrival: the panels seating in the jamb
+    clunk = np.zeros(n)
+    cn = min(n, int(0.12 * SR))
+    if cn > 8:
+        seat = (_sine(rng.uniform(52, 68) if heavy else rng.uniform(96, 124), cn)
+                * _decay(cn, 0.035) * (1.0 if heavy else 0.7))
+        clunk[n - cn:] = seat
+
+    return _norm(np.tanh((hiss * 0.5 + body + clunk) * 1.3))
+
+
+def _door(rng: random.Random) -> np.ndarray:
+    return _slide(rng, 0.42, heavy=False)
+
+
+def _door_heavy(rng: random.Random) -> np.ndarray:
+    # as long as the panels take: a blast door you can hear finish is a blast
+    # door you can count down
+    return _slide(rng, 5.0, heavy=True)
 
 
 def _glass(rng: random.Random) -> np.ndarray:
@@ -231,6 +280,7 @@ _RECIPES = {
     "magazine":      (lambda rng: _clicks(rng, 2, 0.05, False), 3),
     "knock":         (_knock, 2),
     "door":          (_door, 2),
+    "door_heavy":    (_door_heavy, 1),
     "glass":         (_glass, 3),
     "dryfire":       (_dry, 2),
 }

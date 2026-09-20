@@ -30,7 +30,10 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from sim import ballistics, combat, movement, perception, weapons
-from sim.tilemap import break_glass_cells, find_doors, set_door
+from sim.doors import DoorSet
+from sim.pickups import PickupSet
+from sim import pickups as pk
+from sim.tilemap import break_glass_cells, set_door
 
 from . import maps as netmaps
 from . import protocol as P
@@ -51,6 +54,24 @@ MIN_PLAYERS_TO_START = 2
 # the same order. The server takes at most one per tick, so a client that sends
 # faster than the tick rate gains no speed — its surplus is simply dropped.
 INPUT_QUEUE_MAX = 4
+
+# Sending. The tick loop must never block on a socket: one player whose
+# connection backs up — wifi hiccup, a laptop going to sleep, a client paused in
+# a debugger — would otherwise freeze the simulation for everybody else. Each
+# connection has an outbox drained by its own thread, and the tick loop only
+# ever appends to it.
+SEND_QUEUE_SOFT = 48      # past this, shed: stale snapshots first, then effects
+SEND_QUEUE_HARD = 256     # past this the client is not reading at all: cut it
+SENDER_POLL_S = 0.5       # how often an idle sender wakes to check for shutdown
+
+# Only the newest of these matters — an old snapshot is worthless once a newer
+# one exists, so the queue keeps one.
+COALESCE_TYPES = frozenset({P.S_SNAPSHOT})
+# Losing one of these costs a tracer, a footstep or a muzzle flash. Everything
+# NOT listed here is state — lobby rosters, match start, kills, scores, doors,
+# glass — and is delivered or the connection is dropped, because a client that
+# misses a door opening is playing a different game from everyone else.
+DROPPABLE_TYPES = frozenset({P.S_SHOT, P.S_SOUND})
 
 # Weapon handling. These mirror main.py, which is the reference implementation
 # of how the guns feel; the server owns them because a client that decided its
@@ -75,6 +96,10 @@ class NetPlayer:
     team: Team = Team.NONE
     ready: bool = False
     is_host: bool = False
+    # Connected is not the same as playing. A latecomer sits here until they
+    # are dropped in, and someone who leaves a match sits here again rather
+    # than losing their connection.
+    playing: bool = False
     # match state
     x: float = 0.0
     y: float = 0.0
@@ -97,9 +122,11 @@ class NetPlayer:
     swap_t: float = 0.0
     charging: bool = False      # rail weapon spooling up
     charge: float = 0.0         # seconds held so far
+    flashlight: bool = False    # lit? everyone can see a beam, so it is shared
     firing_was: bool = False    # last tick's trigger, for press/release edges
     reload_was: bool = False
     interact_was: bool = False
+    light_was: bool = False
     step_dist: float = 0.0      # metres since this player's last footstep
 
     # input: queued commands, plus the last one applied (what the sim reads)
@@ -112,15 +139,85 @@ class NetPlayer:
     buttons: int = 0
     last_seq: int = -1          # highest seq RECEIVED (dedupe/reorder guard)
     acked_seq: int = -1         # highest seq APPLIED (what snapshots report)
-    _send_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    # outbound: appended by the tick loop, drained by this player's own thread
+    out: deque = field(default_factory=deque)
+    dropped_msgs: int = 0       # shed under backpressure, for diagnostics
+    _out_cv: threading.Condition = field(default_factory=threading.Condition)
+    _sender: object = None
+    _dead: bool = False
 
     def send(self, obj: dict) -> bool:
+        """Queue a message for this player. Never touches the socket, so a
+        stalled connection costs this player their backlog and nobody else
+        their frame rate. False means the connection is finished."""
+        with self._out_cv:
+            if self._dead:
+                return False
+            if obj.get("t") in COALESCE_TYPES:
+                # A snapshot is a complete picture of the world, so an older one
+                # queued behind it is worthless — it never waits in line. This
+                # has to happen on every append, not only once the queue is
+                # deep: while a stalled sender sits in sendall the outbox looks
+                # empty, and stale snapshots would pile up under the cap.
+                for i in range(len(self.out) - 1, -1, -1):
+                    if self.out[i].get("t") == obj["t"]:
+                        del self.out[i]
+                        self.dropped_msgs += 1
+            self.out.append(obj)
+            if len(self.out) > SEND_QUEUE_SOFT:
+                self._shed_locked()
+            if len(self.out) > SEND_QUEUE_HARD:
+                # nothing is being read at the far end; further patience just
+                # costs memory
+                self._dead = True
+                self._out_cv.notify_all()
+                return False
+            self._out_cv.notify()
+        return True
+
+    def _shed_locked(self) -> None:
+        """Make room by dropping effects, oldest first. Snapshots have already
+        coalesced to one on the way in."""
+        i = 0
+        while len(self.out) > SEND_QUEUE_SOFT and i < len(self.out):
+            if self.out[i].get("t") in DROPPABLE_TYPES:
+                del self.out[i]
+                self.dropped_msgs += 1
+            else:
+                i += 1                          # state: must be delivered
+
+    def start_sender(self) -> None:
+        self._sender = threading.Thread(target=self._send_loop, daemon=True)
+        self._sender.start()
+
+    def _send_loop(self) -> None:
+        """Blocking sends live here, where blocking only affects this player."""
+        while True:
+            with self._out_cv:
+                while not self.out and not self._dead:
+                    self._out_cv.wait(SENDER_POLL_S)
+                if self._dead and not self.out:
+                    break
+                batch = list(self.out)
+                self.out.clear()
+            try:
+                for obj in batch:
+                    P.send_msg(self.sock, obj)
+            except OSError:
+                with self._out_cv:
+                    self._dead = True
+                break
         try:
-            with self._send_lock:
-                P.send_msg(self.sock, obj)
-            return True
+            self.sock.close()       # unblocks this player's receive thread too
         except OSError:
-            return False
+            pass
+
+    def close(self) -> None:
+        with self._out_cv:
+            self._dead = True
+            self.out.clear()
+            self._out_cv.notify_all()
 
 
 class GameServer:
@@ -137,7 +234,7 @@ class GameServer:
         """spawn_points=None (the normal case) derives them from the map. Pass
         a list to pin them — tests do this to place players deliberately; pinned
         spawns survive a map change, derived ones follow it."""
-        self.spawn_points = list(spawn_points) if spawn_points else []
+        self.spawn_points = netmaps.as_spawn_list(spawn_points)
         self._spawns_pinned = bool(spawn_points)
         self.maps_dir = maps_dir or netmaps.DEFAULT_MAPS_DIR
         self.map = None                    # TileMap: geometry players collide with
@@ -165,7 +262,8 @@ class GameServer:
         self._threads: list[threading.Thread] = []
 
         self._rng = random.Random()
-        self.doors: dict = {}              # coarse (row, col) -> is_open
+        self.doors = DoorSet()             # every doorway and what it is doing
+        self.packs = PickupSet()           # health and ammo on the map
         self._broken_glass: set = set()    # coarse cells already shattered
         self._projectiles: list = []       # rockets in flight
 
@@ -198,13 +296,16 @@ class GameServer:
             return False
         with self._lock:
             self.map = m
-            self.doors = find_doors(m)
+            self.doors = DoorSet(m)
+            self.packs = PickupSet(m)
             self._map_loaded_id = map_id
             if not self._spawns_pinned:
                 self.spawn_points = spawns
             n = len(self.spawn_points)
+            authored = sum(1 for sp in self.spawn_points if sp in m.spawn_points)
         print(f"[server] map {map_id}: {m.name} "
-              f"{m.width_m:.0f}x{m.height_m:.0f}m, {n} spawn points")
+              f"{m.width_m:.0f}x{m.height_m:.0f}m, {n} spawn points "
+              f"({'authored' if authored else 'derived'})")
         return True
 
     # ---------------------------------------------------------------- lifecycle
@@ -225,6 +326,7 @@ class GameServer:
         self._running = False
         with self._lock:
             for p in list(self.players.values()):
+                p.close()
                 try:
                     p.sock.close()
                 except OSError:
@@ -294,9 +396,6 @@ class GameServer:
             P.send_msg(sock, {"t": P.S_REJECT, "reason": "version mismatch"})
             return None
         with self._lock:
-            if self.state != ServerState.LOBBY:
-                P.send_msg(sock, {"t": P.S_REJECT, "reason": "match in progress"})
-                return None
             pid = self._next_id
             self._next_id += 1
             is_host = self.host_id is None
@@ -309,9 +408,26 @@ class GameServer:
                 is_host=is_host,
             )
             self.players[pid] = p
+            p.start_sender()
             p.send({"t": P.S_WELCOME, "your_id": pid, "is_host": is_host})
+            mid_match = self.state != ServerState.LOBBY
+            if mid_match:
+                # Catch them up on everything about the map that has drifted
+                # from the file: a door someone opened, a window someone shot
+                # out. Without this they would be walking into walls that are
+                # no longer there and shooting at glass that already broke.
+                p.send(self._map_state_locked())
         self._broadcast_lobby()
+        with self._lock:
+            self._broadcast_score()
         return pid
+
+    def _map_state_locked(self) -> dict:
+        # caller holds _lock
+        return {"t": P.S_MAP_STATE,
+                "doors": self.doors.wire(),
+                "pickups": self.packs.wire(),
+                "glass": [[r, c] for (r, c) in sorted(self._broken_glass)]}
 
     def _remove_players_locked(self, pids: list[int]) -> bool:
         """Remove players by id and migrate host if needed. Returns True if
@@ -321,6 +437,7 @@ class GameServer:
         for pid in pids:
             p = self.players.pop(pid, None)
             if p is not None:
+                p.close()
                 changed = True
                 if p.is_host:
                     host_gone = True
@@ -342,6 +459,7 @@ class GameServer:
 
     def _handle_msg(self, pid: int, msg: dict) -> None:
         t = msg.get("t")
+        joined = left = False
         with self._lock:
             p = self.players.get(pid)
             if p is None:
@@ -370,8 +488,22 @@ class GameServer:
 
             if self.state != ServerState.LOBBY:
                 # lobby-only settings ignored mid-match, except host end_match
+                # and a player coming or going
                 if t == P.C_END_MATCH and p.is_host and self.state == ServerState.MATCH:
                     self._begin_end_countdown()
+                elif t == P.C_JOIN_MATCH and self.state == ServerState.MATCH:
+                    if not p.playing:
+                        self._join_match_locked(p)
+                        joined = True
+                elif t == P.C_LEAVE_MATCH and p.playing:
+                    self._leave_match_locked(p)
+                    left = True
+                if joined or left:
+                    self._broadcast_lobby_locked()
+                    self._broadcast_score()
+                    if left and not any(q.playing for q in self.players.values()):
+                        # everyone walked out; no sense running an empty match
+                        self._begin_end_countdown()
                 return
 
             # ---- lobby settings ----
@@ -439,28 +571,36 @@ class GameServer:
             return
         if self.map is None or self._map_loaded_id != self.map_id:
             self._load_map()          # _lock is an RLock; re-entry is fine
-        if len(self.spawn_points) < len(ps):
-            # not enough unique spawns; allow reuse but warn via reject-less log
+        # one spawn each where possible, from each player's own pool in team
+        # modes, and never two people materialising on the same spot
+        chosen, used = [], []
+        for q in ps:
+            team = q.team if self.mode == GameMode.TEAM else None
+            pool = netmaps.for_team(self.spawn_points, team)
+            free = [sp for sp in pool if sp not in used] or pool
+            sp = random.choice(free)
+            used.append(sp)
+            chosen.append(sp)
+        if len(set(id(sp) for sp in chosen)) < len(ps):
             print(f"[server] WARNING: {len(self.spawn_points)} spawns < "
                   f"{len(ps)} players; spawns will repeat")
-            chosen = [random.choice(self.spawn_points) for _ in ps]
-        else:
-            chosen = random.sample(self.spawn_points, len(ps))
         now = time.monotonic()
-        if self._broken_glass or any(self.doors.values()):
+        if self._broken_glass or any(self.doors.values()) \
+                or self.doors.moving_keys():
             # a new match gets its windows and doors back as the map authored
             # them
             self._broken_glass.clear()
             self._load_map()
         self._projectiles.clear()
-        for q, (sx, sy) in zip(ps, chosen):
-            q.x, q.y = float(sx), float(sy)
-            q.aim = 0.0
+        for q, sp in zip(ps, chosen):
+            q.x, q.y = float(sp.x), float(sp.y)
+            q.aim = math.radians(sp.facing_deg)
             q.alive = True
             q.respawn_at = None
             q.kills = 0
             q.ready = False
             q.firing_was = False
+            q.playing = True
             q.inputs.clear()
             self._spawn_body(q)
         self.state = ServerState.MATCH
@@ -474,11 +614,70 @@ class GameServer:
                 "mode": int(self.mode),
                 "duration_s": self.duration_s,
                 "map_id": self.map_id,
-                "spawn": {"x": q.x, "y": q.y},
+                "spawn": {"x": q.x, "y": q.y, "aim": round(q.aim, 3)},
                 "team": int(q.team),
                 "players": roster,
             })
         self._broadcast_score()
+
+    def _spawn_for(self, p: NetPlayer, top: int = 1):
+        """A spawn point for this player: from their side's pool in team modes,
+        and as far from everyone still fighting as the map allows.
+
+        Dropping a latecomer into a firefight — or worse, into somebody's line
+        of fire while they are mid-burst — is what makes joining late feel
+        unfair."""
+        team = p.team if self.mode == GameMode.TEAM else None
+        away = [(q.x, q.y) for q in self.players.values()
+                if q.playing and q.alive and q.id != p.id]
+        return netmaps.pick(self.spawn_points, team=team, away_from=away,
+                            rng=self._rng, top=top)
+
+    def _join_match_locked(self, p: NetPlayer) -> None:
+        """Drop a connected player into the match that is already running."""
+        if self.mode == GameMode.TEAM:
+            # put them on the thinner side, whatever they picked in the lobby
+            counts = {Team.A: 0, Team.B: 0}
+            for q in self.players.values():
+                if q.playing and q.team in counts:
+                    counts[q.team] += 1
+            p.team = Team.A if counts[Team.A] <= counts[Team.B] else Team.B
+        sp = self._spawn_for(p)
+        p.x, p.y = float(sp.x), float(sp.y)
+        p.aim = math.radians(sp.facing_deg)
+        p.playing = True
+        p.alive = True
+        p.respawn_at = None
+        p.firing_was = False
+        p.inputs.clear()
+        self._spawn_body(p)
+        roster = [{"id": q.id, "name": q.name, "colour": list(q.colour),
+                   "team": int(q.team)}
+                  for q in self.players.values() if q.playing]
+        # the map may have moved on since they last saw it — or since they
+        # connected, if they have been sitting in the lobby a while
+        p.send(self._map_state_locked())
+        p.send({
+            "t": P.S_MATCH_START,
+            "mode": int(self.mode),
+            "duration_s": self.duration_s,
+            "map_id": self.map_id,
+            "spawn": {"x": p.x, "y": p.y, "aim": round(p.aim, 3)},
+            "team": int(p.team),
+            "players": roster,
+        })
+
+    def _leave_match_locked(self, p: NetPlayer) -> None:
+        """Take a player out of the match without dropping their connection.
+        Their score stays on the board until the match ends."""
+        p.playing = False
+        p.alive = False
+        p.respawn_at = None
+        p.body = None
+        p.inputs.clear()
+        p.buttons = 0
+        p.charging = False
+        p.charge = 0.0
 
     def _begin_end_countdown(self) -> None:
         # caller holds _lock
@@ -492,6 +691,7 @@ class GameServer:
         self.state = ServerState.LOBBY
         for q in self.players.values():
             q.alive = False
+            q.playing = False
             q.respawn_at = None
             q.ready = False
             q.kills = 0
@@ -524,8 +724,68 @@ class GameServer:
             else:
                 next_t = time.monotonic()          # fell behind; resync
 
-    def _tick_match(self, now: float) -> None:
+    def _step_doors(self, dt: float, now: float) -> None:
+        """Move every door that is travelling, and apply the ones that arrive.
+
+        A door in motion is still a wall: `set_door` is called at the end of
+        the travel and nowhere else, which is what makes the blast door's five
+        seconds cost something."""
+        for (r, c), is_open, changed in self.doors.step(dt):
+            if changed:
+                set_door(self.map, None, r, c, is_open)
+            if self.doors.door((r, c)).heavy:
+                # the panels seating: a second, quieter cue that it is done
+                self._sound(c + 0.5, r + 0.5, DOOR_SOUND_M * 0.6, "door",
+                            0, label="door")
+
+    def _step_pickups(self, dt: float, now: float) -> None:
+        """Respawn the packs whose time is up, then hand out any a live player
+        is standing on.
+
+        The server is the only thing that decides this. Two players reaching a
+        pack on the same tick is not a tie — the first one this loop reaches
+        takes it, and `PickupSet.take` returns False for the second."""
+        for pid in self.packs.step(dt):
+            self._broadcast({"t": P.S_PICKUP, "pid": pid, "live": True,
+                             "by": 0, "dur": 0.0})
+        if not self.packs.packs:
+            return
         for p in self.players.values():
+            if not (p.playing and p.alive and p.body is not None):
+                continue
+            got = self.packs.at(p.x, p.y)
+            if got is None:
+                continue
+            if not self._apply_pack(p, got):
+                continue                  # full up: leave it for somebody else
+            if not self.packs.take(got.id):
+                continue                  # somebody beat them to it this tick
+            self._broadcast({"t": P.S_PICKUP, "pid": got.id, "live": False,
+                             "by": p.id, "dur": round(got.respawn_s, 2)})
+            self._sound(got.x, got.y, perception.MAGDROP_REACH_M, "reload",
+                        p.id, label=f"{p.id}/reload")
+
+    def _apply_pack(self, p: NetPlayer, got) -> bool:
+        """Give a player a pack. False if it would do nothing."""
+        if got.kind == pk.HEALTH:
+            gain = pk.health_gain(p.body)
+            if gain is None:
+                return False
+            p.body.health = gain
+            p.hp = gain
+            return True
+        gain = pk.ammo_gain(p.loadout, p.reserves, weapons.ROSTER)
+        if gain is None:
+            return False
+        p.reserves = gain
+        return True
+
+    def _tick_match(self, now: float) -> None:
+        self._step_doors(TICK_DT, now)
+        self._step_pickups(TICK_DT, now)
+        for p in self.players.values():
+            if not p.playing:
+                continue                  # connected, but sitting this one out
             if not p.alive:
                 if p.respawn_at is not None and now >= p.respawn_at:
                     self._respawn(p)
@@ -679,6 +939,11 @@ class GameServer:
             if p.reload_t <= 0.0:
                 self._finish_reload(p, w)
 
+        want_light = bool(p.buttons & P.BTN_LIGHT)
+        if want_light and not p.light_was:
+            p.flashlight = not p.flashlight
+        p.light_was = want_light
+
         want_use = bool(p.buttons & P.BTN_INTERACT)
         if want_use and not p.interact_was:
             self._interact(p, now)
@@ -696,7 +961,10 @@ class GameServer:
                 best, bd = (r, c), d
         if best is None:
             return
-        want_open = not self.doors[best]
+        door = self.doors.door(best)
+        if door.moving:
+            return                        # once a blast door starts, it finishes
+        want_open = not door.is_open
         if not want_open:
             # closing: nobody may be standing in the leaf, including the person
             # pulling it shut
@@ -711,12 +979,21 @@ class GameServer:
                                      "open": True, "id": p.id,
                                      "blocked": True})
                     return
-        self.doors[best] = want_open
-        set_door(self.map, None, best[0], best[1], want_open)
+        moved, changed = self.doors.begin(best, want_open)
+        if moved is None:
+            return
+        if changed:
+            # sealing: the gap closes the moment the panels move
+            set_door(self.map, None, best[0], best[1], moved.is_open)
+        # The panels start moving NOW; the wall stops being a wall when they
+        # arrive (_step_doors). Clients are told how long the travel takes and
+        # run the same clock, so nobody has to be told again when it lands.
         self._broadcast({"t": P.S_DOOR, "r": best[0], "c": best[1],
-                         "open": want_open, "id": p.id, "blocked": False})
-        self._sound(best[1] + 0.5, best[0] + 0.5, DOOR_SOUND_M, "door", p.id,
-                    label=f"{p.id}/door")
+                         "open": want_open, "dur": round(door.dur, 3),
+                         "id": p.id, "blocked": False})
+        clip = "door_heavy" if door.heavy else "door"
+        self._sound(best[1] + 0.5, best[0] + 0.5, DOOR_SOUND_M, clip, p.id,
+                    label=f"{p.id}/{clip}")
 
     def _finish_reload(self, p: NetPlayer, w) -> None:
         if w.shell_reload:
@@ -949,9 +1226,11 @@ class GameServer:
 
     def _respawn(self, p: NetPlayer) -> None:
         p.inputs.clear()          # commands aimed at where they used to be
-        sx, sy = random.choice(self.spawn_points)
-        p.x, p.y = float(sx), float(sy)
-        p.aim = 0.0
+        # a few options rather than the single furthest one: always coming back
+        # to the same corner is an invitation to be camped
+        sp = self._spawn_for(p, top=3)
+        p.x, p.y = float(sp.x), float(sp.y)
+        p.aim = math.radians(sp.facing_deg)
         p.alive = True
         p.respawn_at = None
         p.buttons = 0
@@ -972,7 +1251,8 @@ class GameServer:
     def _broadcast_lobby_locked(self) -> None:
         roster = [{"id": p.id, "name": p.name, "colour": list(p.colour),
                    "team": int(p.team), "ready": p.ready,
-                   "is_host": p.is_host} for p in self.players.values()]
+                   "is_host": p.is_host, "playing": p.playing}
+                  for p in self.players.values()]
         self._broadcast({
             "t": P.S_LOBBY, "state": int(self.state), "mode": int(self.mode),
             "duration_s": self.duration_s, "map_id": self.map_id,
@@ -989,7 +1269,8 @@ class GameServer:
         with self._lock:
             roster = [{"id": p.id, "name": p.name, "colour": list(p.colour),
                        "team": int(p.team), "ready": p.ready,
-                       "is_host": p.is_host} for p in self.players.values()]
+                       "is_host": p.is_host, "playing": p.playing}
+                      for p in self.players.values()]
             self._broadcast({
                 "t": P.S_LOBBY,
                 "state": int(self.state),
@@ -1014,6 +1295,8 @@ class GameServer:
                        if p.body else 0.0),
                 "sh": (round(p.body.shields / p.body.max_shields, 3)
                        if p.body and p.body.max_shields > 0 else 0.0),
+                "pl": p.playing,
+                "fl": p.flashlight,
                 "wep": p.wi,
                 "mag": p.mags[p.wi] if p.mags else 0,
                 "rl": round(p.reload_t, 2),
@@ -1031,9 +1314,15 @@ class GameServer:
         # caller holds _lock
         scores = [{"id": p.id, "name": p.name, "team": int(p.team),
                    "kills": p.kills} for p in self.players.values()]
-        team_scores = {}
+        # Keys are strings on purpose. msgpack refuses integer map keys on
+        # unpack (strict_map_key), so a team-numbered dict here raises a
+        # ValueError inside the client's receive loop, which quietly ends that
+        # thread — the client stops receiving ANYTHING and just sits there.
+        # This only ever fired in team modes, which is why it went unnoticed.
+        team_scores: dict[str, int] = {}
         if self.mode == GameMode.TEAM:
             for p in self.players.values():
-                team_scores[int(p.team)] = team_scores.get(int(p.team), 0) + p.kills
+                key = str(int(p.team))
+                team_scores[key] = team_scores.get(key, 0) + p.kills
         self._broadcast({"t": P.S_SCORE, "mode": int(self.mode),
                          "scores": scores, "team_scores": team_scores})
