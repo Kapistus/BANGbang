@@ -83,11 +83,16 @@ class Match:
         """Wait out the last throw's recovery, holding the same weapon the
         next one will use: holding fire while the weapon is blocked - by the
         recovery or by a weapon swap the wep number started - cooks nothing,
-        which reads as a much shorter fuse."""
+        which reads as a much shorter fuse. A respawn puts the knife back in
+        his hands, so the swap has to be asked for and then waited out, not
+        only waited out."""
+        self.hold(self.a, 0.5, wep=wep)      # ask for it, and let it start
         t0 = time.monotonic()
         while ((self.pa.fire_cd > 0.0 or self.pa.swap_t > 0.0)
                and time.monotonic() - t0 < 3.0):
             self.hold(self.a, 0.05, wep=wep)
+        assert self.pa.wi == wep, \
+            f"weapon {wep} never came up: still holding {self.pa.wi}"
 
     def swing(self, aim=0.0, wep=0):
         """One swing, then wait out the blade's own recovery - swinging again
@@ -112,7 +117,8 @@ def kit_test():
     nade = weapons.ROSTER["frag_grenade"]
     assert knife.is_melee and knife.backstab > 1.0
     assert nade.fuse_s > 0.0 and nade.blast_r > 0.0
-    assert nade.mag + nade.reserve == 3, "three grenades, ever"
+    assert nade.single_load and nade.mag == 3, \
+        "three grenades on a belt, with no reload to get more"
     print("\nKIT CHECKS PASSED")
 
 
@@ -181,6 +187,12 @@ def grenade_test():
         p.wi = NADE
         p.x, p.y = SPOT
         q.x, q.y = SPOT[0] + 4.0, SPOT[1]
+        # a deep pool: one of these kills a real body outright now, and a
+        # target that dies respawns at the other end of the range, where the
+        # next throw of the test measures nothing at all. Lethality is checked
+        # on a real body at the end.
+        q.body.max_health = 5000.0
+        q.body.health = 5000.0
         q.body.shields = 0.0
         before = q.body.health
         t0 = time.monotonic()
@@ -197,13 +209,14 @@ def grenade_test():
         print(f"  a quick throw 4 m: went off {hurt_at:.2f}s later for "
               f"{before - q.body.health:.0f} damage (fuse {nade.fuse_s}s)")
         assert hurt_at > nade.fuse_s * 0.5, "it went off far too early"
-        assert p.mags[NADE] == 0 and p.reserves[NADE] == 2, "the belt did not count"
+        assert p.mags[NADE] == 2, \
+            f"the belt did not count: {p.mags[NADE]} left of three"
 
         # --- cooked: the same throw, held for half the fuse, goes off in
         # about half the time
-        m.ready(2)
-        p.mags[NADE], p.reserves[NADE] = 1, 1
-        q.body.heal_full()
+        m.ready(NADE)
+        p.mags[NADE] = 1
+        q.body.health = q.body.max_health
         q.body.shields = 0.0
         before = q.body.health
         cook = nade.fuse_s * 0.55
@@ -226,8 +239,8 @@ def grenade_test():
             "cooking did not shorten the wait after the throw"
 
         # --- held all the way: it goes off in your hand
-        m.ready(2)
-        p.mags[NADE], p.reserves[NADE] = 1, 0
+        m.ready(NADE)
+        p.mags[NADE] = 1
         p.body.heal_full()
         p.x, p.y = SPOT
         q.x, q.y = AWAY
@@ -238,14 +251,23 @@ def grenade_test():
         print(f"  held the whole {nade.fuse_s}s: {hurt:.0f} damage to the "
               f"thrower, {p.mags[NADE]} left in hand")
         assert hurt > 0.0, "holding a grenade to the end cost nothing"
+        assert not p.body.alive, \
+            "a grenade in your own hand should be the end of you"
         assert p.mags[NADE] == 0, "the grenade that went off is still on the belt"
         assert not m.srv._projectiles, "it was thrown as well as going off"
 
+        # it killed him, so wait for the body to come back before throwing
+        # anything else, and give this one a pool deep enough to keep testing
+        p.respawn_at = time.monotonic() + 0.3
+        assert wait_for(lambda: p.alive, 6.0), "the thrower never came back"
+        p.body.max_health = 5000.0
+        p.body.health = 5000.0
+
         # --- let go too late and it goes off between you and them
-        m.ready(2)
-        p.mags[NADE], p.reserves[NADE] = 1, 0
-        p.body.heal_full()
-        q.body.heal_full()
+        m.ready(NADE)
+        p.mags[NADE] = 1
+        p.body.health = p.body.max_health
+        q.body.health = q.body.max_health
         q.body.shields = 0.0
         p.x, p.y = SPOT
         q.x, q.y = SPOT[0] + 12.0, SPOT[1]     # further than it can fly in time
@@ -266,9 +288,9 @@ def grenade_test():
         assert q.body.health == theirs, "it still reached a target 12 m away"
 
         # --- cover stops it: the blast is traced like a bullet
-        m.ready(2)
-        p.mags[NADE], p.reserves[NADE] = 1, 0
-        q.body.heal_full()
+        m.ready(NADE)
+        p.mags[NADE] = 1
+        q.body.health = q.body.max_health
         q.body.shields = 0.0
         p.x, p.y = R.BLAST_SHOOTER          # the blast door between them
         q.x, q.y = R.BLAST_TARGET
@@ -277,6 +299,20 @@ def grenade_test():
         m.hold(m.a, 3.2, aim=math.pi / 2, wep=NADE)
         print(f"  through a shut blast door: {before - q.body.health:.0f} damage")
         assert q.body.health == before, "a grenade went through a blast door"
+
+        # --- and what one is worth against a real body: a grenade at your
+        # feet is the end of it, whatever class you are
+        m.ready(NADE)
+        p.mags[NADE] = 1
+        p.x, p.y = SPOT
+        q.x, q.y = SPOT[0] + 4.0, SPOT[1]
+        q.body = classes.make_body("commando", q.x, q.y)
+        q.body.faction, q.body.net_id = "player", q.id
+        q.hp = q.body.max_health
+        m.hold(m.a, 0.2, aim=0.0, buttons=BTN_FIRE, wep=NADE)
+        m.hold(m.a, 3.4, aim=0.0, wep=NADE)
+        print(f"  on a Commando's feet: alive={q.body.alive}")
+        assert not q.body.alive, "a grenade landed on someone and they lived"
     finally:
         m.close()
     print("\nGRENADE CHECKS PASSED")

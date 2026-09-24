@@ -191,30 +191,47 @@ def flak_test():
         # --- the ring: it bursts at the end of its run, and catches somebody
         # standing off the line it flew down
         p.x, p.y = 3.5, 10.5
-        q.x, q.y = 3.5 + w.range_m, 12.4     # two metres off the shell's path
+        q.x, q.y = 3.5 + w.range_m, 12.0     # a metre and a half off the path
         q.body.shields = 0.0
         before = q.body.health
         m.arm(FLAK)
         m.shoot(FLAK)
         assert wait_for(lambda: q.body.health < before, 3.0), \
-            "the burst missed a man standing two metres off it"
-        print(f"  off the line by two metres: {before - q.body.health:.0f} damage")
+            "the burst missed a man standing next to it"
+        print(f"  off the line by a metre and a half: "
+              f"{before - q.body.health:.0f} damage")
 
-        # --- and the shooter is not in his own ring at twelve metres
+        # --- and the shooter is not in his own ring
         assert p.body.health == p.body.max_health, "he caught his own burst"
 
-        # --- cover: a wall between you and the burst is the whole answer
-        p.x, p.y = 2.5, 23.5                 # the wall lane
-        q.x, q.y = 10.5, 23.5                # behind the wall in column 8
+        # --- cover: the same distance, once in the open and once with a wall
+        # in between, so the second half is not passing for want of range
+        p.x, p.y = 5.5, 23.5                 # the wall lane, wall in column 8
+        q.x, q.y = 9.5, 23.5                 # just behind it
+        gap = q.x - (p.x + 2.5)              # how far the burst is from him
         q.body.health = q.body.max_health
         q.body.shields = 0.0
         safe = q.body.health
         m.arm(FLAK)
         m.shoot(FLAK)
-        time.sleep(1.5)
+        time.sleep(1.2)
         m.hold(m.a, 0.3, wep=FLAK)
         assert q.body.health == safe, \
             f"pellets went through a wall: {safe - q.body.health:.0f} damage"
+
+        # the control: nothing between them, same spacing, down the open hall
+        p.x, p.y = 5.5, 10.5
+        q.x, q.y = 9.5, 10.5
+        q.body.health = q.body.max_health
+        q.body.shields = 0.0
+        open_before = q.body.health
+        m.arm(FLAK)
+        m.shoot(FLAK)
+        assert wait_for(lambda: q.body.health < open_before, 3.0), \
+            "the control shot did nothing either: the wall proved nothing"
+        print(f"  {gap:.1f} m past the burst: "
+              f"{open_before - q.body.health:.0f} damage in the open, "
+              f"none through the wall")
         print("  behind a wall: nothing")
         print("\nFLAK CHECKS PASSED")
     finally:

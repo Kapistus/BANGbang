@@ -44,10 +44,11 @@ def caps_test():
     # a blade carries no ammo, so it is the one thing with no reserve
     unlimited = [k for k in unlimited if not weapons.ROSTER[k].is_melee]
     assert not unlimited, f"these guns still have infinite ammo: {unlimited}"
-    # a weapon that makes its own ammunition is the other exception: it has
-    # nothing to reload from, which is the point of it
+    # two other exceptions, both of them weapons with no reload to speak of:
+    # one that makes its own ammunition, and one where what you are carrying
+    # IS the magazine - three grenades, and then you are out of grenades
     counted = {k: w for k, w in weapons.ROSTER.items()
-               if not w.is_melee and w.recharge_s <= 0.0}
+               if not w.is_melee and w.recharge_s <= 0.0 and not w.single_load}
     for k, w in counted.items():
         mags = w.reserve / w.mag
         assert 1.0 <= mags <= 8.0, \
@@ -56,6 +57,9 @@ def caps_test():
         if w.recharge_s > 0.0:
             assert w.reserve == 0, \
                 f"{k} recharges AND carries spare cells; pick one"
+        if w.single_load and not w.is_melee:
+            assert 1 <= w.mag <= 6, \
+                f"{k} is all magazine and carries {w.mag}, which is not a belt"
     worst = min(counted.items(), key=lambda kv: kv[1].reserve / kv[1].mag)
     best = max(counted.items(), key=lambda kv: kv[1].reserve / kv[1].mag)
     print(f"  tightest {worst[0]} ({worst[1].reserve / worst[1].mag:.1f} mags), "

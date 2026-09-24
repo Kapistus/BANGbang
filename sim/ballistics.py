@@ -282,8 +282,10 @@ def blast(center, radius_m, weapon, targets, rng, now, m=None):
     return hits
 
 
-FLAK_CORE_M = 0.1          # anything this close to the burst took the shell
-                           # itself; the ring is for everyone standing off it
+FLAK_CORE_M = 0.1          # only a body sitting on the burst point is left
+                           # out of the ring - any wider an exclusion and
+                           # standing ON a flak shell hurts less than standing
+                           # a metre from it, which is not how that works
 
 
 def burst(center, weapon, targets, rng, now, m=None):
@@ -306,7 +308,7 @@ def burst(center, weapon, targets, rng, now, m=None):
         return []
     out = [t for t in targets
            if math.hypot(getattr(t, "x", cx) - cx, getattr(t, "y", cy) - cy)
-           > max(weapon.blast_r, FLAK_CORE_M)]
+           > FLAK_CORE_M]
     pellet = dataclasses.replace(
         weapon, range_m=weapon.burst_range_m, pen=0.0, pellets=1,
         blast_r=0.0, projectile_speed=0.0, burst_pellets=0,

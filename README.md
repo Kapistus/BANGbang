@@ -272,9 +272,9 @@ them.
 He carries no gun at all: a blade, three grenades, and the speed to get to
 where those are the right answer. Two things exist only on this class. The **combat knife** has no projectile:
 a 1.6 m reach and a 50° arc, and it will not swing through a wall. From the
-front it takes three swings; from behind (more than 100° off the way they are
-facing) it does 4.5x damage, which kills any class outright, a Heavy only
-just. It carries no ammo and never runs out.
+front it takes two swings, three on a Heavy; from behind (more than 100° off
+the way they are facing) it does 4.5x damage, which kills any class outright.
+It carries no ammo and never runs out.
 
 The **frag grenade** runs a three-second fuse that starts when the pin comes
 out, not when it lands — so you cook it. Hold fire and the same ring the rail
@@ -285,11 +285,17 @@ weapons draw fills at your cursor, amber then red; let go and it flies at
   plenty of time for the room to leave
 - cooked halfway, it goes off about a second after it leaves your hand
 - let go too late and it goes off in the air between you and them
-- hold it the whole three seconds and it goes off in your hand, which is
-  usually fatal
+- hold it the whole three seconds and it goes off in your hand, which kills
+  you
 
 It blasts 3.5 m, traced through cover like any other explosion, so a shut door
-stops it. Three grenades, ever.
+stops it. One that lands on somebody kills them where they stand; a metre out
+it still takes most of a Commando, and at three it is a bad wound rather than
+a death.
+
+Three grenades, and no reload: the belt is the magazine. There is nothing to
+reload from and an ammo pack has nothing to give it, so the only question is
+whether this is worth one of the three.
 
 On everyone else's screen a thrown grenade is the round itself and nothing
 else: no tracer is sent for anything that travels, because a line drawn to
@@ -333,12 +339,15 @@ other blast.
 
 The **flak cannon** fires a shell, not a burst. The shell travels at 20 m/s
 and comes apart where it stops — against a wall, against a body, or at the end
-of its twelve-metre run — into thirty-six pellets thrown outward through the
-full circle, each one an ordinary shot with no penetration at all. Whoever it
-actually hit takes the shell; everyone standing off it takes whatever the ring
-reaches, which is dense close in and thin by five metres, and which a wall, a
-door or a corner stops dead. It is a doorway weapon: fired down an open hall
-most of the ring is spent on air.
+of its four-metre run — into thirty-six pellets thrown outward through the
+full circle, each one an ordinary shot with no penetration at all, carrying
+two and a half metres. A wall, a door or a corner stops them dead.
+
+It is a weapon for the length of a room and no further. Against a Commando,
+a shell that lands on somebody kills them; a metre away it takes half of what
+they have, at two metres a quarter, and by three there is nothing left of the
+ring. Fired at anything further than four metres it bursts in mid-air short
+of them and does nothing at all.
 
 The **plasma rifle** carries five bolts and no spare cells, and makes itself a
 new one every five seconds whether it is in your hands or slung. There is
@@ -348,7 +357,10 @@ the wait as a bar where the reserve count would be.
 
 Ammo is **capped** everywhere else: every gun carries
 three to six spare magazines (the rocket launcher, three rockets ever), so a
-firefight you cannot walk away from is one you have to finish. Damage runs through the same
+firefight you cannot walk away from is one you have to finish. The two
+exceptions are the ones with no reload at all — the plasma rifle, which makes
+its own, and the grenade belt, which does not — and `tests/pickups_test.py`
+holds all three rules apart. Damage runs through the same
 shields → armor → health model as single-player, bullets spend the same
 penetration budget against cover, and glass shatters for everyone at once.
 

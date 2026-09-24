@@ -97,6 +97,13 @@ class Weapon:
     module_slots: int = 0
 
     @property
+    def single_load(self) -> bool:
+        """Everything it will ever fire is already in it: no reserve to draw
+        on and nothing that puts rounds back, so there is no reload - a belt
+        of three grenades, not one grenade and two spares."""
+        return self.reserve == 0 and self.recharge_s <= 0.0
+
+    @property
     def refire(self) -> float:
         return 1.0 / self.rof if self.rof > 0 else 0.2
 
@@ -243,9 +250,9 @@ ROSTER: dict[str, Weapon] = {
     # pellets. Point blank it is the shell that kills; across a doorway it is
     # the ring, and the ring does not go through cover.
     "flak_cannon": Weapon(
-        "flak cannon", "heavy", 11, 16, 12, 1.0, 0.86, 5, 2.4,
-        reserve=15, pen=0.0, blast_r=1.4, projectile_speed=20.0,
-        burst_pellets=36, burst_range_m=5.0,
+        "flak cannon", "heavy", 5.5, 8, 4, 1.0, 0.86, 5, 2.4,
+        reserve=15, pen=0.0, blast_r=0.7, projectile_speed=20.0,
+        burst_pellets=36, burst_range_m=2.5,
         sound_reach_m=120.0, weight=9.7, str_req=17, module_slots=1),
     # bible lists 2 shots before reload; overridden per request - reload every shot.
     # bible blast radius is "2-5 units"; 4 m radius = 8 m kill diameter.
@@ -257,16 +264,21 @@ ROSTER: dict[str, Weapon] = {
     # the Saboteur's blade: silent, and murderous from behind. Nothing about
     # it works at a distance, which is the whole trade
     "combat_knife": Weapon(
-        "combat knife", "melee", 14, 20, 1.6, 1.6, 1.0, 1, 0.0,
+        # two swings from the front, one from behind: a blade you have to walk
+        # into someone to use should settle it when you get there
+        "combat knife", "melee", 26, 34, 1.6, 1.6, 1.0, 1, 0.0,
         reserve=-1, melee_range=1.6, melee_arc_deg=50.0, backstab=4.5,
         sound_reach_m=8.0, min_dev_m=0.0, weight=0.6, str_req=6,
         module_slots=0),
     # thrown on a three-second fuse that starts when you pull the pin, not
     # when it lands. Hold to cook it: a cooked grenade gives the room no time,
     # and one held too long goes off in your hand
+    # three of them, and no reload at all: what you are carrying is what you
+    # have, and one that goes off at your feet kills anything but a braced
+    # Heavy outright
     "frag_grenade": Weapon(
-        "frag grenade", "heavy", 22, 34, 14, 1.0, 0.93, 1, 1.0,
-        reserve=2, pen=0.0, blast_r=3.5, projectile_speed=16.0, fuse_s=3.0,
+        "frag grenade", "heavy", 55, 72, 14, 1.0, 0.93, 3, 0.0,
+        reserve=0, pen=0.0, blast_r=3.5, projectile_speed=16.0, fuse_s=3.0,
         sound_reach_m=130.0, weight=0.5, str_req=8, module_slots=0),
     # corridor denial: a short wide cone of fire, high flesh multiplier - no
     # one walks down this hallway and nothing stays in that doorway
