@@ -6,11 +6,17 @@ Two kinds, both split down the middle and retracting into the jambs:
     door         powered, open before you have finished the thought
     blast door   thick, slow, and five seconds of standing there while it moves
 
-Neither is passable, transparent or quiet until the panels are fully home. A
-door in motion is a wall, and that is the point of the slow one: the five
-seconds are a cost, and you pay them out in the open where anyone can see you
-paying. A door already moving ignores the key — once a blast door starts, it
-finishes.
+Neither can be walked through, and neither lets sound past, until the panels
+are fully home. While the panels are moving, either way, there is a slit
+between them — widening as they part, narrowing as they close — and SIGHT goes
+through it: you can see the room beyond and it can see you. On a blast door
+BULLETS go through it too. That is the point of the slow one: five seconds in
+which each side can see and shoot the other through the gap, and neither can
+get through it.
+
+A blast door is committed: once it starts, it finishes, and the key does
+nothing until it is idle. A powered door is quick enough to change your mind
+about — pressing the key mid-travel reverses it from wherever the panels are.
 
 The state machine is here and pygame-free because single-player, the server and
 every client have to agree on it to the tick. Drawing is main.draw_door.
@@ -21,6 +27,9 @@ from dataclasses import dataclass, field
 
 DEFAULT_SLIDE = 0.35      # a door with no authored time
 ARRIVE_EPS = 1e-6
+PANEL_STUB = 0.16         # how much of each panel still shows when it is fully
+                          # home in the jamb. Shared with main.draw_door, so the
+                          # gap you see drawn is the gap you can see through
 
 
 def axis_from_solid(is_solid, r: int, c: int) -> str:
@@ -64,6 +73,7 @@ class Door:
                                      # and still. Never true during a travel
     target: bool = False             # what they are travelling toward
     left: float = 0.0                # seconds of travel remaining
+    _gap: int = 0                    # fine cells of slit currently applied
 
     @property
     def moving(self) -> bool:
@@ -82,6 +92,29 @@ class Door:
             return 1.0 if self.is_open else 0.0
         done = 1.0 - self.left / max(self.dur, ARRIVE_EPS)
         return done if self.target else 1.0 - done
+
+    @property
+    def reversible(self) -> bool:
+        """Can the key turn it round mid-travel? A powered door, yes. A blast
+        door, no — the five seconds are the cost, and cancelling one would hand
+        them back."""
+        return not self.heavy
+
+    @property
+    def shoot_through(self) -> bool:
+        """Do bullets pass the slit while it moves? Only on a blast door: a
+        quick door is gone before you could aim through it, and a heavy one is
+        worth fighting across."""
+        return self.heavy
+
+    def gap(self, subdiv: int) -> int:
+        """How many fine cells wide the slit between the panels is, centred in
+        the doorway: the whole tile when open, nothing when shut, and while the
+        panels move — in either direction — the gap as drawn."""
+        if not self.moving:
+            return subdiv if self.is_open else 0
+        width = (1.0 - 2.0 * PANEL_STUB) * self.frac * subdiv
+        return max(0, min(subdiv, int(width)))
 
     @property
     def heavy(self) -> bool:
@@ -156,7 +189,24 @@ class DoorSet:
         door halfway would hand back the five seconds that are the whole reason
         to place one."""
         d = self.doors.get(key)
-        if d is None or d.moving or d.is_open == target:
+        if d is None:
+            return None, False
+        if d.moving:
+            if not d.reversible or d.target == target:
+                return None, False       # committed, or already heading there
+            # turn it round where it stands: what is left to travel is what it
+            # has already covered, so the panels never jump
+            d.left = max(0.0, d.dur - d.left)
+            d.target = target
+            if d.left <= ARRIVE_EPS:
+                d.left = 0.0
+                was = d.is_open
+                d.is_open = target
+                return d, d.is_open != was
+            if not target:
+                d.is_open = False
+            return d, False
+        if d.is_open == target:
             return None, False
         if d.dur <= 0.0:
             d.is_open = d.target = target
@@ -211,6 +261,22 @@ class DoorSet:
                 d.is_open = d.target
                 done.append((key, d.is_open, d.is_open != was))
         return done
+
+    def gap_changes(self, subdiv: int) -> list:
+        """[(key, gap)] for doors whose slit changed width since last call.
+        Callers write each into their grids with tilemap.set_door_gap (sight
+        always, bullets for a blast door) and invalidate their vision cache.
+
+        Every change is reported, including the one a door makes when it comes
+        to rest — a closing door reaches zero without set_door ever being
+        called again, so this is the only thing that shuts its last sliver."""
+        out = []
+        for key, d in self.doors.items():
+            want = d.gap(subdiv)
+            if want != d._gap:
+                d._gap = want
+                out.append((key, want))
+        return out
 
     def moving_keys(self) -> list:
         return [k for k, d in self.doors.items() if d.moving]

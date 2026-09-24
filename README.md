@@ -48,7 +48,7 @@ format (`sim/mapfile.py`), anything else is treated as the legacy char-grid +
 TOML sidecar.
 
 Controls in brief: WASD + mouse, shift run, ctrl crawl, Mouse1 fire, R reload,
-B fire mode, F interact, Space knock, wheel/1-7 weapon, V guard cones, F1-F11
+B fire mode, F interact, E knock, wheel/1-7 weapon, V guard cones, F1-F11
 overlays, Esc quit. The full list is the module docstring at the top of
 `main.py`.
 
@@ -68,6 +68,11 @@ lamp, kind on an entity, weapon on a guard — with shift taking the coarse step
 on a lamp. `5` `6` cycle a guard's skill, `7` clears every guard, `8` saves
 (shift = save as), `9` loads, `0` starts a new map. Enter, Backspace, Del,
 arrows, space-drag and Esc are unchanged.
+
+Saving runs the same check the lobby uses, and says whether the map will be
+listed. A map that fails is still saved — you never lose work — but it's marked
+**NOT PLAYABLE** in the status bar until it saves clean, and the full list of
+problems goes to the console.
 
 `e` enters entity mode and `1` `2` cycle the kind. Alongside npc, trader and
 quest_item there are **health** and **ammo** packs — those two place straight
@@ -106,18 +111,44 @@ py mp_client.py 192.168.1.42:47999
 py mp_client.py --host --window 900x700     # two clients on one screen
 ```
 
+The window sizes itself to the display: the match view opens at the desktop
+size less a margin for the title bar and the taskbar (`view_cap` in `main.py`,
+about 1860x960 on a 1920x1080 screen, and the full width of anything larger),
+falling back to 1860x776 if the desktop size cannot be read. The view is a
+camera onto a world that is usually bigger than it at a fixed 48 pixels per
+metre, so a taller window is about five more metres of map rather than a
+bigger picture of the same one; `--window WxH` overrides it. The lobby is its
+own 1280x800 window, which is what gives the class cards 200 px each.
+
 `mp_client.py` is the networked game: start screen, lobby, then the match.
 Hosting runs the server inside the same process and connects your own client to
 it over loopback, so the host sits in the lobby like everyone else — the address
 other machines need is printed on the host screen and shown in the lobby.
 
 In the lobby everyone sets name, colour, team (in team mode) and ready; the host
-also picks the map, the mode and the match length. The match starts when
+also picks the map, the mode and the match length. The map list only offers
+**playable** maps — ones that load, use only tiles the tileset has, and have at
+least two usable spawns. Anything else is left out and the reason printed to the
+console. If the host's map isn't playable (the default is `arena`), the server
+switches to the first one that is and the lobby shows which; a match never
+starts on a map the clients can't load. The match starts when
 everyone is ready, or when the host forces it. Minimum two players.
+
+Only the host needs the map. The lobby carries a fingerprint of the host's
+map files, and a player whose copy is missing, or different under the same
+name, downloads the host's copy. Downloads go into `maps/downloaded/<map>/`, so
+they never overwrite a map of your own. A copy downloaded once is used again as
+long as the host's map hasn't changed. While a player is downloading, their
+ready dot in the lobby is hollow and readying up starts nothing; joining a
+match in progress waits for the download too. The server only sends the map
+the host has selected, and the client writes only plain `.map`, `.toml` and
+`.grid` files into its own download folder, after checking them against the
+fingerprint.
 
 You can arrive late. Connect while a match is running and you drop straight into
 it, at the spawn point furthest from anyone still fighting, with the doors and
-broken windows as they stand rather than as the map file has them. Esc steps you
+broken windows as they stand rather than as the map file has them (after
+choosing a class - see below). Leave match in the Esc menu steps you
 out again without dropping your connection: you land back in the lobby, your
 score stays on the board, and a JOIN MATCH button puts you back in. In team mode
 a latecomer goes to the thinner side. A match everybody walks out of ends by
@@ -128,19 +159,207 @@ In the match:
 ```
 WASD / arrows   move        shift run        ctrl crawl
 mouse           aim         left mouse fire (hold for auto, or to charge rail)
-1-7 / wheel     weapon      r reload         b fire mode
+1-3 / wheel     weapon      r reload         b fire mode
 f               open or close a door you are standing next to
+e               knock on the wall (single-player has this on e too now)
+space           your class ability
 l               flashlight
-tab             scoreboard  esc step out to the lobby (still connected)
+tab             scoreboard  esc menu: resume, class, leave match
 ```
 
-The full seven-weapon loadout works — pistol, combat rifle, SMG, combat shotgun,
-rail rifle, laser rifle, rocket launcher — with magazines, reloads, fire modes,
-rail charge-up and rocket flight time. Ammo is **capped**: every gun carries
+Sprinting runs on fuel, and both modes run the same model (`sim/movement.py`):
+about six seconds of running empties the tank, standing still refills it in
+five and walking in fourteen, and bottoming it out locks the sprint until it is
+back to a quarter — which is what stops a player sprinting on fumes. The server
+owns the number in multiplayer and ships it in the snapshot, so the bar under
+your shields is the server's figure and not a guess; your own client predicts
+it with the same function, so the bar does not jump.
+
+In the Esc menu, up/down (or w/s) moves between Resume, Class and Leave match;
+left/right, a/d or the mouse wheel steps through the classes; enter or a click
+picks; Esc closes it. While it is open you stand still and don't fire, but the
+match carries on around you.
+
+### Classes
+
+Every player picks a class. A new connection is asked first, with the four
+side by side; after that the class row in the lobby (under the player list)
+or the Esc menu changes it. A pick takes effect at your **next spawn**: the
+next match start, or your next respawn mid-match. Until then you play the
+class you spawned as.
+
+```
+class          health  shields  armour  speed     weapons
+Commando         98      71      20%    4.0 m/s   pistol, combat rifle, SMG
+Heavy support   129      65      30%    3.0 m/s   pistol, flak cannon, rocket launcher
+Medic            94      75      20%    4.0 m/s   pistol, SMG, combat shotgun
+Tech             61      98      20%    3.5 m/s   pistol, rail rifle, plasma rifle
+Saboteur         88      56      10%    5.0 m/s   combat knife, frag grenade
+```
+
+Every number there is a rounded one, and the game uses what the card shows:
+health and shields to the whole point, speed to the nearest half a metre per
+second. The design numbers behind them stay in `sim/classes.py` — the class
+reads them back through `hp`, `sh` and `spd` — because a card reading 4.2 m/s
+next to 4.1 m/s is a difference nobody can feel. Speed is a multiplier on
+every stance, against the Commando's 4.0: the Saboteur runs at 7.5 m/s, the
+Commando at 6.0, the Heavy at 4.5.
+
+Each class has one ability on **space**, and thirty seconds between uses,
+counted from the moment the last one ended:
+
+- **Commando — Blitz** (6 s): double speed, and an empty gun reloads itself
+  the instant it runs dry, out of the ammo you are actually carrying. With an
+  empty reserve it stays empty.
+- **Heavy support — Brace** (6 s): half the damage taken, but only while you
+  stand still. Walk and it is off until you stop again.
+- **Medic — Field dressing** (3 s): channeled, like a reload. Heals half your
+  health, paid out as it goes, and moving, firing or being hit stops it —
+  what it has already given stays given.
+- **Tech — Echo ping** (3 s): opens the fog around you for three seconds,
+  through walls, showing the layout and anyone standing in it. When it fades
+  those cells stay remembered, like anywhere else you have seen.
+- **Saboteur — Vanish** (4 s): your feet make no sound, nobody draws you past
+  three metres, and you move at double speed. Firing or swinging ends it on
+  the spot. It is for
+  crossing ground and getting behind someone, not for winning a fight you are
+  already in — and it is the answer to the Tech's ping.
+
+The server runs all of it. The client predicts the Commando's speed and draws
+the Tech's ping; everything else — the heal, the mitigation, the cooldown — is
+the server's, so a modified client gains nothing.
+
+The stats come from the class sheets in `mechanics/Classes`, scaled to the
+prototype Commando and then by `TOUGHNESS` (1.25) for the reaction-time
+rebalance below; the abilities are newer than those sheets. Both live in
+`sim/classes.py`. Single-player's Commando is deliberately not scaled: it
+still carries the 78 health and 57 shields it always did.
+
+Each class draws its own sprite set from `assets/characters`: a class with
+`art="medic"` looks for `medic_ready` / `medic_idle` and falls back to its own
+idle before it falls back to the khaki soldier, so a class with only one pose
+keeps its own armour rather than changing body mid-fight. The Saboteur still
+points at `unnamed_idle.png`; rename the file and the class's `art` field
+together when it gets a name of its own.
+
+### Reaction time
+
+A firefight has to last long enough to answer. Point blank with every shot
+hitting — the fastest any of it can happen — it now runs:
+
+```
+weapon          Commando  Heavy  Medic   Tech  Saboteur
+pistol             1.92s  3.69s  1.92s  1.92s  1.54s
+combat rifle       1.50s  2.00s  1.50s  1.33s  1.17s
+SMG                1.08s  1.46s  1.08s  1.00s  0.85s
+combat shotgun     1 shell at point blank (a Heavy survives it, just)
+heavy rifle        2.22s  3.33s  2.22s  2.22s  1.11s
+rail pistol        3.12s  3.75s  3.12s  3.12s  2.50s
+pulse carbine      2.00s  3.00s  2.00s  1.50s  1.50s
+```
+
+What moved: classes carry 25% more health and shields; the SMG lost a little
+damage; the pistol gained damage and then a faster trigger — 2.6 pulls a
+second, so eight rounds go out in three seconds and a sidearm is a weapon
+again; and
+every gun except the two rails shoots 33% wider than its accuracy rating alone
+would give (`SPREAD_WIDEN` in `sim/weapons.py`), which is what turns distance
+into time. The rails are exempt — the slow, deliberate shot is the point of
+them.
+
+### The Saboteur's kit
+
+He carries no gun at all: a blade, three grenades, and the speed to get to
+where those are the right answer. Two things exist only on this class. The **combat knife** has no projectile:
+a 1.6 m reach and a 50° arc, and it will not swing through a wall. From the
+front it takes three swings; from behind (more than 100° off the way they are
+facing) it does 4.5x damage, which kills any class outright, a Heavy only
+just. It carries no ammo and never runs out.
+
+The **frag grenade** runs a three-second fuse that starts when the pin comes
+out, not when it lands — so you cook it. Hold fire and the same ring the rail
+weapons draw fills at your cursor, amber then red; let go and it flies at
+16 m/s with whatever is left of the fuse:
+
+- a quick throw lands and sits there for most of three seconds, which is
+  plenty of time for the room to leave
+- cooked halfway, it goes off about a second after it leaves your hand
+- let go too late and it goes off in the air between you and them
+- hold it the whole three seconds and it goes off in your hand, which is
+  usually fatal
+
+It blasts 3.5 m, traced through cover like any other explosion, so a shut door
+stops it. Three grenades, ever.
+
+On everyone else's screen a thrown grenade is the round itself and nothing
+else: no tracer is sent for anything that travels, because a line drawn to
+where it will land both gives the throw away and reads as a gunshot. The throw
+message carries the fuse, so every client draws the round lying there with a
+quickening blink on the same clock, and the blast arrives as its own message
+when the fuse ends — one explosion, from the server, not one per client.
+
+The shotgun went the other way on purpose. It throws ten pellets, and what
+decides a fight is how many of them are still on a person:
+
+```
+range   pellets on the body   shells to kill (Commando / Heavy)
+ 1 m          10.0                   1 / 2
+ 3 m           6.9                   2 / 2
+ 5 m           4.6                   2 / 3
+ 8 m           3.1                   3 / 4
+12 m           2.2                   5 / 6
+```
+
+At arm's length it is the one gun you cannot react to. Across a room or down a
+hallway — five to eight metres — half the pattern still lands and it kills in
+two or three shells, which is a rifle's pace. Past twelve it is the wrong gun:
+the pattern is wider than a person. Its numbers say the same: a 20 m effective
+range (the shortest of any gun), a 12° cone, and 0.92 accuracy.
+
+`tests/balance_test.py` pins all of it: nothing but that one shell kills in
+under half a second. Speed scales every stance, so a Heavy walks, runs and
+crawls at 0.75 of the Commando's pace and the Saboteur at 1.25 of it.
+Single-player still plays the Commando with the full kit.
+
+### The heavy and energy weapons
+
+Three weapons put something into the air rather than a line on the map, and
+`tests/weapons_test.py` pins each one.
+
+The **rocket launcher** flies: 28 m/s, so twenty metres of hallway is most of
+a second in which the man you aimed at can be somewhere else. It goes off
+where it arrives, never where it left, and it is traced through cover like any
+other blast.
+
+The **flak cannon** fires a shell, not a burst. The shell travels at 20 m/s
+and comes apart where it stops — against a wall, against a body, or at the end
+of its twelve-metre run — into thirty-six pellets thrown outward through the
+full circle, each one an ordinary shot with no penetration at all. Whoever it
+actually hit takes the shell; everyone standing off it takes whatever the ring
+reaches, which is dense close in and thin by five metres, and which a wall, a
+door or a corner stops dead. It is a doorway weapon: fired down an open hall
+most of the ring is spent on air.
+
+The **plasma rifle** carries five bolts and no spare cells, and makes itself a
+new one every five seconds whether it is in your hands or slung. There is
+nothing to reload and an ammo pack has nothing to give it, so the only
+question it ever asks is whether to spend the round you have; both modes draw
+the wait as a bar where the reserve count would be.
+
+Ammo is **capped** everywhere else: every gun carries
 three to six spare magazines (the rocket launcher, three rockets ever), so a
 firefight you cannot walk away from is one you have to finish. Damage runs through the same
 shields → armor → health model as single-player, bullets spend the same
 penetration budget against cover, and glass shatters for everyone at once.
+
+Explosions respect cover too. A blast is traced from where it goes off to each
+body in range and pays for the cover in between the way a bullet does, out of
+a small budget (`BLAST_PEN` = 1.0 in `sim/ballistics.py`): glass and thin walls
+let it through, while low cover, doors, blast doors and walls stop it outright. A
+rocket or bolt that hits a wall goes off on the near face of it, so the
+side it hit takes the blast and the far side doesn't. The rail pistol punches
+through a shut blast door, but only at full charge (`pen_charged` = 3.3 against
+the door's 3.2). It never gets through a full wall (3.5).
 
 Muzzle flashes are the single-player ones: two sprite layers pinned to the
 barrel with a random roll and scale per shot, the gun kicking back and settling
@@ -179,13 +398,17 @@ map control.
 
 Doors are two steel panels that part along the wall and retract into the jambs.
 There are two kinds, and the difference is time: a powered door (`+`) is open
-in about a third of a second, and a blast door (`B`) takes five. Neither is
-passable, transparent or quiet until the panels are fully home, in either
-direction — a door part-way open is not a gap to squeeze through, and one
-part-way shut is not a gap to dive back out of. That is the whole design of the
-slow one: five seconds standing in the open, watching an amber lamp go yellow,
-is a cost somebody can make you pay. A door already moving ignores the key,
-so there is no cancelling it once it starts.
+in about a third of a second, and a blast door (`B`) takes five. Neither can be
+walked through, and neither lets sound past, until the panels are fully home.
+While the panels move — opening or closing — there's a slit between them,
+widening as they part and narrowing as they meet, and you can see through it,
+as can whoever is on the far side. On a blast door you can also shoot through
+it. That's the point of the slow one: five seconds in which each side can see
+and fire on the other through the gap, and nobody can get through it.
+
+A blast door is committed: once it starts, `f` does nothing until it's idle
+again. A powered door is quick enough to change your mind about — press `f`
+mid-travel and it turns round from wherever the panels are.
 
 Opening one changes what can be seen, shot and heard through it for everyone,
 and it will not close on a body standing in the doorway. Other players are
@@ -193,6 +416,16 @@ hidden by fog of war exactly like anything else — if you cannot see into a roo
 you cannot see who is in it, and their tracers and muzzle flashes are hidden with
 them. What their gunfire LIGHTS is still visible, which is usually the more
 useful tell.
+
+The fog itself is built only where it is seen. Each frame the veil is made,
+blurred and drawn for the fine cells under the camera plus a margin wide enough
+for the blur to read from, rather than for the whole map; and since the veil is
+black, it goes on as a multiply rather than as a per-pixel-alpha layer. On the
+80x52 m vessel map that took the fog from 4.0 ms a frame to 1.7 ms, and the
+whole frame from 7.5 ms to 5.1 ms (single-player: 8.7 ms to 6.2 ms). The window
+is `fog_windows` and the veil `fog_veil`, both in `main.py` and both used by the
+multiplayer client too, with `tests/fog_window_test.py` checking that a window
+gives the same veil the whole map would.
 
 Each source keeps one reusable propagation field per kind of sound, so a weapon
 on full auto costs about one field solve rather than one per round — measured at
@@ -219,9 +452,15 @@ command arrives rather than inventing one.
 
 An authoritative server runs in a daemon thread inside the host process. TCP,
 one length-prefixed msgpack frame per message (`net/protocol.py`), default port
-**47801**, protocol version 3 — a mismatched client is rejected outright.
+**47801**, protocol version 13 — a mismatched client is rejected outright.
 
-The server ticks at 30 Hz and broadcasts snapshots at 20 Hz. Every connection
+The server ticks at 30 Hz and broadcasts snapshots at 30 Hz. Clients draw
+remote players 70 ms in the past (`INTERP_DELAY`), which is two snapshots of
+buffer: enough that one late packet is covered, and no more. Measured on a
+loopback match, a remote player's position lags the server's by a median of
+78 ms, worst 102 ms — down from 89/144 ms at 20 Hz and 100 ms of interpolation.
+Dropping the buffer below two snapshots measures faster still (70 ms) but
+freezes and snaps the moment a packet is late, so it is not the default. Every connection
 has an outbox drained by its own thread, so the tick loop never blocks on a
 socket: one player whose connection backs up costs themselves their backlog and
 nobody else their frame rate. Under pressure a queue sheds what is cheapest to
@@ -263,6 +502,32 @@ them.
 
 LAN only. There is no matchmaking, no NAT punch-through, no relay. If the host
 machine has a firewall, allow inbound TCP on 47801.
+
+### Test maps
+
+The test maps live in `tests/` with the tests. They are never offered in the
+multiplayer lobby, and the server refuses them even by a crafted id; open them
+in the editor or play them in single-player:
+
+```
+py main.py tests/range.map             # the shooting range every test uses
+py editor.py tests/not_playable.map
+```
+
+`range` is one map with a corner for each thing the tests check. The top
+strip has a powered door in a vertical wall (the first door on the map) and a
+window. Under it is a powered door in a horizontal wall, then an open hall
+with two of the four spawns. Below the hall a blast door in a horizontal
+wall leads to four cover lanes, each with its cover in column 8: window,
+door, blast door, wall. A health pack and an ammo pack sit in the lower
+right. `tests/range_spots.py` names every one of these positions, and the
+tests check the map against it first, so if an edit moves something a test
+needs, the test fails and names what moved.
+
+Two things are not on the range. `not_playable` uses a tile the tileset
+doesn't have, so it can't share a map with anything playable; save it in
+the editor to see the NOT PLAYABLE warning. The editor has no thin wall or
+low cover tile, so `blast_cover_test` checks those two on a small char grid.
 
 ### Headless harnesses
 
@@ -307,24 +572,38 @@ else needs to change.
 
 ### Tests
 
+All tests live in `tests/` and run from the project root:
+
 ```
-py -m net.smoke_test        # lobby -> match -> kill -> respawn -> end -> lobby
-py -m net.movement_test     # speeds, stance, input clamping, walls
-py -m net.combat_test       # firing, damage, mags, cover, kills, glass,
-                            #   doors, sound
-py -m net.backpressure_test # a client that stops reading must not stall the
-                            #   server for everyone else
-py -m net.rejoin_test       # joining, leaving and rejoining a running match
-py -m net.spawn_points_test # authored spawns: format, teams, facing, fallback
-py -m net.doors_test        # slide axis, travel time, a moving door is a wall
-py -m net.pickups_test      # ammo caps, the 30% rule, respawns, who got there
-                            #   first
-py mp_smoke_test.py         # the real client, headless, for six seconds
-py mp_smoke_test.py vessel_interior
-py editor_test.py           # the editor opens every map and draws every mode
+py -m tests.smoke_test        # lobby -> match -> kill -> respawn -> end -> lobby
+py -m tests.movement_test     # speeds, stance, input clamping, walls
+py -m tests.combat_test       # firing, damage, mags, cover, kills, glass,
+                              #   doors, sound
+py -m tests.backpressure_test # a client that stops reading must not stall the
+                              #   server for everyone else
+py -m tests.rejoin_test       # joining, leaving and rejoining a running match
+py -m tests.spawn_points_test # authored spawns: format, teams, facing, fallback
+py -m tests.doors_test        # slide axis, travel time, a moving door is a wall
+py -m tests.pickups_test      # ammo caps, the 30% rule, respawns, who got there
+                              #   first
+py -m tests.map_validity_test # nothing unplayable is listed, hosted or started
+py -m tests.map_download_test # a player without the host's map gets a copy
+py -m tests.classes_test      # classes: stats, kits, speed, the esc menu, respawn
+py -m tests.fog_window_test   # the camera-window veil matches a whole-map one
+py -m tests.lobby_layout_test # nothing is drawn off the lobby or off a card
+py -m tests.abilities_test    # the four class abilities, their cooldown, knocking
+py -m tests.balance_test      # time to kill, the shotgun's one shell, the spread
+py -m tests.saboteur_test     # the knife, the grenade's fuse, Vanish, class art
+py -m tests.stamina_test      # sprint fuel over the wire, and a thrown round
+py -m tests.weapons_test      # the rocket's flight, the flak ring, plasma cells
+py -m tests.blast_cover_test  # what blasts and a charged rail shot get through
+py -m tests.sp_downed_test    # a downed player cannot move, aim, act or heal
+py -m tests.mp_smoke_test     # the real client, headless, for six seconds
+py -m tests.mp_smoke_test vessel_interior
+py -m tests.editor_test       # the editor opens every test map, every mode
 ```
 
-All ten are headless. `mp_smoke_test.py` drives the actual `MatchView` with
+All twenty-two are headless. `mp_smoke_test.py` drives the actual `MatchView` with
 scripted input against a dummy video driver, so it exercises rendering,
 prediction, shooting, muzzle flashes and the sound path without opening a
 window. It then runs four more passes: the lobby's late-join path; field
@@ -347,25 +626,20 @@ editor.py           map editor (.map JSON format)
 lobby.py            pygame start screen and lobby (host and join)
 run_host.py         headless host harness
 run_client.py       headless client harness
-mp_smoke_test.py    headless test of the networked client
-editor_test.py      headless test that the editor draws and edits
+tests/              every test, headless; python -m tests.<name>
+                    range.map + range_spots.py: the map they share
 net/
   protocol.py       wire format, enums, message tags, input bits, kill verbs
   server.py         authoritative server: threads, ticks, movement, scoring
   client.py         client socket, world mirror, event queue
   maps.py           map id -> file, map loading, spawn point derivation
-  combat_test.py    headless combat test
   mapcatalog.py     scans maps/ for playable maps (both formats)
   mappicker.py      host-only map selection panel
-  smoke_test.py     headless netcode test
-  movement_test.py  headless movement test
-  spawn_points_test.py  authored spawns, teams, facing
-  rejoin_test.py    joining, leaving and rejoining
-  backpressure_test.py  a client that stops reading
 sim/
   movement.py       speeds, collision, input clamping — one definition, shared
   perception.py     loudness, and what a listener makes of a sound — shared
   lighting.py       beams, point lights, and the light gate on sight — shared
+  classes.py        multiplayer classes: stats, kits, the body each spawns in
   doors.py          sliding-door state machine: axis, travel time, arrival
   pickups.py        health/ammo packs: what they give, and when they return
   sound.py          Eikonal solver, separate attenuation + travel-time fields
@@ -399,28 +673,22 @@ mechanics/          legacy design docs, keybindings, older asset sets
    camera. Worth deciding whether a spectator should see through the fog of war
    before building it, since in a stealth game that leaks positions to anyone
    sitting in the same room.
-3. **No stamina.** Sprinting is unlimited over the network; single-player drains
-   and regenerates it.
-4. **No interactables beyond doors.** Single-player has traders, corpses, quest
+3. **No interactables beyond doors.** Single-player has traders, corpses, quest
    objects and an inventory behind the same key; multiplayer has doors only.
-5. **Missing feedback the single-player renderer has:** blood hit-reactions,
+4. **Missing feedback the single-player renderer has:** blood hit-reactions,
    the weapon-swap animation frames, the rail spool-up sound while charging,
    and the slung/raise weapon states. Muzzle flashes, recoil, the flashlight
    and the shadow model are done.
-7. **No ripple view.** Single-player can show the sound wavefront itself
+5. **No ripple view.** Single-player can show the sound wavefront itself
    (F11 cycles arcs / full ripples / off, and ripples are its default);
    multiplayer draws the arrival arcs only.
-8. **Fog costs more than it should on large maps.** The veil is rebuilt and
-   blurred across the whole map array every frame; on the 80x52 m vessel map that
-   is the dominant frame cost. Single-player has the same pattern. Blur only the
-   camera window.
-9. **Sound is emitted authoritatively but heard client-side**, which is a
+6. **Sound is emitted authoritatively but heard client-side**, which is a
    deliberate trade (see above) and the place to revisit first if this ever
    needs to be cheat-resistant.
-10. **If the host quits, the match ends for everyone.** The server lives inside
-    the host's process. The `is_host` flag migrates between players, but it
-    cannot move the server, so nobody can take over; `net/smoke_test.py`'s
-    migration check passes only because the test itself owns the server.
+7. **If the host quits, the match ends for everyone.** The server lives inside
+   the host's process. The `is_host` flag migrates between players, but it
+   cannot move the server, so nobody can take over; `tests/smoke_test.py`'s
+   migration check passes only because the test itself owns the server.
 
 ### Colour art
 
@@ -436,7 +704,7 @@ centre, same up-facing orientation as the base art; the game only swaps which
 file it draws.
 
 Anything missing falls back to the base sprite, so a palette half-painted is
-fine and one file is enough to see it working. `python mp_smoke_test.py` prints
+fine and one file is enough to see it working. `python -m tests.mp_smoke_test` prints
 which coloured sets it found. `sprites.PALETTE` is also what the lobby swatches
 are built from, so adding a colour there adds it to the lobby — but a swatch
 with no art is a soldier in khaki wearing a coloured ring.
@@ -461,12 +729,11 @@ with no art is a soldier in khaki wearing a coloured ring.
 
 ### Housekeeping
 
-14. **Not a git repository.** No version control on the project folder.
-15. `sim/` has no direct test coverage; the four headless tests cover the net
+14. `sim/` has no direct test coverage; the four headless tests cover the net
     path and reach into `sim/` through it.
-16. `maps/` mixes formats and scratch files (`untitled.map`, `untitled2.map`,
+15. `maps/` mixes formats and scratch files (`untitled.map`, `untitled2.map`,
     `arena_1x.*`), and they all show up in the map picker.
-17. `mechanics/` is imported design material from an older project (some files
+16. `mechanics/` is imported design material from an older project (some files
     dated 2018) kept as reference — the weapon roster and the
     shield/armor/accuracy model were ported from it into `sim/weapons.py` and
     `sim/combat.py`. It is not live code.

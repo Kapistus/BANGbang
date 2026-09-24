@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 import random
 import sys
 import time
@@ -52,14 +53,16 @@ from lobby import LobbyResult, Lobby, run_lobby, _make_fonts, W as LOBBY_W, \
     H as LOBBY_H
 from net import GameClient, GameServer
 from net import maps as netmaps
-from net.protocol import (BTN_CRAWL, BTN_FIRE, BTN_INTERACT, BTN_LIGHT,
+from net.protocol import (BTN_ABILITY, BTN_CRAWL, BTN_FIRE, BTN_INTERACT,
+                          BTN_KNOCK, BTN_LIGHT,
                           BTN_RELOAD, BTN_RUN, DEFAULT_PORT, GameMode,
                           ServerState)
 from net.server import TICK_DT
-from sim import audio, lighting, movement, perception, sprites, weapons
+from sim import audio, classes, lighting, movement, perception, sprites, weapons
 from sim.doors import DoorSet
 from sim.pickups import PickupSet
-from sim.tilemap import break_glass_cells, compute_roof, set_door
+from sim.tilemap import (break_glass_cells, compute_roof, set_door,
+                         set_door_gap)
 from sim.vision import ConeSpec, VisibilityCache, shadowcast
 
 # Prediction. Input is sent as one fixed-size command per server tick, and this
@@ -78,7 +81,7 @@ SNAP_M = 2.0              # a correction this large is a teleport (respawn, or
 PENDING_MAX = 64          # commands kept for replay; ~2 s at 30 Hz
 RENDER_SMOOTH_PER_S = 30.0  # the drawn position eases toward the predicted one
 
-INTERP_DELAY = 0.10       # render remote players this far in the past, so there
+INTERP_DELAY = 0.07       # render remote players this far in the past, so there
                           # are always two snapshots to interpolate between
 
 NAME_DY = -0.95           # name tag offset above a body, metres
@@ -116,6 +119,7 @@ OWN_GAIN = {"reload": 0.5, "dryfire": 0.5, "door": 0.6, "glass": 0.7}
 CUE_MERGE_DEG = 22.0
 CUE_MERGE_S = 0.9
 CUE_MAX = 4
+SWING_TIME = 0.18         # how long a knife arc stays on screen
 
 # Solving a propagation field is the expensive thing this client does, and a
 # weapon on full auto makes ten noises a second from what is very nearly one
@@ -125,12 +129,16 @@ CUE_MAX = 4
 # louder than it should.
 SOUND_CACHE_TTL = 6.0     # forget a source's field after this long unused
 SOUND_CACHE_MAX = 24      # hard cap on cached fields, oldest evicted first
-MAX_ACTIVE_SOUNDS = 24    # in flight at once before the oldest is dropped
+MAX_ACTIVE_SOUNDS = 48    # alive at once; past this, heard ones go first (main._trim_sounds).
+                          # 48 keeps sustained full-auto audible to ~100 m on open ground
 
 CLIP_BY_KIND = {
     "fire": "gunshot", "step": "footstep", "reload": "magazine",
     "dry": "dryfire", "glass": "glass", "knock": "knock", "door": "door",
     "door_heavy": "door_heavy",
+    # no blade sound of its own yet: the knock is the closest thing the
+    # procedural bank has to a short, dull impact
+    "melee": "knock", "ability": "knock",
 }
 
 
@@ -172,7 +180,14 @@ class MatchView:
     def __init__(self, cli: GameClient, maps_dir="maps", window=None):
         self.cli = cli
         w = cli.world
-        self.m = netmaps.load(w.map_id, maps_dir)
+        # the host's exact map: ours, or the copy the client downloaded. A
+        # host that force-started before the download finished is waited for
+        # rather than drawn with the wrong walls.
+        where = w.map_dir or cli.wait_for_map()
+        if where is None:
+            raise RuntimeError(f"no copy of map {w.map_id!r} "
+                               f"({w.map_status or 'the host did not send it'})")
+        self.m = netmaps.load(w.map_id, where)
         self.ppm = renderer.PX_PER_M
         self.cpm = self.m.cells_per_metre
         # the sound solver works on its own copy of the cost field, kept in
@@ -181,7 +196,7 @@ class MatchView:
 
         self.world_w = round(self.m.width_m * self.ppm)
         self.world_h = round(self.m.height_m * self.ppm)
-        cap = window or renderer.MAX_VIEW
+        cap = window or renderer.view_cap()
         self.view_w = min(self.world_w, cap[0])
         self.view_h = min(self.world_h, cap[1])
         self.window = pygame.display.set_mode((self.view_w, self.view_h))
@@ -208,7 +223,11 @@ class MatchView:
             peripheral_range=renderer.CONE_RANGE_M[2] * self.cpm,
             near_range=renderer.CONE_RANGE_M[3] * self.cpm,
         )
-        self._ov = pygame.Surface((8, 8), pygame.SRCALPHA)
+        # the veil, as a multiply layer: black at alpha a is the same as
+        # multiplying by (1 - a), and an opaque multiply blit is about half
+        # the cost of a per-pixel-alpha one over a whole viewport
+        self._ov = pygame.Surface((8, 8))
+        self._ov_big = pygame.Surface((8, 8))
 
         self.font = pygame.font.SysFont("consolas,monospace", 14)
         self.font_mid = pygame.font.SysFont("consolas,monospace", 20, bold=True)
@@ -231,10 +250,24 @@ class MatchView:
         self.corrected_m = 0.0
         self.travelled = 0.0
 
-        # weapons: the client asks, the server decides
-        self.loadout = list(weapons.DEFAULT_LOADOUT)
+        # weapons: the client asks, the server decides. What you carry is
+        # your class's kit, and the class is the one you spawned as
+        _me = w.players.get(w.my_id)
+        self.cls_now = classes.get(_me.cls_now if _me else None).key
+        self.loadout = list(classes.get(self.cls_now).loadout)
         self.wep = 0
         self.modes = [0] * len(self.loadout)
+
+        # sprint fuel: predicted here, corrected by every snapshot
+        self.stamina = 1.0
+        self.sprint_locked = False
+
+        # the esc menu: resume, class for the next respawn, leave
+        self.menu_open = False
+        self.menu_sel = 0
+        # a Tech's echo ping: where it went off and when it fades. The cells it
+        # showed you stay in fog memory afterwards, like anything else seen
+        self.ping = None
 
         # sound and effects
         self.sounds: list = []        # ActiveSound: fields being solved/heard
@@ -242,10 +275,12 @@ class MatchView:
         self.caches: dict = {}        # (source id, kind) -> reusable field
         self.cues: list = []          # arrival arcs at the listener
         self.tracers: list = []       # (segments, t0, mine)
+        self.swings: list = []        # knife arcs: {id, heading, reach, hit, t0}
         self.shots: dict = {}         # player id -> {t0, art, roll, scale}
         self.mlights: list = []       # {x, y, t0, col, gain, reach, life}
         self.blasts: list = []        # {x, y, r, t0}
         self.rockets: list = []       # {x, y, ix, iy, t0, dur}
+        self.rail_ch = None           # the rail spool-up loop, while charging
         self.broken: set = set()      # coarse glass cells already broken here
         self.doors = DoorSet(self.m)
         self.packs = PickupSet(self.m)
@@ -276,6 +311,10 @@ class MatchView:
             buttons |= BTN_RELOAD
         if k[pygame.K_f]:
             buttons |= BTN_INTERACT
+        if k[pygame.K_e]:
+            buttons |= BTN_KNOCK
+        if k[pygame.K_SPACE]:
+            buttons |= BTN_ABILITY
         if k[pygame.K_l]:
             # the server owns the lamp and toggles it on the rising edge, so
             # holding the key does not strobe it
@@ -286,19 +325,181 @@ class MatchView:
         ax = (mxp + self.cam_x) / self.ppm
         ay = (myp + self.cam_y) / self.ppm
         dx, dy = ax - self.rx, ay - self.ry
-        if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+        if self._alive() and (abs(dx) > 1e-6 or abs(dy) > 1e-6):
+            # a dead player's view does not follow the mouse
             self.facing = math.atan2(dy, dx)
             self.aim_dist = max(0.5, math.hypot(dx, dy))
         return mx, my, buttons
 
+    # ---- the esc menu ------------------------------------------------
+
+    MENU_ITEMS = ("resume", "class", "leave")
+
+    def _my_pick(self) -> str:
+        me = self.cli.world.players.get(self.cli.world.my_id)
+        return classes.get(me.cls if me else None).key
+
+    def _cycle_class(self, step: int) -> None:
+        new = classes.cycle(self._my_pick(), step)
+        self.cli.set_class(new)
+        when = ("now playing it" if new == self.cls_now
+                else "from your next respawn")
+        self._say(f"class: {classes.get(new).name}, {when}")
+
+    @staticmethod
+    def _wrap(text: str, font, width: int) -> list:
+        """`text` broken into lines that fit `width`, on word boundaries."""
+        if font.size(text)[0] <= width:
+            return [text]
+        out, line = [], ""
+        for word in text.split():
+            trial = (line + " " + word).strip()
+            if line and font.size(trial)[0] > width:
+                out.append(line)
+                line = word
+            else:
+                line = trial
+        if line:
+            out.append(line)
+        return out
+
+    def _menu_rects(self):
+        """(item, rect) for each menu row, in window coordinates."""
+        bw = 600
+        x = self.view_w // 2 - bw // 2
+        y = self.view_h // 2 - 150
+        heights = {"resume": 40, "class": 130, "leave": 40}
+        out = []
+        yy = y + 50
+        for item in self.MENU_ITEMS:
+            out.append((item, pygame.Rect(x + 16, yy, bw - 32, heights[item])))
+            yy += heights[item] + 10
+        return out
+
+    def _menu_activate(self, item: str) -> str | None:
+        if item == "resume":
+            self.menu_open = False
+        elif item == "class":
+            self._cycle_class(1)
+        elif item == "leave":
+            return "leave"
+        return None
+
+    def _menu_event(self, ev) -> str | None:
+        """Everything while the menu is open. Up/down (or w/s) moves between
+        rows, left/right or the mouse wheel steps through the classes, enter
+        or a click picks, esc closes."""
+        if ev.type == pygame.KEYDOWN:
+            k = ev.key
+            if k == pygame.K_ESCAPE:
+                self.menu_open = False
+            elif k in (pygame.K_UP, pygame.K_w):
+                self.menu_sel = (self.menu_sel - 1) % len(self.MENU_ITEMS)
+            elif k in (pygame.K_DOWN, pygame.K_s):
+                self.menu_sel = (self.menu_sel + 1) % len(self.MENU_ITEMS)
+            elif k in (pygame.K_LEFT, pygame.K_a):
+                self._cycle_class(-1)
+            elif k in (pygame.K_RIGHT, pygame.K_d):
+                self._cycle_class(1)
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
+                return self._menu_activate(self.MENU_ITEMS[self.menu_sel])
+        elif ev.type == pygame.MOUSEWHEEL:
+            self._cycle_class(-1 if ev.y > 0 else 1)
+        elif ev.type == pygame.MOUSEMOTION:
+            for i, (item, r) in enumerate(self._menu_rects()):
+                if r.collidepoint(ev.pos):
+                    self.menu_sel = i
+        elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 3):
+            for item, r in self._menu_rects():
+                if r.collidepoint(ev.pos):
+                    if item == "class":
+                        self._cycle_class(1 if ev.button == 1 else -1)
+                        return None
+                    return self._menu_activate(item)
+        return None
+
+    def _draw_menu(self) -> None:
+        bw, bh = 600, 320
+        x = self.view_w // 2 - bw // 2
+        y = self.view_h // 2 - 150
+        shade = pygame.Surface((self.view_w, self.view_h), pygame.SRCALPHA)
+        shade.fill((0, 0, 0, 120))
+        self.window.blit(shade, (0, 0))
+        panel = pygame.Surface((bw, bh), pygame.SRCALPHA)
+        panel.fill((16, 18, 22, 236))
+        self.window.blit(panel, (x, y))
+        white, dim, gold = (222, 226, 232), (140, 146, 156), (230, 210, 140)
+        self.window.blit(self.font_mid.render("MENU", True, white), (x + 16, y + 14))
+        pick = self._my_pick()
+        c = classes.get(pick)
+        for i, (item, r) in enumerate(self._menu_rects()):
+            sel = i == self.menu_sel
+            pygame.draw.rect(self.window, (40, 44, 52) if sel else (26, 28, 34),
+                             r, border_radius=6)
+            pygame.draw.rect(self.window, gold if sel else (60, 64, 74), r,
+                             width=2, border_radius=6)
+            if item == "resume":
+                t = self.font_mid.render("Resume", True, white)
+                self.window.blit(t, t.get_rect(center=r.center))
+            elif item == "leave":
+                t = self.font_mid.render("Leave match", True, white)
+                self.window.blit(t, t.get_rect(center=r.center))
+            else:
+                t = self.font_mid.render(f"<   {c.name}   >", True, white)
+                self.window.blit(t, t.get_rect(midtop=(r.centerx, r.y + 8)))
+                lines = [(classes.stat_line(pick), white),
+                         (classes.weapon_line(pick), white),
+                         (f"space: {classes.ability_of(pick).name} - "
+                          f"{classes.ability_of(pick).hint}", dim)]
+                if pick != self.cls_now:
+                    lines.append((f"from your next respawn - now playing "
+                                  f"{classes.get(self.cls_now).name}", gold))
+                else:
+                    lines.append(("the class you are playing", dim))
+                # wrapped to the panel: an ability line is a sentence, and a
+                # sentence written past the edge of the box is one you cannot
+                # read the end of
+                wrapped = []
+                for txt, col in lines:
+                    wrapped += [(ln, col)
+                                for ln in self._wrap(txt, self.font, r.w - 24)]
+                step = min(22, max(14, (r.h - 44) // max(1, len(wrapped))))
+                for j, (txt, col) in enumerate(wrapped):
+                    s_ = self.font.render(txt, True, col)
+                    self.window.blit(s_, s_.get_rect(
+                        midtop=(r.centerx, r.y + 34 + j * step)))
+        hint = self.font.render(
+            "up/down choose   left/right or wheel: class   enter select   "
+            "esc close", True, dim)
+        self.window.blit(hint, hint.get_rect(midtop=(x + bw // 2, y + bh - 22)))
+
+    def _sync_class(self) -> None:
+        """Pick up a class change the moment the server spawns us as it: new
+        weapons, and the speed prediction steps at."""
+        me = self.cli.world.players.get(self.cli.world.my_id)
+        if me is None or me.cls_now == self.cls_now:
+            return
+        self.cls_now = classes.get(me.cls_now).key
+        self.loadout = list(classes.get(self.cls_now).loadout)
+        self.wep = 0
+        self.modes = [0] * len(self.loadout)
+        self._say(f"now playing {classes.get(self.cls_now).name}")
+
     def handle_event(self, ev) -> str | None:
         if ev.type == pygame.QUIT:
             return "quit"
+        if self.menu_open:
+            return self._menu_event(ev)
         if ev.type == pygame.KEYDOWN:
             if ev.key == pygame.K_ESCAPE:
-                return "leave"
+                self.menu_open = True
+                self.menu_sel = 0
+                self.show_scores = False
+                return None
             if ev.key == pygame.K_TAB:
                 self.show_scores = True
+            elif not self._alive():
+                pass                  # dead: the scoreboard and esc still work
             elif pygame.K_1 <= ev.key <= pygame.K_9:
                 idx = ev.key - pygame.K_1
                 if idx < len(self.loadout):
@@ -313,9 +514,47 @@ class MatchView:
                     self._say(f"{w.name}: no alt fire")
         elif ev.type == pygame.KEYUP and ev.key == pygame.K_TAB:
             self.show_scores = False
-        elif ev.type == pygame.MOUSEWHEEL:
+        elif ev.type == pygame.MOUSEWHEEL and self._alive():
             self._select((self.wep - ev.y) % len(self.loadout))
         return None
+
+    @staticmethod
+    def _their_weapon(p) -> str:
+        """The gun another player is holding: slot `wep` of THEIR class's kit,
+        not of ours."""
+        kit = classes.get(p.cls_now).loadout
+        return kit[min(p.wep, len(kit) - 1)]
+
+    def _on_ability(self, e, now):
+        """Somebody used their class ability. Your own ping is the one this
+        client has to draw; the rest is the server's business."""
+        who = self.cli.world.players.get(e["id"])
+        name = classes.ABILITIES.get(e.get("ab", ""))
+        if e["id"] == self.cli.world.my_id:
+            if e.get("ab") == "ping":
+                self.ping = (self.rx, self.ry, now + float(e.get("dur", 3.0)))
+            if name is not None:
+                self._say(name.name)
+        elif who is not None and name is not None and e.get("ab") == "blitz":
+            pass                     # nothing to draw for somebody else's yet
+
+    def _ability_speed(self) -> float:
+        """Blitz and Vanish, predicted the way the server runs them."""
+        me = self.cli.world.players.get(self.cli.world.my_id)
+        if me is None:
+            return 1.0
+        return classes.ability_speed(me.cls_now, me.ability_t > 0.0)
+
+    def _ping_visible(self, x: float, y: float) -> bool:
+        """Is this spot inside a live echo ping?"""
+        if self.ping is None:
+            return False
+        px, py, _t = self.ping
+        return math.hypot(x - px, y - py) <= classes.PING_RADIUS_M
+
+    def _alive(self) -> bool:
+        me = self.cli.world.players.get(self.cli.world.my_id)
+        return bool(me and me.alive)
 
     def _select(self, idx: int) -> None:
         if idx != self.wep:
@@ -327,16 +566,25 @@ class MatchView:
 
     # ---- prediction --------------------------------------------------
 
-    @staticmethod
-    def _stance(buttons):
+    def _stance(self, buttons):
+        """The stance the SERVER will give this input. Predicting a sprint the
+        server refuses - because the tank is empty - is a correction every
+        frame, so the client runs the same sprint fuel the server does."""
         if buttons & BTN_CRAWL:
             return "crawl"
-        return "run" if buttons & BTN_RUN else "walk"
+        want = "run" if buttons & BTN_RUN else "walk"
+        return movement.allowed_stance(want, self.stamina, self.sprint_locked)
 
     def _apply(self, x, y, mx, my, buttons):
         """One command, stepped exactly as the server will step it."""
-        return movement.step(self.m, x, y, mx, my,
-                             self._stance(buttons), TICK_DT)
+        moving = (mx, my) != (0.0, 0.0)
+        self.stamina, self.sprint_locked = movement.step_stamina(
+            self.stamina, self.sprint_locked, self._stance(buttons), moving,
+            TICK_DT)
+        return movement.step(
+            self.m, x, y, mx, my, self._stance(buttons), TICK_DT,
+            speed_mult=(classes.get(self.cls_now).speed_mult
+                        * self._ability_speed()))
 
     def send_commands(self, mx, my, buttons, dt):
         """Emit whole input commands at the server's tick rate, predicting each
@@ -400,9 +648,13 @@ class MatchView:
         ix, iy = e["impact"]
         if e.get("travel", 0.0) > 0.0:
             d = math.hypot(ix - e["x"], iy - e["y"])
+            flight = max(0.05, d / e["travel"])
+            fuse = float(e.get("fuse", 0.0))
+            # a fused round runs the server's clock: it flies, then lies there
+            # until the fuse ends. A rocket has no fuse and goes off on arrival.
             self.rockets.append({"x": e["x"], "y": e["y"], "ix": ix, "iy": iy,
-                                 "t0": now, "dur": max(0.05, d / e["travel"]),
-                                 "wep": wid})
+                                 "t0": now, "dur": fuse if fuse > 0.0 else flight,
+                                 "flight": flight, "fuse": fuse, "wep": wid})
         elif e.get("blast", 0.0) > 0.0:
             self.blasts.append({"x": ix, "y": iy, "r": e["blast"], "t0": now})
             if w is not None:
@@ -764,7 +1016,7 @@ class MatchView:
 
     def _draw_body(self, x, y, facing, colour, name, wep_id=None,
                    reloading=False, dead=False, light=1.0, shot=None,
-                   torch=False, now=0.0):
+                   torch=False, now=0.0, torch_light=None, cls=None):
         """A soldier in their own colour art, lit by whatever light reaches
         them, with a ring in that colour at their feet.
 
@@ -774,29 +1026,43 @@ class MatchView:
         ppm = self.ppm
         cx, cy = x * ppm, y * ppm
         r = max(4, int(renderer.BODY_R * ppm))
-        if torch:
-            light = max(light, renderer.FLASHLIGHT_SELF_SEEN)
         tint = self._light_tint(light)
+        # a lamp held out in front lights the front of the body, not the back:
+        # the whole sprite at the room's light, then its front half again at
+        # the lamp's
+        front = None
+        if torch and not dead:
+            front = self._light_tint(max(
+                light, renderer.FLASHLIGHT_SELF_SEEN if torch_light is None
+                else torch_light))
         cname = sprites.colour_name(colour)
+        cls_art = classes.get(cls).art if cls else ""
         pygame.draw.circle(self.surf, colour, (int(cx), int(cy)), r + 4, 2)
         drew = False
         if self.bank.ok:
             if dead:
                 drew = self.bank.blit(
-                    self.surf, self.bank.body_art("soldier_ded", cname),
+                    self.surf, self.bank.body_art("soldier_ded", cname, cls_art),
                     cx, cy, facing, tint=tuple(int(c * 0.55) for c in tint))
             elif reloading:
-                drew = self.bank.blit(
-                    self.surf, self.bank.body_art("soldier_idle", cname),
-                    cx, cy, facing, tint=tint)
+                art = self.bank.body_art("soldier_idle", cname, cls_art)
+                drew = self.bank.blit(self.surf, art, cx, cy, facing, tint=tint)
                 self.bank.blit(self.surf, "weapon_sling", cx, cy, facing,
                                tint=tint)
+                if front and drew:
+                    self.bank.blit_front(self.surf, art, cx, cy, facing,
+                                         tint=front)
+                    self.bank.blit_front(self.surf, "weapon_sling", cx, cy,
+                                         facing, tint=front)
             else:
-                drew = self.bank.blit(
-                    self.surf, self.bank.body_art("soldier_ready", cname),
-                    cx, cy, facing, tint=tint)
+                art = self.bank.body_art("soldier_ready", cname, cls_art)
+                drew = self.bank.blit(self.surf, art, cx, cy, facing, tint=tint)
+                if front and drew:
+                    self.bank.blit_front(self.surf, art, cx, cy, facing,
+                                         tint=front)
                 if wep_id:
-                    self._draw_weapon(cx, cy, facing, wep_id, tint, shot, now)
+                    self._draw_weapon(cx, cy, facing, wep_id, tint, shot, now,
+                                      front=front)
             if drew and not dead:
                 # the lamp itself is drawn full-bright when it is on, and as an
                 # unlit fitting when it is off
@@ -819,7 +1085,8 @@ class MatchView:
             tag = self.font.render(name, True, (235, 235, 235))
             self.surf.blit(tag, tag.get_rect(center=(cx, cy + NAME_DY * ppm)))
 
-    def _draw_weapon(self, cx, cy, facing, wep_id, tint, shot, now) -> None:
+    def _draw_weapon(self, cx, cy, facing, wep_id, tint, shot, now,
+                     front=None) -> None:
         """The gun, kicked back by however much recoil is left, and the muzzle
         flash pinned to its barrel.
 
@@ -827,6 +1094,8 @@ class MatchView:
         flash is the same two-layer sprite pair single-player draws, through
         the same function."""
         art = sprites.weapon_art(wep_id)
+        if not art:
+            return                    # a blade or a grenade: nothing in hand yet
         kick = 0.0
         if shot:
             age = now - shot["t0"]
@@ -835,11 +1104,44 @@ class MatchView:
         gwx = cx - math.cos(facing) * kick
         gwy = cy - math.sin(facing) * kick
         self.bank.blit(self.surf, art, gwx, gwy, facing, tint=tint)
+        if front is not None:
+            # the lamp's half of the gun, split on the body's line, not the
+            # gun's, so recoil does not move the edge
+            self.bank.blit_front(self.surf, art, gwx, gwy, facing, tint=front,
+                                 pivot=(cx, cy))
         if shot:
             ft = max(0.0, sprites.FLASH_TIME - (now - shot["t0"]))
             sprites.draw_muzzle(self.bank, self.surf, shot.get("art") or art,
                                 gwx, gwy, facing, ft, shot["roll"],
                                 shot["scale"])
+
+    def _draw_swings(self, now, mine: bool):
+        """A knife swing: a short arc where the blade went, brighter if it
+        landed. There is no projectile to trace, so this is all there is."""
+        w = self.cli.world
+        for sw in self.swings:
+            if (sw["id"] == w.my_id) != mine:
+                continue
+            if sw["id"] == w.my_id:
+                x, y = self.rx, self.ry
+            else:
+                p = w.players.get(sw["id"])
+                if p is None:
+                    continue
+                x, y, _a = p.render_pos(now, INTERP_DELAY)
+            age = (now - sw["t0"]) / SWING_TIME
+            fade = max(0.0, 1.0 - age)
+            r = sw["reach"] * self.ppm
+            col = (235, 225, 205) if sw["hit"] else (150, 156, 166)
+            arc = math.radians(50.0)
+            steps = 7
+            pts = [(x * self.ppm, y * self.ppm)]
+            for i in range(steps + 1):
+                a = sw["heading"] - arc + 2 * arc * i / steps
+                pts.append((x * self.ppm + math.cos(a) * r,
+                            y * self.ppm + math.sin(a) * r))
+            pygame.draw.lines(self.surf, tuple(int(c * fade) for c in col),
+                              False, pts[1:], 2)
 
     def _draw_effects(self, now, mine: bool):
         """Tracers, muzzle flashes, blasts and rockets.
@@ -870,14 +1172,27 @@ class MatchView:
                                (int(b["x"] * ppm), int(b["y"] * ppm)),
                                rad, max(2, int(6 * (1.0 - age))))
         for rk in self.rockets:
-            f = (now - rk["t0"]) / rk["dur"]
-            if f >= 1.0:
+            age = now - rk["t0"]
+            if age >= rk["dur"]:
                 continue
+            f = min(1.0, age / max(rk.get("flight", rk["dur"]), 1e-3))
             x = rk["x"] + (rk["ix"] - rk["x"]) * f
             y = rk["y"] + (rk["iy"] - rk["y"]) * f
-            pygame.draw.circle(self.surf, (255, 200, 120),
-                               (int(x * ppm), int(y * ppm)),
-                               max(2, int(ROCKET_R * ppm)))
+            if rk.get("fuse", 0.0) > 0.0:
+                # a grenade: dark, and the fuse light quickens as it burns down
+                left = 1.0 - age / rk["dur"]
+                blink = (now * (6.0 + 10.0 * (1.0 - left))) % 1.0 < 0.5
+                pygame.draw.circle(self.surf, (70, 74, 66),
+                                   (int(x * ppm), int(y * ppm)),
+                                   max(2, int(ROCKET_R * ppm)))
+                if blink:
+                    pygame.draw.circle(self.surf, (235, 120, 60),
+                                       (int(x * ppm), int(y * ppm)),
+                                       max(1, int(ROCKET_R * ppm * 0.5)))
+            else:
+                pygame.draw.circle(self.surf, (255, 200, 120),
+                                   (int(x * ppm), int(y * ppm)),
+                                   max(2, int(ROCKET_R * ppm)))
 
     def _blast_light(self, x, y, w, now) -> None:
         """A detonation as light: brighter, wider and longer-lived than a
@@ -889,13 +1204,37 @@ class MatchView:
     def _detonate(self, rk, now) -> None:
         """A rocket reached its impact point. The server sends the round on its
         way and its speed; when it arrives is arithmetic, so the client does
-        the fireball itself rather than waiting for a message."""
+        the fireball itself rather than waiting for a message.
+
+        A fused round is different: the server decides when it goes off and
+        says so, and drawing our own fireball as well as that one is how a
+        grenade came to explode twice."""
         w = weapons.ROSTER.get(rk.get("wep", ""))
-        if w is None or w.blast_r <= 0.0:
+        if w is None or w.blast_r <= 0.0 or rk.get("fuse", 0.0) > 0.0:
             return
         self.blasts.append({"x": rk["ix"], "y": rk["iy"], "r": w.blast_r,
                             "t0": now})
         self._blast_light(rk["ix"], rk["iy"], w, now)
+
+    def _rail_sound(self) -> None:
+        """The rail spool-up, for as long as the trigger is held.
+
+        Single-player starts this the moment the charge begins and cuts it on
+        release; multiplayer has no local trigger state to hang it on, so it
+        follows the charge the server reports - which is the same clock the
+        ring at the cursor is drawn from.
+        """
+        if not self.audio_on:
+            return
+        me = self.cli.world.players.get(self.cli.world.my_id)
+        w = weapons.ROSTER[self.loadout[self.wep]]
+        charging = (me is not None and me.charge > 0.0 and not w.is_cooked
+                    and me.alive)
+        if charging and self.rail_ch is None:
+            self.rail_ch = audio.play_channel("railcharge", 0.26)
+        elif not charging and self.rail_ch is not None:
+            self.rail_ch.stop()
+            self.rail_ch = None
 
     def _reap_effects(self, now):
         self.tracers = [t for t in self.tracers
@@ -904,6 +1243,7 @@ class MatchView:
                        if now - b["t0"] < renderer.BLAST_FADE]
         self.mlights = [m for m in self.mlights
                         if now - m["t0"] < m["life"]]
+        self.swings = [sw for sw in self.swings if now - sw["t0"] < SWING_TIME]
         gone = max(sprites.FLASH_TIME, sprites.RECOIL_TIME)
         self.shots = {i: sh for i, sh in self.shots.items()
                       if now - sh["t0"] < gone}
@@ -915,45 +1255,57 @@ class MatchView:
                 self._detonate(rk, now)
         self.rockets = live
 
-    def _draw_fog(self, vf, inten):
-        a_unknown = renderer.A_UNKNOWN / 255.0
-        a_remember = renderer.A_REMEMBERED / 255.0
-        ov_a = np.where(self.known, a_remember, a_unknown).astype(np.float32)
-        h_, w_ = inten.shape
-        sub = ov_a[vf.y0:vf.y0 + h_, vf.x0:vf.x0 + w_]
-        lit = inten > 0.004
-        sub[lit] = np.minimum(
-            sub[lit], a_remember * (1.0 - renderer.CONE_REVEAL * inten[lit]))
-        if self.mflash is not None:
-            # a muzzle flash briefly parts the veil where it lights, and only
-            # while it burns — it never writes anything into fog memory
-            mm = self.mflash > 0.004
-            sub[mm] = np.minimum(
-                sub[mm], a_remember * (1.0 - np.clip(self.mflash[mm] * 2.2,
-                                                     0.0, 1.0)))
-        ov_a = renderer.box_blur(ov_a, renderer.FOG_BLUR_R)
+    def _ping_into(self, ov_a, build):
+        """Open the veil inside a live ping, and write those cells into fog
+        memory so the room stays remembered once it fades."""
+        by0, by1, bx0, bx1 = build
+        px, py, _t = self.ping
+        cx, cy = self.m.cell_of(px, py)
+        r = classes.PING_RADIUS_M * self.cpm
+        ys = np.arange(by0, by1, dtype=np.float32)[:, None] - cy
+        xs = np.arange(bx0, bx1, dtype=np.float32)[None, :] - cx
+        inside = (xs * xs + ys * ys) <= r * r
+        ov_a[inside] = np.minimum(
+            ov_a[inside],
+            renderer.A_REMEMBER_F * (1.0 - renderer.CONE_REVEAL))
+        self.known[by0:by1, bx0:bx1] |= inside
 
+    def _draw_fog(self, vf, inten):
+        """The veil: unknown, remembered, and what is in view right now.
+
+        Only the fine cells under the camera (plus a blur margin) are built,
+        blurred and blitted - on a big map the rest of the world costs
+        nothing."""
         ppc = self.ppm / self.cpm                  # pixels per fine cell
-        foh, fow = ov_a.shape
-        mgn = renderer.FOG_BLUR_R + 2
-        fx0 = max(0, int(self.cam_x / ppc) - mgn)
-        fy0 = max(0, int(self.cam_y / ppc) - mgn)
-        fx1 = min(fow, int((self.cam_x + self.view_w) / ppc) + mgn + 1)
-        fy1 = min(foh, int((self.cam_y + self.view_h) / ppc) + mgn + 1)
-        fw, fh = fx1 - fx0, fy1 - fy0
+        build, blit = renderer.fog_windows(
+            self.known.shape, self.cam_x, self.cam_y, self.view_w,
+            self.view_h, ppc)
+        by0, by1, bx0, bx1 = build
+        ov_a, _rgb = renderer.fog_veil(
+            self.known, build, cone=(vf.y0, vf.x0, inten), mflash=self.mflash)
+        if self.ping is not None:
+            self._ping_into(ov_a, build)
+
+        sy0, sy1, sx0, sx1 = blit
+        fw, fh = sx1 - sx0, sy1 - sy0
         if fw <= 0 or fh <= 0:
             return
         if self._ov.get_size() != (fw, fh):
-            self._ov = pygame.Surface((fw, fh), pygame.SRCALPHA)
+            self._ov = pygame.Surface((fw, fh))
         px3 = pygame.surfarray.pixels3d(self._ov)
-        pxa = pygame.surfarray.pixels_alpha(self._ov)
-        px3[:, :, :] = 0
-        pxa[:, :] = np.transpose(
-            np.clip(ov_a[fy0:fy1, fx0:fx1] * 255.0, 0, 255)).astype(np.uint8)
-        del px3, pxa
-        self.surf.blit(pygame.transform.scale(
-            self._ov, (round(fw * ppc), round(fh * ppc))),
-            (round(fx0 * ppc), round(fy0 * ppc)))
+        keep = np.transpose(np.clip(
+            (1.0 - ov_a[sy0 - by0:sy1 - by0, sx0 - bx0:sx1 - bx0]) * 255.0,
+            0, 255)).astype(np.uint8)
+        px3[:, :, 0] = keep
+        px3[:, :, 1] = keep
+        px3[:, :, 2] = keep
+        del px3
+        big = (round(fw * ppc), round(fh * ppc))
+        if self._ov_big.get_size() != big:
+            self._ov_big = pygame.Surface(big)
+        pygame.transform.scale(self._ov, big, self._ov_big)
+        self.surf.blit(self._ov_big, (round(sx0 * ppc), round(sy0 * ppc)),
+                       special_flags=pygame.BLEND_RGB_MULT)
 
     def _draw_cues(self, now):
         """The arc that says a sound arrived, and roughly from where. A firm
@@ -1026,8 +1378,8 @@ class MatchView:
         wep = weapons.ROSTER[self.loadout[self.wep]]
         modes = wep.fire_modes()
         mode = modes[min(self.modes[self.wep], len(modes) - 1)]
-        by = self.view_h - 78
-        panel = pygame.Surface((300, 66), pygame.SRCALPHA)
+        by = self.view_h - 88
+        panel = pygame.Surface((300, 76), pygame.SRCALPHA)
         panel.fill((16, 18, 22, 210))
         self.window.blit(panel, (pad, by))
         if me:
@@ -1035,23 +1387,50 @@ class MatchView:
                       (190, 70, 70))
             self._bar(self.window, pad + 10, by + 22, 150, 6, me.sh,
                       (80, 150, 230))
+            # sprint fuel: dull grey once it has bottomed out and locked
+            self._bar(self.window, pad + 10, by + 31, 150, 4, self.stamina,
+                      (120, 120, 130) if self.sprint_locked else (230, 205, 110))
             ammo = f"{me.mag}" if me.reload_t <= 0 else "reloading"
+            if wep.is_melee:
+                ammo = "blade"
             if me.charge > 0.0:
-                ammo = f"charge {min(1.0, me.charge / 3.0) * 100:.0f}%"
+                if wep.is_cooked:
+                    # what is left of the fuse, which is what you are actually
+                    # deciding about while you hold it
+                    ammo = f"cook {max(0.0, wep.fuse_s - me.charge):.1f}s"
+                else:
+                    ammo = f"charge {min(1.0, me.charge / 3.0) * 100:.0f}%"
             self.window.blit(self.font.render(
                 f"{wep.name}  [{mode}]", True, (222, 226, 232)),
-                (pad + 10, by + 34))
+                (pad + 10, by + 40))
             self.window.blit(self.font_mid.render(ammo, True, (230, 210, 140)),
-                             (pad + 210, by + 18))
+                             (pad + 210, by + 20))
+            if wep.recharge_s > 0.0 and me.charge <= 0.0:
+                # a weapon with no reserve to count: what there is to know is
+                # how long until it hands you the next round
+                self.window.blit(self.font.render(
+                    f"/{wep.mag}", True, (120, 126, 136)),
+                    (pad + 210, by + 42))
+                self._bar(self.window, pad + 210, by + 58, 76, 4,
+                          me.recharge, (120, 190, 235))
+            # the class ability: running, cooling down, or ready
+            ab = classes.ability_of(me.cls_now)
+            if me.ability_t > 0.0:
+                txt, col = f"{ab.name}  {me.ability_t:.1f}s", (230, 210, 140)
+            elif me.ability_cd > 0.0:
+                txt, col = f"{ab.name}  {me.ability_cd:.0f}s", (120, 126, 136)
+            else:
+                txt, col = f"space: {ab.name}", (190, 196, 206)
+            self.window.blit(self.font.render(txt, True, col),
+                             (pad + 10, by + 58))
         near = self._near_door()
         if near is not None:
             d = self.doors.door(near)
             name = "blast door" if d.heavy else "door"
-            if d.moving:
-                # a travelling door is still a wall, and the countdown is the
-                # information that matters while you stand there
+            if d.moving and not d.reversible:
+                # a blast door is committed; the countdown is what matters
                 hint = f"{name} {'opening' if d.target else 'sealing'} — {d.left:.1f}s"
-            elif d.is_open:
+            elif (d.target if d.moving else d.is_open):
                 hint = f"f: close {name}"
             else:
                 hint = (f"f: open {name} ({d.dur:.0f}s)" if d.heavy
@@ -1064,11 +1443,23 @@ class MatchView:
                              (pad, by - 20))
         self.window.blit(self.font.render(
             f"({self.px:5.1f}, {self.py:5.1f})  correction "
-            f"{self.corrected_m * 100:4.1f} cm    tab scores   esc leave",
+            f"{self.corrected_m * 100:4.1f} cm    tab scores   e knock   "
+            f"space ability   esc menu",
             True, (90, 96, 106)), (pad, self.view_h - 20))
 
         mxp, myp = pygame.mouse.get_pos()
         pygame.draw.circle(self.window, (230, 230, 230), (mxp, myp), 3, 1)
+        if me is not None and me.charge > 0.0:
+            # the spool-up ring single-player draws, for the rail and for a
+            # grenade cooking in your hand - amber, then red as the fuse runs
+            full = wep.fuse_s if wep.is_cooked else 3.0
+            f = min(1.0, me.charge / max(full, 1e-3))
+            ring = ((235, 170, 60) if f < 0.7 else (235, 90, 60)) \
+                if wep.is_cooked else (120, 190, 255)
+            pygame.draw.circle(self.window, (60, 64, 74), (mxp, myp), 16, 1)
+            pygame.draw.arc(self.window, ring, (mxp - 16, myp - 16, 32, 32),
+                            -math.pi / 2, -math.pi / 2 + f * 2 * math.pi,
+                            3 if f < 0.999 else 4)
 
     # ---- one frame ---------------------------------------------------
 
@@ -1097,6 +1488,12 @@ class MatchView:
                 self._on_door(e, now)
             elif t == "pickup":
                 self._on_pickup(e, now)
+            elif t == "ability":
+                self._on_ability(e, now)
+            elif t == "melee":
+                self.swings.append({"id": e["id"], "heading": e["heading"],
+                                    "reach": e.get("reach", 1.6),
+                                    "hit": e.get("hit", 0), "t0": now})
 
         # doors travel on this client's own clock, started by the message that
         # said they had set off. Stepped BEFORE prediction, so the geometry
@@ -1105,8 +1502,32 @@ class MatchView:
         for _key, _open, _chg in self.doors.step(dt):
             if _chg:
                 self._door_arrived(_key, _open)
+        # the slit between moving panels. The client only needs it for
+        # sight — the server owns bullets — but writing both keeps this map
+        # identical to the server's
+        _sg = self.doors.gap_changes(self.m.subdiv)
+        for _key, _gap in _sg:
+            _d = self.doors.door(_key)
+            set_door_gap(self.m, _key[0], _key[1], _gap, _d.axis,
+                         bullets=_d.shoot_through)
+        if _sg:
+            self.vis.invalidate()
 
+        self._sync_class()
         mx, my, buttons = self.read_input()
+        me_now = w.players.get(w.my_id)
+        if me_now is not None:
+            # the server's number is the truth; ease onto it rather than
+            # snapping, so the bar does not jitter between snapshots
+            self.stamina += (me_now.stamina - self.stamina) * min(1.0, dt * 6.0)
+            if me_now.stamina <= 0.0:
+                self.sprint_locked = True
+            elif me_now.stamina >= movement.STAMINA_UNLOCK:
+                self.sprint_locked = False
+        if self.menu_open:
+            # in the menu you stand still and hold fire; the match goes on
+            mx = my = 0.0
+            buttons = 0
         me = w.players.get(w.my_id)
         alive = bool(me and me.alive)
         if alive:
@@ -1121,7 +1542,10 @@ class MatchView:
         self.rx += (self.px - self.rx) * f
         self.ry += (self.py - self.ry) * f
 
+        if self.ping is not None and now >= self.ping[2]:
+            self.ping = None          # the cells it showed stay remembered
         self._hear(now)
+        self._rail_sound()
         self._reap_effects(now)
 
         self.cam_x = int(min(max(self.rx * self.ppm - self.view_w * 0.5, 0),
@@ -1139,16 +1563,21 @@ class MatchView:
 
         # everyone else, and everything they did, goes under the fog
         self._draw_effects(now, mine=False)
+        self._draw_swings(now, mine=False)
         for p in w.players.values():
             if p.id == w.my_id or not p.alive:
                 continue
             rx, ry, raim = p.render_pos(now, INTERP_DELAY)
             cx, cy = self.m.cell_of(rx, ry)
-            if not self._sees_cell(vf, inten, cx, cy):
+            if p.vanished and math.hypot(rx - self.rx, ry - self.ry) \
+                    > classes.VANISH_SEEN_M:
+                continue                  # vanished: nothing to see from here
+            if not self._sees_cell(vf, inten, cx, cy) \
+                    and not self._ping_visible(rx, ry):
                 continue
             self._draw_body(rx, ry, raim, p.colour, p.name,
-                            wep_id=self.loadout[min(p.wep,
-                                                    len(self.loadout) - 1)],
+                            cls=p.cls_now,
+                            wep_id=self._their_weapon(p),
                             reloading=p.reload_t > 0.0,
                             light=self._illum_at(vf, cx, cy),
                             shot=self.shots.get(p.id), torch=p.flashlight,
@@ -1166,15 +1595,16 @@ class MatchView:
         if alive:
             pcx, pcy = self.m.cell_of(self.rx, self.ry)
             mylight = self._illum_at(vf, pcx, pcy)
-            if me is not None and me.flashlight:
-                mylight = max(mylight, renderer.FLASHLIGHT_SELF)
             self._draw_body(self.rx, self.ry, self.facing,
                             (me.colour if me else (220, 220, 220)), "",
+                            cls=self.cls_now,
                             wep_id=self.loadout[self.wep],
                             reloading=bool(me and me.reload_t > 0.0),
                             light=mylight, shot=self.shots.get(w.my_id),
-                            torch=bool(me and me.flashlight), now=now)
+                            torch=bool(me and me.flashlight), now=now,
+                            torch_light=renderer.FLASHLIGHT_SELF)
         self._draw_effects(now, mine=True)
+        self._draw_swings(now, mine=True)
         if self.mflash_rgb is not None:
             # the coloured glow of each flash, already shadow-cast and masked
             # to line of sight, over the fog
@@ -1195,6 +1625,8 @@ class MatchView:
             self.window.blit(txt, txt.get_rect(
                 center=(self.view_w // 2, self.view_h // 2)))
         self._draw_hud(now)
+        if self.menu_open:
+            self._draw_menu()
         pygame.display.flip()
         return None
 
@@ -1221,6 +1653,8 @@ def run_match(cli: GameClient, maps_dir="maps", window=None) -> str:
 def main():
     args = parse_args()
     window = _window_size(args.window)
+    import net.client as _netclient
+    _netclient.MAPS_DIR = Path(args.maps_dir)   # where to look for the host's map
     ip, port = args.address, DEFAULT_PORT
     if ip and ":" in ip:
         ip, _, ps = ip.partition(":")

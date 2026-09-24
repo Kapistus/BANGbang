@@ -15,12 +15,16 @@ with its own accuracy jitter by the caller. A projectile:
   through a body that had no shields, losing ``weapons.BODY_DMG_RETAIN`` of
   its damage each time, and stops on the first body that did have shields.
 
-``blast`` is the explosive path: full damage at the centre falling linearly
-to zero at ``radius_m``.
+``blast`` is the explosive path: full damage at the centre tapering to zero
+at ``radius_m``. Given the map, cover between the centre and each target
+counts the same way it does for a bullet, against ``BLAST_PEN``: glass and
+thin walls (which do not block shots at all) let the blast through, anything
+sturdier - walls, low cover, doors, blast doors - stops it.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -29,6 +33,8 @@ from sim import weapons
 MIN_PEN_COST = 0.05
 STEP_C = 0.25          # march increment, fine-grid cells
 BLAST_FALLOFF_EXP = 0.55   # < 1 keeps the outer half of a blast dangerous
+BLAST_PEN = 1.0            # a blast's cover budget: glass (0.3) yes, low cover
+                           # (1.2), doors (1.8), blast doors (3.2), walls no
 
 
 @dataclass
@@ -45,6 +51,9 @@ class Shot:
     hits: list              # list[Hit]
     pierced: int = 0
     shattered: list = None  # fine (col, row) cells of glass the shot broke
+    blast_at: tuple = None  # where an explosive goes off: `impact`, except that
+                            # a shot stopped by cover detonates on its near face
+                            # (impact is already inside the first solid cell)
 
 
 def _ray_circle(ox, oy, dx, dy, cx, cy, r):
@@ -117,6 +126,8 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
     max_c = max_range * cpm
     travelled = 0.0
     stop_pt = None
+    stop_solid = False      # stopped inside a solid cell (wall face / pane)
+    last_air = (ox_m, oy_m)
     shattered = []
 
     while travelled < max_c:
@@ -132,6 +143,8 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
             continue
         prev_cell = (ci, cj)
         solid = bool(blocks_bullets[cj, ci])
+        if not solid:
+            last_air = cur_m
         if solid and glass[cj, ci]:
             # glass: the shot goes straight through and the pane breaks
             if not shattered or shattered[-1] != (ci, cj):
@@ -139,6 +152,7 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
             budget -= 0.1
             if weapon.pen <= 0.0 or budget < 0.0:
                 stop_pt = cur_m       # explosives detonate on the pane
+                stop_solid = True
                 break
             continue
         if solid and mode == "air":
@@ -147,6 +161,7 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
             mode = "wall"
             if weapon.pen <= 0.0:
                 stop_pt = cur_m
+                stop_solid = True
                 break
             dist_m = math.hypot(cur_m[0] - ox_m, cur_m[1] - oy_m)
             budget -= max(float(pen_cost[cj, ci]), MIN_PEN_COST)
@@ -155,6 +170,7 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
             pierces.append((dist_m, retain))
             if budget < 0.0:
                 stop_pt = cur_m
+                stop_solid = True
                 break
         elif not solid and mode == "wall":
             segments.append((seg_start, cur_m, "wall"))
@@ -166,6 +182,7 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
     segments.append((seg_start, stop_pt, mode))
     stop_dist = math.hypot(stop_pt[0] - ox_m, stop_pt[1] - oy_m)
 
+    blast_at = last_air if stop_solid else stop_pt
     hits = []
     for t, tgt in bodies:
         if t > stop_dist + 1e-6:
@@ -173,7 +190,7 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
         if not apply_damage:
             # travelling explosive: the first body is where it detonates,
             # but the damage comes from blast() on arrival, not here
-            stop_pt = (ox_m + dx * t, oy_m + dy * t)
+            stop_pt = blast_at = (ox_m + dx * t, oy_m + dy * t)
             segments = _trim(segments, ox_m, oy_m, dx, dy, t)
             break
         scale = 1.0
@@ -196,13 +213,56 @@ def fire_shot(m, blocks_bullets, pen_cost, glass, origin, heading, weapon,
         break
 
     return Shot(segments=segments, impact=stop_pt, hits=hits, pierced=pierced,
-                shattered=shattered)
+                shattered=shattered, blast_at=blast_at)
 
 
-def blast(center, radius_m, weapon, targets, rng, now):
+def blast_cover(m, center, target):
+    """Damage fraction a blast at `center` still has on reaching `target`
+    (world metres) through the cover between them: 1.0 in the open, 0.0 when
+    the cover stops it. Same accounting as a bullet's: the first solid face of
+    each piece of cover spends its pen_cost from BLAST_PEN and passes on
+    WALL_DMG_RETAIN of the damage; glass costs its pen_cost too."""
+    cpm = m.cells_per_metre
+    bb, pc, gl = m.blocks_bullets, m.pen_cost, m.glass
+    rows, cols = bb.shape
+    x0, y0 = center[0] * cpm, center[1] * cpm
+    x1, y1 = target[0] * cpm, target[1] * cpm
+    length = math.hypot(x1 - x0, y1 - y0)
+    n = int(length / STEP_C)
+    if n <= 0:
+        return 1.0
+    sx, sy = (x1 - x0) / length * STEP_C, (y1 - y0) / length * STEP_C
+    budget, retain = BLAST_PEN, 1.0
+    prev = (int(x0), int(y0))
+    inside = None           # None in the open, else "glass" / "wall"
+    for i in range(1, n + 1):
+        ci, cj = int(x0 + sx * i), int(y0 + sy * i)
+        if (ci, cj) == prev:
+            continue
+        prev = (ci, cj)
+        if not (0 <= ci < cols and 0 <= cj < rows):
+            return 0.0
+        if not bb[cj, ci]:
+            inside = None
+            continue
+        kind = "glass" if gl[cj, ci] else "wall"
+        if kind == inside:
+            continue            # thickness past the face costs nothing
+        inside = kind
+        budget -= max(float(pc[cj, ci]), MIN_PEN_COST)
+        if kind == "wall":
+            retain *= weapons.WALL_DMG_RETAIN
+        if budget < 0.0:
+            return 0.0
+    return retain
+
+
+def blast(center, radius_m, weapon, targets, rng, now, m=None):
     """Area damage: full at the centre, tapering to zero at radius_m. The
     taper uses BLAST_FALLOFF_EXP (< 1) so the outer half of the blast still
-    hurts rather than only the dead centre."""
+    hurts rather than only the dead centre. With the map `m`, cover between
+    the centre and a target reduces or stops the damage (blast_cover); pass
+    the Shot's `blast_at` as the centre, not its `impact`."""
     hits = []
     cx, cy = center
     for tgt in targets:
@@ -211,9 +271,52 @@ def blast(center, radius_m, weapon, targets, rng, now):
         d = math.hypot(tgt.x - cx, tgt.y - cy)
         if d > radius_m:
             continue
+        cover = 1.0 if m is None else blast_cover(m, center, (tgt.x, tgt.y))
+        if cover <= 0.0:
+            continue
         dmg = weapons.roll_damage(weapon, rng) \
-            * (1.0 - d / radius_m) ** BLAST_FALLOFF_EXP
+            * (1.0 - d / radius_m) ** BLAST_FALLOFF_EXP * cover
         tgt.take(dmg, now, weapon.shield_mult, weapon.health_mult,
                  src=(cx, cy))
         hits.append(Hit(tgt, dmg, d))
     return hits
+
+
+FLAK_CORE_M = 0.1          # anything this close to the burst took the shell
+                           # itself; the ring is for everyone standing off it
+
+
+def burst(center, weapon, targets, rng, now, m=None):
+    """A flak shell coming apart where it stopped.
+
+    Two separate things happen. The shell's own blast catches whatever it hit -
+    point blank, that is the kill. Then `burst_pellets` pellets leave the same
+    point through the full circle, each one an ordinary shot with no
+    penetration, so a wall, a door or a corner takes them out of the air. A
+    body's distance from the centre decides how many of them find it: close in
+    the ring is dense, at the edge of `burst_range_m` you catch one if you are
+    unlucky.
+
+    Returns the pellet segments, for drawing.
+    """
+    cx, cy = center
+    blast(center, weapon.blast_r, weapon, targets, rng, now, m=m)
+    n = max(0, weapon.burst_pellets)
+    if m is None or n == 0 or weapon.burst_range_m <= 0.0:
+        return []
+    out = [t for t in targets
+           if math.hypot(getattr(t, "x", cx) - cx, getattr(t, "y", cy) - cy)
+           > max(weapon.blast_r, FLAK_CORE_M)]
+    pellet = dataclasses.replace(
+        weapon, range_m=weapon.burst_range_m, pen=0.0, pellets=1,
+        blast_r=0.0, projectile_speed=0.0, burst_pellets=0,
+        min_dev_m=0.0, accuracy=0.999)
+    step = 2.0 * math.pi / n
+    base = rng.uniform(0.0, step)
+    segs = []
+    for i in range(n):
+        hd = base + i * step
+        sh = fire_shot(m, m.blocks_bullets, m.pen_cost, m.glass,
+                       center, hd, pellet, out, rng, now)
+        segs.extend(sh.segments)
+    return segs

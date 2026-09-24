@@ -62,6 +62,10 @@ WEAPON_ART = {
     "plasma_rifle": "laser_rifle",
     "rocket_launcher": "rocket_launcher",
     "flamethrower": "rocket_launcher",
+    # no art for these two yet, and a knife drawn as a rifle is worse than no
+    # weapon in the hands at all: "" means draw nothing
+    "combat_knife": "",
+    "frag_grenade": "",
 }
 _ID_BY_NAME: dict[str, str] = {}
 
@@ -125,6 +129,38 @@ def weapon_art_for(weapon_obj) -> str:
         from sim import weapons
         _ID_BY_NAME.update({v.name: k for k, v in weapons.ROSTER.items()})
     return weapon_art(_ID_BY_NAME.get(getattr(weapon_obj, "name", ""), ""))
+
+
+FRONT_FEATHER = 0.14      # soft edge of a front-lit half, fraction of sprite size
+_front_masks: dict = {}
+
+
+def front_mask(size: tuple, facing: float, off: tuple = (0, 0)):
+    """White, with alpha 255 on the side of the sprite `facing` points at and
+    0 behind, ramped across FRONT_FEATHER. `off` is where the sprite's centre
+    sits relative to the line's pivot, in pixels. Masks for a centred sprite
+    are cached per size and whole degree; offset ones (a gun mid-recoil) are
+    small enough to make each time."""
+    import numpy as np
+    w, h = size
+    deg = int(round(math.degrees(facing))) % 360
+    key = (w, h, deg) if off == (0, 0) else None
+    if key is not None and key in _front_masks:
+        return _front_masks[key]
+    a = math.radians(deg)
+    feather = max(2.0, FRONT_FEATHER * min(w, h))
+    xs = np.arange(w, dtype=np.float32) - (w - 1) / 2.0 + off[0]
+    ys = np.arange(h, dtype=np.float32) - (h - 1) / 2.0 + off[1]
+    d = xs[:, None] * math.cos(a) + ys[None, :] * math.sin(a)   # (w, h)
+    alpha = np.clip(d / feather + 0.5, 0.0, 1.0) * 255.0
+    m = pygame.Surface((w, h), pygame.SRCALPHA)
+    m.fill((255, 255, 255, 255))
+    pa = pygame.surfarray.pixels_alpha(m)
+    pa[:] = alpha.astype(np.uint8)
+    del pa
+    if key is not None:
+        _front_masks[key] = m
+    return m
 
 
 def draw_muzzle(bank, screen, art: str, cx: float, cy: float, facing: float,
@@ -213,8 +249,18 @@ class SpriteBank:
             self.scale = scale
             self._cache.clear()
 
-    def body_art(self, pose: str, colour: "str | None") -> str:
-        """`pose` in a player's colour if that art exists, else the base pose."""
+    def body_art(self, pose: str, colour: "str | None",
+                 cls_art: str = "") -> str:
+        """The art for one pose: the class's own set if it has one, then the
+        player's colour, then the base soldier.
+
+        A class with art for one pose but not another (only `_idle` so far)
+        uses its own idle rather than falling back to the khaki soldier
+        mid-fight: the wrong stance reads better than the wrong armour."""
+        if cls_art:
+            for name in (f"{cls_art}_{pose}", f"{cls_art}_idle"):
+                if name in self.raw:
+                    return name
         if colour:
             name = f"{pose}_{colour}"
             if name in self.raw:
@@ -261,6 +307,33 @@ class SpriteBank:
                 surf.fill(tuple(wash) + (0,), special_flags=pygame.BLEND_RGB_ADD)
             if alpha is not None:
                 surf.set_alpha(alpha)
+        screen.blit(surf, surf.get_rect(center=(int(cx), int(cy))))
+        return True
+
+    def blit_front(self, screen, name: str, cx: float, cy: float,
+                   facing: float, tint: "tuple[int, int, int] | None" = None,
+                   pivot: "tuple[float, float] | None" = None,
+                   alpha: "int | None" = None) -> bool:
+        """Draw only the half of a sprite that faces `facing`: the part a
+        flashlight held in front of the body lights up.
+
+        The dividing line runs through `pivot` - the body's centre, which is
+        not the weapon's once recoil has kicked it back - square to the facing,
+        with a soft edge FRONT_FEATHER of the sprite wide so the lit half
+        fades into the rest rather than being cut off. Drawn over the same
+        sprite at its ordinary light, this leaves the back half as it was."""
+        surf = self.get(name, facing)
+        if surf is None:
+            return False
+        surf = surf.copy()
+        if tint is not None:
+            surf.fill(tuple(tint) + (255,), special_flags=pygame.BLEND_RGB_MULT)
+        px, py = pivot if pivot is not None else (cx, cy)
+        off = (int(cx) - int(px), int(cy) - int(py))
+        surf.blit(front_mask(surf.get_size(), facing, off), (0, 0),
+                  special_flags=pygame.BLEND_RGBA_MULT)
+        if alpha is not None:
+            surf.set_alpha(alpha)
         screen.blit(surf, surf.get_rect(center=(int(cx), int(cy))))
         return True
 

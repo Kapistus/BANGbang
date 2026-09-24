@@ -26,7 +26,18 @@ DEFAULT_PORT = 47801
 #    match_start says which way you are looking when you arrive.
 # 6: flashlights. An input bit toggles one, and snapshots carry whose is lit,
 #    because a beam is something everyone else can see coming.
-PROTOCOL_VERSION = 8
+# 9: map transfer. The lobby and match_start carry the map's fingerprint, and a
+#    player without that exact map asks the host for a copy.
+# 10: player classes. A player picks one in the lobby or from the in-match
+#     menu; it takes effect at their next spawn. The lobby roster carries each
+#     player's pick and snapshots the class they are playing right now, which
+#     sets their speed and weapons.
+# 11: class abilities and knocking. Two more input bits (space = ability,
+#     e = knock), and snapshots carry each player's ability state so a client
+#     can predict a Commando's sprint and draw a Tech's ping.
+# 12: the Saboteur. A melee swing has no projectile to trace, so it has its
+#     own message, and snapshots carry who is currently unseen.
+PROTOCOL_VERSION = 13
 
 
 # ---------------------------------------------------------------- enums
@@ -58,11 +69,18 @@ C_SET_NAME = "set_name"      # {name}
 C_SET_COLOUR = "set_colour"  # {colour}
 C_SET_TEAM = "set_team"      # {team}          (team modes only)
 C_SET_READY = "set_ready"    # {ready}
+C_SET_CLASS = "set_class"    # {cls}  sim/classes.py key; applies at the next
+                             #   spawn, so it can be sent from the lobby or
+                             #   mid-match
 C_SET_CONFIG = "set_config"  # host only: {mode?, duration_s?, map_id?}
 C_JOIN_MATCH = "join_match"   # drop me into the match that is already running
 C_LEAVE_MATCH = "leave_match"  # take me out of it, but keep my connection
 C_START = "start"            # host only: force-start ignoring un-ready? (see server)
 C_END_MATCH = "end_match"    # host only
+C_MAP_REQ = "map_req"        # {map_id}   send me the map you have selected
+C_MAP_HAVE = "map_have"      # {map_id, sha}  I have this map, this version:
+                             #   until the server hears it, readying does not
+                             #   start a match
 C_INPUT = "input"            # {seq, mx, my, aim, buttons, wep, mode} in MATCH
                              #   wep  = index into the player's loadout
                              #   mode = index into that weapon's fire modes
@@ -70,8 +88,13 @@ C_INPUT = "input"            # {seq, mx, my, aim, buttons, wep, mode} in MATCH
 # server -> client
 S_WELCOME = "welcome"        # {your_id, is_host}
 S_REJECT = "reject"          # {reason}
-S_LOBBY = "lobby"            # {state, mode, duration_s, map_id, host_id, players:[...]}
-S_MATCH_START = "match_start"  # {mode, duration_s, map_id, spawn:{x,y,aim},
+S_LOBBY = "lobby"            # {state, mode, duration_s, map_id, map_sha,
+                             #  host_id, players:[...]}  map_sha fingerprints
+                             #  the map's files; a player whose copy differs,
+                             #  or who has none, downloads the host's
+S_MAP_DATA = "map_data"      # {map_id, sha, files: {name: bytes}} or
+                             #   {map_id, error}: the host's copy of its map
+S_MATCH_START = "match_start"  # {mode, duration_s, map_id, map_sha, spawn:{x,y,aim},
                                #  team, players:[...]}
 S_SNAPSHOT = "snapshot"      # {tick, time_left, players:[{id,x,y,aim,alive,
                              #   respawn_in, seq, hp, sh, wep, mag, rl, pl}]}
@@ -82,9 +105,27 @@ S_SNAPSHOT = "snapshot"      # {tick, time_left, players:[{id,x,y,aim,alive,
                              #   rl    = reloading (seconds left, 0 = not)
                              #   fl    = flashlight lit: everyone can see a
                              #           beam, so everyone is told about it
+                             #   cl    = class they are playing now (their
+                             #           lobby roster entry has the one they
+                             #           have picked for next time)
+                             #   ab    = seconds of their ability left, 0 = not
+                             #           using it. Everyone is told, because an
+                             #           ability is something you can see
+                             #           somebody doing.
+                             #   acd   = YOUR ability's cooldown, seconds left
+                             #   vn    = vanished: drawn only from close up
+                             #   rc    = how far along the next round a
+                             #           self-charging magazine is making,
+                             #           0..1 (0 = not charging one)
 S_SHOT = "shot"              # {id, x, y, heading, wep, charge, segs, impact,
-                             #   blast}  one trigger pull, for tracers, muzzle
-                             #   flash and the sound it makes
+                             #   blast, travel, fuse}  one trigger pull, for
+                             #   tracers, muzzle flash and the sound it makes.
+                             #   A round that travels sends no segs - the round
+                             #   itself is the visual - and carries travel (its
+                             #   speed) plus fuse, the seconds it still has to
+                             #   run once thrown. It goes off on its own later
+                             #   message, so a fused round is drawn, never
+                             #   detonated, by this one.
 S_SOUND = "sound"            # {x, y, energy, clip, label, id, stance}  something
                              #   audible happened here; the client's own
                              #   propagation field decides what it can hear
@@ -97,10 +138,21 @@ S_MAP_STATE = "map_state"    # {doors: [[r, c, open, left], ...],
                              #   the file since the match began. Sent to a
                              #   latecomer, who would otherwise be shooting at
                              #   windows that are no longer there.
+S_MELEE = "melee"            # {id, heading, reach, hit}  a blade swung, and
+                             #   whose id it landed on (0 = thin air). No
+                             #   projectile to trace, so clients draw the arc
+                             #   from this.
+S_ABILITY = "ability"        # {id, ab, dur}  somebody used their class
+                             #   ability: which one, and how long it runs.
+                             #   Sent to everyone - an ability is something you
+                             #   can see a player doing.
 S_PICKUP = "pickup"          # {pid, live, by, dur}  a health or ammo pack was
                              #   taken, or came back. The server decides who
                              #   reached it first; clients only draw it.
 S_DOOR = "door"              # {r, c, open, dur, id, blocked}  a door moved, or
+                             #   someone tried and couldn't. `dur` is the travel
+                             #   still to run: the whole door for a fresh start,
+                             #   less for a quick door that was turned round.
                              #   someone tried and couldn't. Doors change
                              #   sight, sound and bullets, so like glass the
                              #   server owns the toggle and everyone applies it.
@@ -126,6 +178,8 @@ BTN_RELOAD = 1 << 2
 BTN_RUN = 1 << 3          # shift: sprint
 BTN_CRAWL = 1 << 4        # ctrl: crawl. Wins if both are held.
 BTN_LIGHT = 1 << 5        # flashlight, toggled on the press
+BTN_ABILITY = 1 << 6      # space: the class ability, on the press
+BTN_KNOCK = 1 << 7        # e: knock on the wall you are standing at
 # reserve more bits as the sim grows
 
 

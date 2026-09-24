@@ -745,7 +745,8 @@ class Guard(Combatant):
                 if w.blast_r > 0.0 and not travels:
                     # instant blast; a travelling one is spawned by the caller
                     # from the returned Shot and detonates on arrival
-                    ballistics.blast(sh.impact, w.blast_r, w, [player], rng, now)
+                    ballistics.blast(sh.blast_at, w.blast_r, w, [player], rng,
+                                     now, m=m)
         if now - self._fire_snd_t >= FIRE_SND_EVERY:
             self._fire_snd_t = now
             emit_cb(self.x, self.y, w.sound_reach_m * self.cpm,

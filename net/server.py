@@ -29,11 +29,11 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from sim import ballistics, combat, movement, perception, weapons
+from sim import ballistics, classes, combat, movement, perception, weapons
 from sim.doors import DoorSet
 from sim.pickups import PickupSet
 from sim import pickups as pk
-from sim.tilemap import break_glass_cells, set_door
+from sim.tilemap import break_glass_cells, set_door, set_door_gap
 
 from . import maps as netmaps
 from . import protocol as P
@@ -41,7 +41,7 @@ from .protocol import GameMode, ServerState, Team
 
 TICK_HZ = 30
 TICK_DT = 1.0 / TICK_HZ
-SNAPSHOT_HZ = 20                      # broadcast rate (<= TICK_HZ)
+SNAPSHOT_HZ = 30                      # broadcast rate (<= TICK_HZ)
 RESPAWN_DELAY = 10.0
 END_COUNTDOWN_FROM = 5
 MIN_DURATION = 120
@@ -84,6 +84,7 @@ SWAP_TIME = 0.55                           # mirrors sprites.SWAP_TIME, which is
 MUZZLE_M = weapons.MUZZLE_M                # shot origin ahead of the body
 INTERACT_RANGE = 1.6                       # mirrors main.py: how far you reach
 DOOR_SOUND_M = perception.KNOCK_REACH_M * 0.7
+ABILITY_SOUND_M = perception.KNOCK_REACH_M * 0.5   # a special is audible, quietly
 
 
 @dataclass
@@ -117,6 +118,9 @@ class NetPlayer:
     mags: list = field(default_factory=list)
     reserves: list = field(default_factory=list)
     fmode: list = field(default_factory=list)   # fire mode index, per weapon
+    charges: list = field(default_factory=list)  # self-recharging magazines:
+                                # seconds accumulated toward the next round,
+                                # one per weapon slot (sim/weapons.py)
     fire_cd: float = 0.0        # seconds until this weapon can fire again
     reload_t: float = 0.0
     swap_t: float = 0.0
@@ -127,7 +131,24 @@ class NetPlayer:
     reload_was: bool = False
     interact_was: bool = False
     light_was: bool = False
+    ability_was: bool = False
+    knock_was: bool = False
+    # the class ability: when it ends, when it may be used again, and how much
+    # health a channeled heal still owes
+    ability_until: float = 0.0
+    ability_ready_at: float = 0.0
+    heal_left: float = 0.0
     step_dist: float = 0.0      # metres since this player's last footstep
+    stamina: float = 1.0        # sprint fuel, 0..1 (sim/movement.py)
+    sprint_locked: bool = False  # bottomed out: no sprinting until it recovers
+    # (map_id, sha) of the map this player's client says it has. Readying up
+    # starts nothing until it matches the selected map: a player still
+    # downloading it would be dropped into a match they cannot draw.
+    has_map: tuple = ("", "")
+    # the class they are playing (what their body and loadout were built
+    # from) and the one they have picked, which takes over at the next spawn
+    cls: str = classes.DEFAULT
+    cls_next: str = classes.DEFAULT
 
     # input: queued commands, plus the last one applied (what the sim reads)
     inputs: deque = field(default_factory=deque)
@@ -240,6 +261,10 @@ class GameServer:
         self.map = None                    # TileMap: geometry players collide with
         self._map_loaded_id: str | None = None
         self._map_dirty = False
+        # the loaded map's files and their fingerprint, served to any player
+        # who does not have this exact map
+        self.map_sha = ""
+        self._map_files: dict = {}
         self.host = host
         self.port = port
         self.mode = mode
@@ -273,28 +298,56 @@ class GameServer:
 
     def _load_map(self) -> bool:
         """Load the geometry the sim collides against, plus the spawn points
-        that go with it. A failure here is not fatal — the match still runs,
-        players just move without collision, and the console says so rather
-        than the server dying in a thread nobody is watching."""
+        that go with it.
+
+        Only a PLAYABLE map is ever loaded (net.maps.validate). This used to
+        fall back to running the match "without collision" when a map failed —
+        but the clients load the same map to draw it, so that fallback started
+        a match every client immediately crashed out of. Now a map that fails
+        keeps the one already loaded, or, if there is none, switches to the
+        first playable map in the folder, and the lobby shows which."""
         map_id = self.map_id
-        try:
-            m, spawns = netmaps.load_with_spawns(map_id, self.maps_dir)
-        except Exception as e:
+        problem = None
+        if map_id != self._map_loaded_id:
+            # a new map: validate it first. A reload of the one we already
+            # have (to reset doors and glass between matches) skips this.
+            found = netmaps.validate(map_id, self.maps_dir)
+            problem = found[0] if found else None
+        if problem is None:
+            try:
+                m, spawns = netmaps.load_with_spawns(map_id, self.maps_dir)
+            except Exception as e:                    # noqa: BLE001
+                problem = f"does not load: {e}"
+        if problem is not None:
             if self.map is not None and self._map_loaded_id:
-                # A map that exists as a file but does not load as a map — such
-                # as a tile definition file the picker offered by mistake. Stay
-                # on the one we have rather than dropping collision entirely.
-                print(f"[server] map {map_id!r} failed to load ({e}); "
+                print(f"[server] map {map_id!r} is not playable ({problem}); "
                       f"staying on {self._map_loaded_id!r}")
                 self.map_id = self._map_loaded_id
                 return False
-            print(f"[server] map {map_id!r} failed to load ({e}); "
-                  f"players will move without collision")
-            with self._lock:
-                self.map = None
-                self._map_loaded_id = None
-            return False
+            fallback = netmaps.first_playable(self.maps_dir)
+            if fallback is None or fallback == map_id:
+                print(f"[server] map {map_id!r} is not playable ({problem}), "
+                      f"and no map in {self.maps_dir} is: refusing to start "
+                      f"a match")
+                with self._lock:
+                    self.map = None
+                    self._map_loaded_id = None
+                    self.map_sha = ""
+                    self._map_files = {}
+                return False
+            print(f"[server] map {map_id!r} is not playable ({problem}); "
+                  f"using {fallback!r} instead")
+            self.map_id = fallback
+            return self._load_map()
+        try:
+            files = netmaps.map_files(map_id, self.maps_dir)
+        except Exception as e:                        # noqa: BLE001
+            print(f"[server] map {map_id!r} loads but its files cannot be "
+                  f"read to share: {e}")
+            files = {}
         with self._lock:
+            self._map_files = files
+            self.map_sha = netmaps.files_sha(files) if files else ""
             self.map = m
             self.doors = DoorSet(m)
             self.packs = PickupSet(m)
@@ -486,6 +539,23 @@ class GameServer:
                             p.inputs.popleft()
                 return
 
+            if t == P.C_MAP_REQ:
+                self._send_map(p, str(msg.get("map_id", "")))
+                return
+            if t == P.C_SET_CLASS:
+                want = str(msg.get("cls", ""))
+                if want in classes.CLASSES and want != p.cls_next:
+                    p.cls_next = want
+                    self._broadcast_lobby_locked()
+                return
+            if t == P.C_MAP_HAVE:
+                p.has_map = (str(msg.get("map_id", "")), str(msg.get("sha", "")))
+                if self.state != ServerState.LOBBY:
+                    self._broadcast_lobby_locked()
+                    return
+                # in the lobby: fall through to the broadcast, and to the
+                # autostart this may have been the last thing waiting for
+
             if self.state != ServerState.LOBBY:
                 # lobby-only settings ignored mid-match, except host end_match
                 # and a player coming or going
@@ -559,7 +629,8 @@ class GameServer:
             if self.state != ServerState.LOBBY:
                 return
             ps = list(self.players.values())
-            if len(ps) >= MIN_PLAYERS_TO_START and all(q.ready for q in ps):
+            if len(ps) >= MIN_PLAYERS_TO_START and all(
+                    q.ready and self._has_map(q) for q in ps):
                 self._try_start(force=False)
 
     def _try_start(self, force: bool) -> None:
@@ -571,6 +642,11 @@ class GameServer:
             return
         if self.map is None or self._map_loaded_id != self.map_id:
             self._load_map()          # _lock is an RLock; re-entry is fine
+        if self.map is None:
+            # nothing playable to put anyone on: starting anyway is exactly
+            # what used to close every client's window
+            print("[server] not starting: no playable map loaded")
+            return
         # one spawn each where possible, from each player's own pool in team
         # modes, and never two people materialising on the same spot
         chosen, used = [], []
@@ -614,11 +690,34 @@ class GameServer:
                 "mode": int(self.mode),
                 "duration_s": self.duration_s,
                 "map_id": self.map_id,
+                "map_sha": self.map_sha,
                 "spawn": {"x": q.x, "y": q.y, "aim": round(q.aim, 3)},
                 "team": int(q.team),
                 "players": roster,
             })
         self._broadcast_score()
+
+    def _has_map(self, p: NetPlayer) -> bool:
+        """Does this player's client have the selected map, this version?"""
+        return bool(self.map_sha) and p.has_map == (self.map_id, self.map_sha)
+
+    def _send_map(self, p: NetPlayer, map_id: str) -> None:
+        """Hand a player the selected map. Only that one: the server never
+        reads a file a client names, just the map the host already chose and
+        validated. Caller holds _lock."""
+        if map_id != self.map_id or not self._map_files:
+            p.send({"t": P.S_MAP_DATA, "map_id": map_id,
+                    "error": f"the host is not on map {map_id!r}"})
+            return
+        size = sum(len(d) for d in self._map_files.values())
+        if size > netmaps.MAX_MAP_BYTES:
+            p.send({"t": P.S_MAP_DATA, "map_id": map_id,
+                    "error": f"map is {size // 1024} KiB, too large to send"})
+            return
+        print(f"[server] sending map {map_id!r} ({size // 1024} KiB) to "
+              f"{p.name}")
+        p.send({"t": P.S_MAP_DATA, "map_id": map_id, "sha": self.map_sha,
+                "files": dict(self._map_files)})
 
     def _spawn_for(self, p: NetPlayer, top: int = 1):
         """A spawn point for this player: from their side's pool in team modes,
@@ -662,6 +761,7 @@ class GameServer:
             "mode": int(self.mode),
             "duration_s": self.duration_s,
             "map_id": self.map_id,
+            "map_sha": self.map_sha,
             "spawn": {"x": p.x, "y": p.y, "aim": round(p.aim, 3)},
             "team": int(p.team),
             "players": roster,
@@ -725,11 +825,13 @@ class GameServer:
                 next_t = time.monotonic()          # fell behind; resync
 
     def _step_doors(self, dt: float, now: float) -> None:
-        """Move every door that is travelling, and apply the ones that arrive.
+        """Move every door that is travelling, apply the ones that arrive, and
+        write the slit between any moving panels into the map.
 
-        A door in motion is still a wall: `set_door` is called at the end of
-        the travel and nowhere else, which is what makes the blast door's five
-        seconds cost something."""
+        A moving door is never walkable: `set_door` opens the doorway at the
+        end of the travel and nowhere else. Its slit lets sight through, and on
+        a blast door bullets — which is what makes those five seconds a
+        firefight rather than a wait."""
         for (r, c), is_open, changed in self.doors.step(dt):
             if changed:
                 set_door(self.map, None, r, c, is_open)
@@ -737,6 +839,14 @@ class GameServer:
                 # the panels seating: a second, quieter cue that it is done
                 self._sound(c + 0.5, r + 0.5, DOOR_SOUND_M * 0.6, "door",
                             0, label="door")
+        # the slit between moving panels. The server needs it for BULLETS: on
+        # a blast door, a shot aimed through the gap has to get through, and
+        # the server is the one that decides what a shot hits
+        if self.map is not None:
+            for (r, c), gap in self.doors.gap_changes(self.map.subdiv):
+                d = self.doors.door((r, c))
+                set_door_gap(self.map, r, c, gap, d.axis,
+                             bullets=d.shoot_through)
 
     def _step_pickups(self, dt: float, now: float) -> None:
         """Respawn the packs whose time is up, then hand out any a live player
@@ -805,6 +915,7 @@ class GameServer:
                 # invented on their behalf, so a stalled client cannot drift.
         for p in self.players.values():
             if p.alive:
+                self._tick_ability(p, TICK_DT, now)
                 self._weapon_tick(p, TICK_DT, now)
         self.resolve_shots(now)
         if now >= self.match_end_time:
@@ -832,13 +943,22 @@ class GameServer:
         client predicting its own movement arrives at the same position the
         server does, and nothing rubber-bands."""
         stance = P.stance_of(p.buttons)
+        moving = (p.mx, p.my) != (0.0, 0.0)
+        # sprint fuel, drained here so a client cannot run for ever by simply
+        # holding the bit down
+        stance = movement.allowed_stance(stance, p.stamina, p.sprint_locked)
+        p.stamina, p.sprint_locked = movement.step_stamina(
+            p.stamina, p.sprint_locked, stance, moving, dt)
         if self.map is None:                # map failed to load: move freely
             mx, my = movement.clamp_input(p.mx, p.my)
-            v = movement.speed_of(stance) * dt
+            v = (movement.speed_of(stance) * classes.get(p.cls).speed_mult
+                 * self._ability_speed(p) * dt)
             p.x += mx * v
             p.y += my * v
             return
-        p.x, p.y = movement.step(self.map, p.x, p.y, p.mx, p.my, stance, dt)
+        p.x, p.y = movement.step(
+            self.map, p.x, p.y, p.mx, p.my, stance, dt,
+            speed_mult=classes.get(p.cls).speed_mult * self._ability_speed(p))
 
     # ------------------------------------------------------------ weapons
 
@@ -850,10 +970,11 @@ class GameServer:
         return modes[min(p.fmode[p.wi], len(modes) - 1)]
 
     def _reset_loadout(self, p: NetPlayer) -> None:
-        p.loadout = list(weapons.DEFAULT_LOADOUT)
+        p.loadout = list(classes.get(p.cls).loadout)
         p.mags = [weapons.ROSTER[k].mag for k in p.loadout]
         p.reserves = [weapons.ROSTER[k].reserve for k in p.loadout]
         p.fmode = [0] * len(p.loadout)
+        p.charges = [0.0] * len(p.loadout)
         p.wi = p.wep_want = 0
         p.fire_cd = p.reload_t = p.swap_t = 0.0
         p.charging = False
@@ -862,8 +983,16 @@ class GameServer:
 
     def _spawn_body(self, p: NetPlayer) -> None:
         """Give a player a fresh Combatant. Damage lands on this, not on the
-        NetPlayer, so every weapon in sim/ works on players untouched."""
-        p.body = combat.player_commando(p.x, p.y)
+        NetPlayer, so every weapon in sim/ works on players untouched.
+
+        This is where a class picked since the last spawn takes over."""
+        p.cls = classes.get(p.cls_next).key
+        p.body = classes.make_body(p.cls, p.x, p.y)
+        p.ability_until = 0.0
+        p.ability_ready_at = 0.0
+        p.heal_left = 0.0
+        p.ability_was = p.knock_was = False
+        p.stamina, p.sprint_locked = 1.0, False
         p.body.faction = "player"
         p.body.net_id = p.id
         p.hp = p.body.max_health
@@ -899,6 +1028,8 @@ class GameServer:
         if p.step_dist < stride:
             return
         p.step_dist = 0.0
+        if self._vanished(p):
+            return                      # a vanished Saboteur crosses in silence
         cx, cy = self.map.cell_of(p.x, p.y)
         mult = float(self.map.footstep_mult[cy, cx])
         self._sound(p.x, p.y, perception.FOOTSTEP_REACH_M[stance] * mult,
@@ -911,6 +1042,10 @@ class GameServer:
         p.body.tick(dt, now)
         p.fire_cd = max(0.0, p.fire_cd - dt)
         p.swap_t = max(0.0, p.swap_t - dt)
+        # a weapon that makes its own ammunition does it slung as well as held
+        if weapons.recharge_step(p.loadout, p.mags, p.charges, dt):
+            self._sound(p.x, p.y, perception.MAGDROP_REACH_M * 0.35,
+                        "reload", p.id, label=f"{p.id}/reload")
 
         # the client asks for a weapon; the server decides when it is in hand
         if p.wep_want != p.wi and p.swap_t <= 0.0 \
@@ -949,6 +1084,80 @@ class GameServer:
             self._interact(p, now)
         p.interact_was = want_use
 
+        want_knock = bool(p.buttons & P.BTN_KNOCK)
+        if want_knock and not p.knock_was:
+            self._sound(p.x, p.y, perception.KNOCK_REACH_M, "knock", p.id,
+                        label=f"{p.id}/knock")
+        p.knock_was = want_knock
+
+        want_ability = bool(p.buttons & P.BTN_ABILITY)
+        if want_ability and not p.ability_was:
+            self._start_ability(p, now)
+        p.ability_was = want_ability
+
+    # ------------------------------------------------------------ abilities
+
+    def _start_ability(self, p: NetPlayer, now: float) -> None:
+        """One special per class, on a shared cooldown. Everything it does is
+        decided here; clients only predict and draw it."""
+        if now < p.ability_ready_at or p.ability_until > now:
+            return
+        ab = classes.ability_of(p.cls)
+        p.ability_until = now + ab.duration
+        p.ability_ready_at = p.ability_until + classes.ABILITY_COOLDOWN_S
+        if ab.key == "heal" and p.body is not None:
+            p.heal_left = p.body.max_health * classes.HEAL_FRACTION
+        elif ab.key == "brace" and p.body is not None:
+            p.body.incoming_mult = classes.BRACE_MITIGATION
+        self._broadcast({"t": P.S_ABILITY, "id": p.id, "ab": ab.key,
+                         "dur": round(ab.duration, 2)})
+        self._sound(p.x, p.y, ABILITY_SOUND_M, "ability", p.id,
+                    label=f"{p.id}/ability")
+
+    def _end_ability(self, p: NetPlayer, now: float) -> None:
+        if p.ability_until <= 0.0:
+            return
+        p.ability_until = 0.0
+        p.heal_left = 0.0
+        if p.body is not None:
+            p.body.incoming_mult = 1.0
+        # the cooldown runs from the end, so a cancelled channel does not get
+        # to start again straight away
+        p.ability_ready_at = max(p.ability_ready_at,
+                                 now + classes.ABILITY_COOLDOWN_S)
+
+    def _tick_ability(self, p: NetPlayer, dt: float, now: float) -> None:
+        """Advance whatever this player's ability is doing this tick."""
+        if p.ability_until <= 0.0:
+            return
+        ab = classes.ability_of(p.cls)
+        moving = (p.mx, p.my) != (0.0, 0.0)
+        if ab.key == "heal":
+            hit = p.body is not None and now - p.body.last_hit_t < dt * 1.5
+            if moving or bool(p.buttons & P.BTN_FIRE) or hit:
+                self._end_ability(p, now)          # like a reload: interrupted
+                return
+            if p.body is not None and p.heal_left > 0.0:
+                # paid out as it goes, so an interrupted heal still counted
+                give = min(p.heal_left, p.body.max_health
+                           * classes.HEAL_FRACTION * dt / ab.duration)
+                p.body.health = min(p.body.max_health, p.body.health + give)
+                p.heal_left -= give
+        elif ab.key == "brace" and p.body is not None:
+            # bracing is standing your ground: the moment you move, it is off
+            p.body.incoming_mult = (1.0 if moving
+                                    else classes.BRACE_MITIGATION)
+        if now >= p.ability_until:
+            self._end_ability(p, now)
+
+    def _vanished(self, p: NetPlayer) -> bool:
+        """Is this player unseen and silent right now?"""
+        return (p.ability_until > 0.0
+                and classes.ability_of(p.cls).key == "vanish")
+
+    def _ability_speed(self, p: NetPlayer) -> float:
+        return classes.ability_speed(p.cls, p.ability_until > 0.0)
+
     def _interact(self, p: NetPlayer, now: float) -> None:
         """Open or close the nearest door. Same rules as single-player, with
         one addition: you cannot close a door on somebody else either."""
@@ -962,9 +1171,10 @@ class GameServer:
         if best is None:
             return
         door = self.doors.door(best)
-        if door.moving:
+        if door.moving and not door.reversible:
             return                        # once a blast door starts, it finishes
-        want_open = not door.is_open
+        # a quick door mid-travel turns round, so flip where it is HEADING
+        want_open = not (door.target if door.moving else door.is_open)
         if not want_open:
             # closing: nobody may be standing in the leaf, including the person
             # pulling it shut
@@ -988,8 +1198,10 @@ class GameServer:
         # The panels start moving NOW; the wall stops being a wall when they
         # arrive (_step_doors). Clients are told how long the travel takes and
         # run the same clock, so nobody has to be told again when it lands.
+        # `dur` is the travel LEFT, which for a fresh start is the whole door
+        # and for a turned-round one is only the part it had already covered
         self._broadcast({"t": P.S_DOOR, "r": best[0], "c": best[1],
-                         "open": want_open, "dur": round(door.dur, 3),
+                         "open": want_open, "dur": round(moved.left, 3),
                          "id": p.id, "blocked": False})
         clip = "door_heavy" if door.heavy else "door"
         self._sound(best[1] + 0.5, best[0] + 0.5, DOOR_SOUND_M, clip, p.id,
@@ -1032,6 +1244,23 @@ class GameServer:
         p.firing_was = held
         blocked = p.reload_t > 0.0 or p.swap_t > 0.0 or p.fire_cd > 0.0
 
+        if w.is_cooked:
+            # a grenade cooks while you hold it: the fuse runs from the moment
+            # the pin comes out, in your hand as readily as in the air
+            if held and not blocked and p.mags[p.wi] > 0:
+                p.charging = True
+                p.charge += TICK_DT
+                if p.charge >= w.fuse_s:
+                    self._cook_off(p, live, w, now)
+            elif released:
+                cooked = p.charge if p.charging else 0.0
+                fire = p.charging and not blocked and p.mags[p.wi] > 0
+                p.charging = False
+                p.charge = 0.0
+                if fire:
+                    self._fire(p, live, w, now, charge=cooked)
+            return
+
         if p.loadout[p.wi] in RAIL_IDS:
             # rail weapons spool up while held and go off on release, so the
             # shot you take is the one you decided to stop charging
@@ -1050,6 +1279,15 @@ class GameServer:
         if blocked:
             return
         if p.mags[p.wi] <= 0:
+            if (p.ability_until > 0.0
+                    and classes.ability_of(p.cls).key == "blitz"
+                    and p.reserves[p.wi] != 0 and p.reload_t <= 0.0):
+                # blitz: the magazine comes back the instant it runs dry, out
+                # of the ammo you are actually carrying
+                self._finish_reload(p, w)
+                self._sound(p.x, p.y, perception.MAGDROP_REACH_M, "reload",
+                            p.id, label=f"{p.id}/reload")
+                return
             if pressed:                    # the click that tells you it's empty
                 self._sound(p.x, p.y, perception.DRYFIRE_REACH_M, "dryfire",
                             p.id, label=f"{p.id}/dry")
@@ -1064,10 +1302,17 @@ class GameServer:
               charge: float = 0.0, auto: bool = False) -> None:
         """One trigger pull: rounds x pellets, each with its own spread, damage
         resolved by the same ballistics the single-player game uses."""
-        if charge > 0.0:
+        if charge > 0.0 and not w.is_cooked:
             mult = 1.0 + RAIL_CHARGE_BOOST * charge
             w = dataclasses.replace(w, dmg_lo=w.dmg_lo * mult,
                                     dmg_hi=w.dmg_hi * mult)
+            if charge >= 0.999 and w.pen_charged > 0.0:
+                w = dataclasses.replace(w, pen=w.pen_charged)
+        if self._vanished(p):
+            self._end_ability(p, now)   # a shot or a swing gives you away
+        if w.is_melee:
+            self._swing(p, live, w, now)
+            return
         p.fire_cd = w.auto_refire if auto else w.burst_time
         rounds = 1 if auto else w.burst
         acc = w.auto_accuracy if auto else None
@@ -1083,6 +1328,7 @@ class GameServer:
         aim_d = max(0.3, p.aim_dist)
 
         segs, impact, shattered, fired = [], (ox, oy), [], 0
+        thrown_fuse = 0.0
         for _ in range(rounds):
             if p.mags[p.wi] <= 0:
                 break
@@ -1101,14 +1347,37 @@ class GameServer:
                     shattered.extend(sh.shattered)
                 if travels:
                     d = math.hypot(sh.impact[0] - ox, sh.impact[1] - oy)
+                    if 0.0 < w.range_m < d:
+                        # nothing stopped it: a shell that outruns its own
+                        # range goes off there rather than carrying on down
+                        # the hall to whatever wall is at the end of it
+                        f = w.range_m / d
+                        sh = dataclasses.replace(
+                            sh,
+                            impact=(ox + (sh.impact[0] - ox) * f,
+                                    oy + (sh.impact[1] - oy) * f),
+                            blast_at=(ox + (sh.blast_at[0] - ox) * f,
+                                      oy + (sh.blast_at[1] - oy) * f))
+                        d = w.range_m
+                    # only a fused round runs a clock. A rocket or a plasma
+                    # bolt has no fuse at all and goes off where it lands:
+                    # giving it one detonates it in the shooter's face.
+                    fuse = max(0.05, w.fuse_s - charge) if w.fuse_s > 0.0 else 0.0
                     self._projectiles.append({
-                        "owner": p.id, "w": w, "x": ox, "y": oy,
+                        # the roster key, not w.name: the client looks the
+                        # weapon up by key to light and sound the blast
+                        "owner": p.id, "w": w, "wid": p.loadout[p.wi],
+                        "x": ox, "y": oy,
                         "ix": sh.impact[0], "iy": sh.impact[1],
-                        "dist": d, "flown": 0.0})
+                        "bx": sh.blast_at[0], "by": sh.blast_at[1],
+                        "dist": d, "flown": 0.0,
+                        # what is left of the fuse after the cooking
+                        "fuse": fuse})
+                    thrown_fuse = fuse
                 elif w.blast_r > 0.0:
                     # the shooter is not immune to their own blast
-                    ballistics.blast(sh.impact, w.blast_r, w,
-                                     others + [p.body], self._rng, now)
+                    ballistics.blast(sh.blast_at, w.blast_r, w,
+                                     others + [p.body], self._rng, now, m=m)
         if not fired:
             return
 
@@ -1119,13 +1388,79 @@ class GameServer:
             "t": P.S_SHOT, "id": p.id, "x": round(ox, 2), "y": round(oy, 2),
             "heading": round(p.aim, 3), "wep": p.loadout[p.wi],
             "charge": round(charge, 2),
-            "segs": [[round(a[0], 2), round(a[1], 2),
+            # a thrown or flying round IS the visual; a tracer line to
+            # where it will land gives the throw away and looks like a shot
+            "segs": [] if travels else
+                    [[round(a[0], 2), round(a[1], 2),
                       round(b[0], 2), round(b[1], 2)] for a, b, _k in segs[:24]],
             "impact": [round(impact[0], 2), round(impact[1], 2)],
             "blast": w.blast_r if not travels else 0.0,
             "travel": w.projectile_speed if travels else 0.0,
+            # a fused round keeps being drawn where it lands until it goes
+            # off; the client runs the same clock rather than guessing
+            "fuse": round(thrown_fuse, 2) if thrown_fuse else 0.0,
         })
         self._sound(ox, oy, w.sound_reach_m, "fire", p.id,
+                    label=f"{p.id}/fire")
+
+    def _swing(self, p: NetPlayer, live: list, w, now: float) -> None:
+        """A blade: no projectile, no spread. Whoever is inside the reach and
+        the arc takes it, and takes triple if you are behind them."""
+        p.fire_cd = w.burst_time
+        others = [q for q in live if q.id != p.id and q.body is not None]
+        by_body = {id(q.body): q for q in others}
+        was_alive = {id(q.body): q.body.alive for q in others}
+        hit = None
+        best = w.melee_range + movement.BODY_R
+        for q in others:
+            d = math.hypot(q.x - p.x, q.y - p.y)
+            if d > best:
+                continue
+            off = abs((math.atan2(q.y - p.y, q.x - p.x) - p.aim + math.pi)
+                      % (2 * math.pi) - math.pi)
+            if off > math.radians(w.melee_arc_deg):
+                continue
+            if self.map is not None:
+                cx, cy = self.map.cell_of((p.x + q.x) / 2, (p.y + q.y) / 2)
+                if self.map.blocks_bullets[cy, cx]:
+                    continue              # not through a wall
+            best, hit = d, q
+        if hit is not None:
+            # behind them: the angle between where they face and where the
+            # blade comes from
+            from_behind = abs(
+                (math.atan2(p.y - hit.y, p.x - hit.x) - hit.aim + math.pi)
+                % (2 * math.pi) - math.pi) > math.radians(100.0)
+            dmg = weapons.roll_damage(w, self._rng) * (w.backstab if from_behind
+                                                       else 1.0)
+            hit.body.take(dmg, now, w.shield_mult, w.health_mult, src=(p.x, p.y))
+            self._collect_kills(p, [q.body for q in others], was_alive,
+                                by_body, w, now)
+        self._broadcast({"t": P.S_MELEE, "id": p.id,
+                         "heading": round(p.aim, 3),
+                         "reach": w.melee_range,
+                         "hit": hit.id if hit is not None else 0})
+        self._sound(p.x, p.y, w.sound_reach_m, "melee", p.id,
+                    label=f"{p.id}/melee")
+
+    def _cook_off(self, p: NetPlayer, live: list, w, now: float) -> None:
+        """Held too long. It goes off where it is: in their hand."""
+        p.charging = False
+        p.charge = 0.0
+        p.mags[p.wi] = max(0, p.mags[p.wi] - 1)
+        p.fire_cd = w.burst_time
+        bodies = [q.body for q in live if q.body]
+        by_body = {id(q.body): q for q in live}
+        was_alive = {id(b): b.alive for b in bodies}
+        ballistics.blast((p.x, p.y), w.blast_r, w, bodies, self._rng, now,
+                         m=self.map)
+        self._collect_kills(p, bodies, was_alive, by_body, w, now)
+        self._broadcast({"t": P.S_SHOT, "id": p.id, "x": round(p.x, 2),
+                         "y": round(p.y, 2), "heading": round(p.aim, 3),
+                         "wep": p.loadout[p.wi], "charge": 0.0, "segs": [],
+                         "impact": [round(p.x, 2), round(p.y, 2)],
+                         "blast": w.blast_r, "travel": 0.0})
+        self._sound(p.x, p.y, w.sound_reach_m, "fire", p.id,
                     label=f"{p.id}/fire")
 
     def _muzzle(self, p: NetPlayer) -> tuple[float, float]:
@@ -1178,23 +1513,52 @@ class GameServer:
             return
         still = []
         for pr in self._projectiles:
-            pr["flown"] += pr["w"].projectile_speed * TICK_DT
-            if pr["flown"] < pr["dist"]:
-                still.append(pr)
-                continue
+            if pr.get("fuse", 0.0) > 0.0:
+                # a fuse runs wherever the thing is: in the air, or on the
+                # floor where it landed. Let one go too late and it goes off
+                # between you and whatever you threw it at.
+                pr["fuse"] -= TICK_DT
+                flying = pr["flown"] < pr["dist"]
+                if flying:
+                    pr["flown"] = min(pr["dist"],
+                                      pr["flown"] + pr["w"].projectile_speed * TICK_DT)
+                if pr["fuse"] > 0.0:
+                    still.append(pr)
+                    continue
+                if pr["flown"] < pr["dist"]:
+                    # it never got there: work out where it actually is
+                    f = pr["flown"] / max(pr["dist"], 1e-6)
+                    pr["bx"] = pr["x"] + (pr["bx"] - pr["x"]) * f
+                    pr["by"] = pr["y"] + (pr["by"] - pr["y"]) * f
+                    pr["ix"] = pr["x"] + (pr["ix"] - pr["x"]) * f
+                    pr["iy"] = pr["y"] + (pr["iy"] - pr["y"]) * f
+            elif pr["flown"] < pr["dist"]:
+                pr["flown"] += pr["w"].projectile_speed * TICK_DT
+                if pr["flown"] < pr["dist"]:
+                    still.append(pr)
+                    continue
             shooter = self.players.get(pr["owner"])
             bodies = [q.body for q in live if q.body]
             by_body = {id(q.body): q for q in live}
             was_alive = {id(b): b.alive for b in bodies}
-            ballistics.blast((pr["ix"], pr["iy"]), pr["w"].blast_r, pr["w"],
-                             bodies, self._rng, now)
+            segs = []
+            if pr["w"].burst_pellets > 0:
+                # a flak shell: the blast for whoever it hit, then the ring
+                segs = ballistics.burst((pr["bx"], pr["by"]), pr["w"],
+                                        bodies, self._rng, now, m=self.map)
+            else:
+                ballistics.blast((pr["bx"], pr["by"]), pr["w"].blast_r, pr["w"],
+                                 bodies, self._rng, now, m=self.map)
             if shooter is not None:
                 self._collect_kills(shooter, bodies, was_alive, by_body,
                                     pr["w"], now)
             self._broadcast({"t": P.S_SHOT, "id": pr["owner"],
                              "x": round(pr["ix"], 2), "y": round(pr["iy"], 2),
-                             "heading": 0.0, "wep": pr["w"].name,
-                             "charge": 0.0, "segs": [],
+                             "heading": 0.0, "wep": pr["wid"],
+                             "charge": 0.0,
+                             "segs": [[round(a[0], 2), round(a[1], 2),
+                                       round(b[0], 2), round(b[1], 2)]
+                                      for a, b, _k in segs[:48]],
                              "impact": [round(pr["ix"], 2), round(pr["iy"], 2)],
                              "blast": pr["w"].blast_r, "travel": 0.0})
             self._sound(pr["ix"], pr["iy"], pr["w"].sound_reach_m, "fire",
@@ -1251,11 +1615,13 @@ class GameServer:
     def _broadcast_lobby_locked(self) -> None:
         roster = [{"id": p.id, "name": p.name, "colour": list(p.colour),
                    "team": int(p.team), "ready": p.ready,
-                   "is_host": p.is_host, "playing": p.playing}
+                   "is_host": p.is_host, "playing": p.playing,
+                   "has_map": self._has_map(p), "cls": p.cls_next}
                   for p in self.players.values()]
         self._broadcast({
             "t": P.S_LOBBY, "state": int(self.state), "mode": int(self.mode),
             "duration_s": self.duration_s, "map_id": self.map_id,
+            "map_sha": self.map_sha,
             "host_id": self.host_id, "players": roster,
         })
 
@@ -1269,7 +1635,8 @@ class GameServer:
         with self._lock:
             roster = [{"id": p.id, "name": p.name, "colour": list(p.colour),
                        "team": int(p.team), "ready": p.ready,
-                       "is_host": p.is_host, "playing": p.playing}
+                       "is_host": p.is_host, "playing": p.playing,
+                       "has_map": self._has_map(p), "cls": p.cls_next}
                       for p in self.players.values()]
             self._broadcast({
                 "t": P.S_LOBBY,
@@ -1277,6 +1644,7 @@ class GameServer:
                 "mode": int(self.mode),
                 "duration_s": self.duration_s,
                 "map_id": self.map_id,
+                "map_sha": self.map_sha,
                 "host_id": self.host_id,
                 "players": roster,
             })
@@ -1297,9 +1665,19 @@ class GameServer:
                        if p.body and p.body.max_shields > 0 else 0.0),
                 "pl": p.playing,
                 "fl": p.flashlight,
+                "cl": p.cls,
+                "vn": self._vanished(p),
+                "st": round(p.stamina, 2),
+                "ab": round(max(0.0, p.ability_until - now), 2),
+                "acd": round(max(0.0, p.ability_ready_at - now), 1),
                 "wep": p.wi,
                 "mag": p.mags[p.wi] if p.mags else 0,
                 "rl": round(p.reload_t, 2),
+                # how far along the next self-made round is, for the bar the
+                # plasma rifle draws where a reserve count would be
+                "rc": (round(weapons.recharge_frac(
+                    p.loadout[p.wi], p.mags[p.wi], p.charges[p.wi]), 2)
+                    if p.loadout and p.charges else 0.0),
                 "chg": round(p.charge, 2),
                 "respawn_in": (round(max(0.0, p.respawn_at - now), 1)
                                if p.respawn_at else 0.0),

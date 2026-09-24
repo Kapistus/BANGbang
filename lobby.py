@@ -36,7 +36,7 @@ import pygame
 from net import GameClient, GameServer
 from net.protocol import GameMode, ServerState, Team, DEFAULT_PORT
 from net.mappicker import MapPicker
-from sim import sprites
+from sim import classes, sprites
 
 
 # --------------------------------------------------------------------- palette
@@ -58,7 +58,60 @@ TEAM_B = (230, 110, 80)
 # coloured soldier art you wear in the match.
 SWATCHES = list(sprites.SWATCHES)
 
-W, H = 820, 620
+# The lobby window. Everything here is laid out against these two numbers
+# rather than written down as pixels: the screens people have are 1920x1080
+# and up, and a 820x620 window put five class cards in 147 px each, which is
+# where the descriptions ran out of room.
+W, H = 1280, 800
+
+# the right-hand column: the player list, and the class box under it
+COL_X = W - 340
+COL_W = 300
+LIST_H = 420
+# the bottom band: every button and note on the lobby screen hangs off this
+BTN_Y = H - 150
+# the class cards, on the prompt that opens over the lobby
+CARD_TOP, CARD_H = 160, 380
+CARD_W_MAX = 200          # they are read side by side, so they are columns
+                          # rather than pages: wider than this and the eye
+                          # stops taking two of them in at once
+
+# the start and join screens are composed for this size and drawn centred in
+# the window, rather than pinned to its top-left corner
+PANEL_W, PANEL_H = 820, 620
+
+
+CARD_LINE_H = 17          # one line of card description
+
+
+def wrap(text: str, font, width: int) -> list:
+    """`text` broken on word boundaries into lines that fit `width`."""
+    out, line = [], ""
+    for word in text.split():
+        trial = (line + " " + word).strip()
+        if line and font.size(trial)[0] > width:
+            out.append(line)
+            line = word
+        else:
+            line = trial
+    if line:
+        out.append(line)
+    return out
+
+
+def card_text_top(cls, rect) -> int:
+    """Where a class card's description starts: under the name, the four
+    stats, the weapons it carries and the ability's name. Shared with
+    tests/lobby_layout_test.py, which checks the description still fits under
+    it - a card that cannot show the last line of an ability is a card that
+    lies about the class."""
+    return (rect.y + 12 + 36 + 4 * 21 + 8 + 20
+            + 19 * len(cls.loadout) + 8 + 19 + 21)
+
+
+def card_room(cls, rect) -> int:
+    """How many lines of description that card has room for."""
+    return max(0, (rect.bottom - 10 - card_text_top(cls, rect)) // CARD_LINE_H)
 
 
 class LobbyResult(enum.Enum):
@@ -154,6 +207,10 @@ class Lobby:
         self.f_big, self.f, self.f_sm = fonts
         self.auto_join = auto_join
         self._join_sent = False
+        # a fresh connection is asked to pick a class before anything else;
+        # somebody back from a match already has one and can change it with
+        # the class row
+        self.choosing_class = auto_join
         self.result: LobbyResult | None = None
         self._colour_idx = 0
         self._buttons: list[Button] = []
@@ -168,7 +225,7 @@ class Lobby:
         # map picker occupies the left-column space below the team row
         self.picker = MapPicker(
             client, maps_dir, (self.f, self.f_sm),
-            rect=(34, 240, 440, 180))
+            rect=(34, 240, COL_X - 58, BTN_Y - 264))
 
     # ---- helpers to read world ----
 
@@ -195,6 +252,16 @@ class Lobby:
     def _pick_colour(self, idx):
         self._colour_idx = idx
         self.cli.set_colour(SWATCHES[idx])
+
+    def _my_class(self) -> str:
+        me = self._me()
+        return classes.get(me.cls if me else None).key
+
+    def pick_class(self, key: str) -> None:
+        """Choose a class. From the join prompt this also lets an automatic
+        join go ahead, now that there is a class to join as."""
+        self.cli.set_class(key)
+        self.choosing_class = False
 
     def _toggle_ready(self):
         me = self._me()
@@ -232,11 +299,14 @@ class Lobby:
         if ev.type == pygame.QUIT:
             self.result = LobbyResult.EXIT
             return
-        self.name_field.handle(ev)
-        self.picker.handle_event(ev)
+        if not self.choosing_class:
+            self.name_field.handle(ev)
+            self.picker.handle_event(ev)
         for b in self._buttons:
             if b.handle(ev):
                 break
+        if self.choosing_class:
+            return                  # only the class cards take clicks
         # colour swatch clicks
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             for i, r in enumerate(self._swatch_rects()):
@@ -257,7 +327,7 @@ class Lobby:
         w = self.cli.world
         if w.state == ServerState.MATCH and w.playing and self.result is None:
             self.result = LobbyResult.START
-        elif (self.auto_join and not self._join_sent
+        elif (self.auto_join and not self._join_sent and not self.choosing_class
               and w.state == ServerState.MATCH and not w.playing):
             self._join_match()
 
@@ -319,7 +389,7 @@ class Lobby:
         self.picker.draw(surf)
 
         # ---- right column: player list ----
-        panel = pygame.Rect(500, 96, 288, 330)
+        panel = pygame.Rect(COL_X, 96, COL_W, LIST_H)
         pygame.draw.rect(surf, PANEL, panel, border_radius=8)
         pygame.draw.rect(surf, LINE, panel, width=1, border_radius=8)
         hdr = self.f_sm.render("PLAYERS", True, TEXT_DIM)
@@ -344,19 +414,58 @@ class Lobby:
                 tcol = TEAM_A if p.team == Team.A else TEAM_B
                 tag = self.f_sm.render(p.team.name, True, tcol)
                 surf.blit(tag, (panel.right - 54, y + 3))
-            # ready dot (fixed far-right)
+            # ready dot (fixed far-right); a hollow one while their client
+            # is still fetching the map - readying up waits for that
             dot = GOOD if p.ready else WARN
-            pygame.draw.circle(surf, dot, (panel.right - 20, y + 10), 6)
+            pygame.draw.circle(surf, dot, (panel.right - 20, y + 10), 6,
+                               width=0 if getattr(p, "has_map", True) else 2)
             y += 30
 
-        legend = self.f_sm.render("\u2605 host", True, TEXT_DIM)
-        surf.blit(legend, (panel.x + 14, panel.bottom - 44))
-
         cnt = self.f_sm.render(
-            f"{len(w.players)} connected · "
+            f"\u2605 host · {len(w.players)} connected · "
             f"{sum(p.ready for p in w.players.values())} ready",
             True, TEXT_DIM)
         surf.blit(cnt, (panel.x + 14, panel.bottom - 26))
+
+        # ---- your class, for your next spawn ----
+        box = pygame.Rect(COL_X, 96 + LIST_H + 16, COL_W, 140)
+        pygame.draw.rect(surf, PANEL, box, border_radius=8)
+        pygame.draw.rect(surf, LINE, box, width=1, border_radius=8)
+        surf.blit(self.f_sm.render("CLASS", True, TEXT_DIM),
+                  (box.x + 14, box.y + 8))
+        mine = self._my_class()
+        prev_b = Button((box.x + 62, box.y + 5, 28, 26), "<",
+                        lambda: self.cli.set_class(classes.cycle(
+                            self._my_class(), -1)))
+        next_b = Button((box.right - 38, box.y + 5, 28, 26), ">",
+                        lambda: self.cli.set_class(classes.cycle(
+                            self._my_class(), 1)))
+        prev_b.draw(surf, self.f)
+        next_b.draw(surf, self.f)
+        self._buttons += [prev_b, next_b]
+        nm = self.f.render(classes.get(mine).name, True, TEXT)
+        surf.blit(nm, nm.get_rect(center=((box.x + 90 + box.right - 38) // 2,
+                                          box.y + 18)))
+        c = classes.get(mine)
+        short = (f"{c.hp:.0f} hp · {c.sh:.0f} sh · "
+                 f"{c.armour:.0f}% armour · {c.spd:.1f} m/s")
+        for j, line in enumerate((short, classes.weapon_line(mine),
+                                  "space: " + classes.ability_of(mine).name)):
+            t = self.f_sm.render(line, True, TEXT_DIM)
+            while t.get_width() > box.w - 20 and len(line) > 8:
+                line = line[:-2]
+                t = self.f_sm.render(line + "…", True, TEXT_DIM)
+            surf.blit(t, (box.x + 12, box.y + 38 + j * 20))
+        surf.blit(self.f_sm.render("applies from your next spawn",
+                                   True, TEXT_DIM), (box.x + 12, box.y + 96))
+
+        # ---- the map: have it, fetching it, or could not get it ----
+        st = w.map_status
+        if st and st != "ready":
+            msg = (f"downloading map '{w.map_id}' from the host..."
+                   if st == "downloading" else f"map '{w.map_id}': {st}")
+            col = TEXT_DIM if st == "downloading" else BAD
+            surf.blit(self.f_sm.render(msg[:70], True, col), (34, BTN_Y - 24))
 
         # ---- bottom bar: ready / host controls / exit ----
         ready_on = bool(me and me.ready)
@@ -365,59 +474,141 @@ class Lobby:
         if mid_match:
             # a match is running without us: the only useful button is the one
             # that puts us in it
-            join_btn = Button((34, 470, 240, 48), "JOIN MATCH IN PROGRESS",
+            join_btn = Button((34, BTN_Y, 240, 48), "JOIN MATCH IN PROGRESS",
                               self._join_match, tone=GOOD)
             join_btn.draw(surf, self.f)
             self._buttons.append(join_btn)
             surf.blit(self.f_sm.render(
                 "you will spawn away from the fighting", True, TEXT_DIM),
-                (34, 524))
+                (34, BTN_Y + 54))
         else:
             ready_btn = Button(
-                (34, 470, 170, 48),
+                (34, BTN_Y, 170, 48),
                 "READY  \u2713" if ready_on else "READY UP",
                 self._toggle_ready, tone=GOOD if ready_on else ACCENT)
             ready_btn.draw(surf, self.f)
             self._buttons.append(ready_btn)
 
         if w.is_host:
-            mode_btn = Button((220, 470, 150, 48), "Mode: "
+            mode_btn = Button((220, BTN_Y, 150, 48), "Mode: "
                               + ("Team" if w.mode == GameMode.TEAM else "FFA"),
                               self._cycle_mode, tone=ACCENT)
             mode_btn.draw(surf, self.f)
-            minus = Button((386, 470, 36, 48), "-",
+            minus = Button((386, BTN_Y, 36, 48), "-",
                            lambda: self._bump_duration(-60))
-            plus = Button((526, 470, 36, 48), "+",
+            plus = Button((526, BTN_Y, 36, 48), "+",
                           lambda: self._bump_duration(60))
             minus.draw(surf, self.f); plus.draw(surf, self.f)
             dtxt = self.f_sm.render(f"{w.duration_s // 60}m",
                                     True, TEXT)
             surf.blit(dtxt, dtxt.get_rect(
-                center=(484, 494)))
+                center=(484, BTN_Y + 24)))
             self._buttons += [mode_btn, minus, plus]
 
             can_start = len(w.players) >= 2
             start_btn = Button(
-                (34, 532, 300, 52),
+                (34, BTN_Y + 62, 300, 52),
                 "START GAME" if can_start else "START (need 2+ players)",
                 self._start, enabled=can_start, tone=GOOD)
             start_btn.draw(surf, self.f)
             self._buttons.append(start_btn)
             hint = self.f_sm.render(
                 "auto-starts when everyone is ready", True, TEXT_DIM)
-            surf.blit(hint, (34, 590))
+            surf.blit(hint, (34, BTN_Y + 120))
         else:
             waiting = self.f_sm.render(
                 "waiting for host to start (auto when all ready)",
                 True, TEXT_DIM)
-            surf.blit(waiting, (34, 548))
+            surf.blit(waiting, (34, BTN_Y + 78))
 
-        exit_btn = Button((W - 186, 532, 152, 52), "EXIT",
+        exit_btn = Button((W - 186, BTN_Y + 62, 152, 52), "EXIT",
                           self._exit, tone=BAD)
         exit_btn.draw(surf, self.f)
         self._buttons.append(exit_btn)
 
-    # (exit button position is computed inline in draw)
+        if self.choosing_class:
+            self._draw_class_prompt(surf)
+
+    def _card_rects(self):
+        """One card per class, sized to fit however many there are."""
+        n = len(classes.ORDER)
+        gap, margin, ch = 12, 18, CARD_H
+        cw = min(CARD_W_MAX, (W - 2 * margin - gap * (n - 1)) // n)
+        x0 = (W - (cw * n + gap * (n - 1))) // 2
+        return [pygame.Rect(x0 + i * (cw + gap), CARD_TOP, cw, ch)
+                for i in range(n)]
+
+    def _draw_class_prompt(self, surf):
+        """The first thing a new arrival sees: the classes side by side, with
+        what each one is and carries. Picking one closes it; the class row in
+        the lobby changes it later."""
+        self._buttons = []                   # nothing underneath is live
+        shade = pygame.Surface((W, H), pygame.SRCALPHA)
+        shade.fill((8, 9, 12, 225))
+        surf.blit(shade, (0, 0))
+        head = self.f_big.render("Choose your class", True, TEXT)
+        surf.blit(head, head.get_rect(midtop=(W // 2, 70)))
+        sub = self.f_sm.render("you can change it in the lobby, or with esc "
+                               "during a match - it applies when you next "
+                               "spawn", True, TEXT_DIM)
+        surf.blit(sub, sub.get_rect(midtop=(W // 2, 114)))
+        from sim import weapons
+        mine = self._my_class()
+
+        def fit(text, font, width):
+            """`text`, trimmed with an ellipsis until it fits `width`."""
+            if font.size(text)[0] <= width:
+                return text
+            while text and font.size(text + "…")[0] > width:
+                text = text[:-1]
+            return text + "…"
+
+        for key, r in zip(classes.ORDER, self._card_rects()):
+            c = classes.get(key)
+            btn = Button(r, "", lambda k=key: self.pick_class(k),
+                         tone=GOOD if key == mine else ACCENT)
+            btn.draw(surf, self.f)
+            self._buttons.append(btn)
+            inner = r.w - 24
+            y = r.y + 12
+            # the name at full size if it fits, smaller if it does not
+            tfont = self.f if self.f.size(c.name)[0] <= inner else self.f_sm
+            t = tfont.render(fit(c.name, tfont, inner), True, TEXT)
+            surf.blit(t, t.get_rect(midtop=(r.centerx, y)))
+            y += 36
+            for label, val in (("health", f"{c.hp:.0f}"),
+                               ("shields", f"{c.sh:.0f}"),
+                               ("armour", f"{c.armour:.0f}%"),
+                               ("speed", f"{c.spd:.1f} m/s")):
+                surf.blit(self.f_sm.render(label, True, TEXT_DIM), (r.x + 12, y))
+                v = self.f_sm.render(val, True, TEXT)
+                surf.blit(v, (r.right - 12 - v.get_width(), y))
+                y += 21
+            y += 8
+            surf.blit(self.f_sm.render("weapons", True, TEXT_DIM), (r.x + 12, y))
+            y += 20
+            for wk in c.loadout:
+                nm = fit(weapons.ROSTER[wk].name, self.f_sm, inner - 8)
+                surf.blit(self.f_sm.render(nm, True, TEXT), (r.x + 18, y))
+                y += 19
+            y += 8
+            ab = classes.ability_of(key)
+            surf.blit(self.f_sm.render("space", True, TEXT_DIM), (r.x + 12, y))
+            y += 19
+            nm = self.f_sm.render(fit(ab.name, self.f_sm, inner), True, TEXT)
+            surf.blit(nm, (r.x + 18, y))
+            y += 21
+            # the ability and then the blurb, wrapped to the card and stopped
+            # at its bottom edge rather than spilling past it
+            y = card_text_top(c, r)     # one source of truth, shared with
+                                        # the test that checks it still fits
+            lines = wrap(ab.hint + " · " + c.blurb, self.f_sm, inner)
+            room = card_room(c, r)
+            for i, text in enumerate(lines[:room]):
+                if i == room - 1 and len(lines) > room:
+                    text = fit(text + " " + lines[room], self.f_sm, inner)
+                surf.blit(self.f_sm.render(text, True, TEXT_DIM), (r.x + 12, y))
+                y += CARD_LINE_H
 
 
 # --------------------------------------------------------------------- start screen
@@ -628,6 +819,35 @@ def _make_fonts():
             pygame.font.SysFont("arial", 15))
 
 
+def _panel_origin():
+    """Where the 820x620 start/join composition sits in the window."""
+    return ((W - PANEL_W) // 2, (H - PANEL_H) // 2)
+
+
+def _at_panel(ev, ox, oy):
+    """The same event, in the panel's coordinates rather than the window's."""
+    if not hasattr(ev, "pos"):
+        return ev
+    d = dict(ev.__dict__)
+    d["pos"] = (ev.pos[0] - ox, ev.pos[1] - oy)
+    return pygame.event.Event(ev.type, d)
+
+
+def _run_panel_screen(screen, panel, clock, scr, done):
+    """Drive one of the two small screens: it draws itself at its own size and
+    is blitted into the middle of the window, and the mouse is moved into its
+    frame so its buttons are where they look."""
+    ox, oy = _panel_origin()
+    while not done():
+        for ev in pygame.event.get():
+            scr.handle_event(_at_panel(ev, ox, oy))
+        scr.draw(panel)
+        screen.fill(BG)
+        screen.blit(panel, (ox, oy))
+        pygame.display.flip()
+        clock.tick(60)
+
+
 def run_lobby(default_ip="", existing_client: GameClient | None = None,
               mode: str | None = None, maps_dir="maps",
               existing_server: GameServer | None = None):
@@ -645,6 +865,7 @@ def run_lobby(default_ip="", existing_client: GameClient | None = None,
     pygame.display.set_caption("BANGbang Lobby")
     clock = pygame.time.Clock()
     fonts = _make_fonts()
+    panel = pygame.Surface((PANEL_W, PANEL_H))
 
     cli = existing_client
     srv = existing_server
@@ -654,23 +875,15 @@ def run_lobby(default_ip="", existing_client: GameClient | None = None,
             mode = "join" if default_ip else None
         if mode is None:
             start = StartScreen(fonts)
-            while start.choice is None and not start.exit:
-                for ev in pygame.event.get():
-                    start.handle_event(ev)
-                start.draw(screen)
-                pygame.display.flip()
-                clock.tick(60)
+            _run_panel_screen(screen, panel, clock, start,
+                              lambda: start.choice is not None or start.exit)
             if start.exit:
                 return LobbyResult.EXIT, None, None
             mode = start.choice
 
         join = JoinScreen(fonts, default_ip, mode=mode)
-        while join.client is None and not join.exit:
-            for ev in pygame.event.get():
-                join.handle_event(ev)
-            join.draw(screen)
-            pygame.display.flip()
-            clock.tick(60)
+        _run_panel_screen(screen, panel, clock, join,
+                          lambda: join.client is not None or join.exit)
         if join.exit:
             if join.server:
                 join.server.stop()

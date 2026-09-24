@@ -27,6 +27,11 @@ DMG_SCALE = 4.0         # global multiplier on all weapon damage. The bible's
                         # different pacing; this brings time-to-kill into
                         # single-digit seconds against bible-scale health.
 SPREAD_SCALE = 1.0       # global multiplier on all spread; tune for feel
+SPREAD_WIDEN = 1.33      # every gun but the rails is this much less precise
+                         # than its rating alone would say: a wider cone is
+                         # what gives the person being shot at time to move.
+                         # Rail weapons (steady=True) are exempt - the slow,
+                         # deliberate shot is the whole point of them.
 SOUND_SCALE = 0.8        # global multiplier on how far every shot is audible
 HARD_RANGE_M = 50.0      # flat max distance any shot registers a hit, metres
 MIN_DEV_M = 0.06         # every gun (bar the flamethrower) misses the exact
@@ -55,6 +60,16 @@ class Weapon:
                                # Quoted in whole magazines in the roster below.
     backblast: bool = False    # vents exhaust behind the shooter on firing
     pen: float = 0.0            # wall-penetration budget (spends tile pen_cost)
+    steady: bool = False        # exempt from SPREAD_WIDEN (the rail weapons)
+    melee_range: float = 0.0    # >0 = a blade, not a gun: no projectile, no
+                                # spread, just a reach and an arc
+    melee_arc_deg: float = 0.0  # half-angle of the swing
+    backstab: float = 1.0       # damage multiplier from behind the target
+    fuse_s: float = 0.0         # >0 = thrown on a fuse: this many seconds from
+                                # pulling the pin to going off, whether it is
+                                # still in your hand, in the air or on the
+                                # floor. Holding fire cooks it.
+    pen_charged: float = 0.0    # >0: the budget of a fully charged shot instead
     pellets: int = 1           # >1 for shotguns
     spread_deg: float = 0.0    # half-angle of the pellet cone (0 = all on the aim line)
     shell_reload_s: float = 0.0  # >0: load ONE round per this many seconds, interruptible
@@ -67,6 +82,14 @@ class Weapon:
     health_mult: float = 1.0     # damage multiplier while hitting health
     blast_r: float = 0.0         # >0 = explosive, area damage at impact
     projectile_speed: float = 0.0  # >0 = travels at this m/s instead of hitscan
+    burst_pellets: int = 0       # >0: the round comes apart where it lands,
+                                 # throwing this many pellets outward through
+                                 # the full circle. Cover stops them like any
+                                 # other shot; nothing is penetrated.
+    burst_range_m: float = 0.0   # how far those pellets carry
+    recharge_s: float = 0.0      # >0: the magazine puts a round back every
+                                 # this many seconds, on its own, with no
+                                 # reload and no reserve to draw on
     sound_reach_m: float = 90.0  # how far the shot is audible, in metres
     min_dev_m: float = MIN_DEV_M  # spread floor at any range (0 = perfectly on aim)
     weight: float = 1.0
@@ -105,6 +128,16 @@ class Weapon:
         """Time to the next reload increment: one shell, or the whole mag."""
         return self.shell_reload_s if self.shell_reload_s > 0.0 else self.reload_s
 
+    @property
+    def is_melee(self) -> bool:
+        return self.melee_range > 0.0
+
+    @property
+    def is_cooked(self) -> bool:
+        """Held to cook, thrown on release, and it goes off when the fuse
+        does - in your hand if you leave it that long."""
+        return self.fuse_s > 0.0
+
     def fire_modes(self) -> list[str]:
         primary = "burst" if self.burst > 1 else "semi"
         return [primary, "auto"] if self.has_auto else [primary]
@@ -113,7 +146,7 @@ class Weapon:
 def spread_factor(w: Weapon, dist_m: float, moving: bool,
                   accuracy: float | None = None) -> float:
     a = min(max(w.accuracy if accuracy is None else accuracy, 0.0), 0.999)
-    r = (0.5 - 0.389 * a) * SPREAD_SCALE
+    r = (0.5 - 0.389 * a) * SPREAD_SCALE * (1.0 if w.steady else SPREAD_WIDEN)
     if dist_m > w.range_m:
         r *= 1.0 + 2.0 * (dist_m / w.range_m - 1.0)
     if moving:
@@ -133,7 +166,8 @@ def jitter(w: Weapon, dist_m: float, moving: bool, rng,
     exactly on the cursor, even at point-blank range.
     """
     sf = spread_factor(w, dist_m, moving, accuracy)      # miss in m at optimal range
-    lin = max(sf * dist_m / max(w.range_m, 1e-3), w.min_dev_m)
+    floor = w.min_dev_m * (1.0 if w.steady else SPREAD_WIDEN)
+    lin = max(sf * dist_m / max(w.range_m, 1e-3), floor)
     half = math.atan2(lin, max(dist_m, 0.3))
     return (rng.random() + rng.random() - 1.0) * half
 
@@ -144,7 +178,7 @@ def pellet_offset(w: Weapon, rng) -> float:
     the middle. Zero for anything that is not a spread weapon."""
     if w.spread_deg <= 0.0:
         return 0.0
-    half = math.radians(w.spread_deg)
+    half = math.radians(w.spread_deg) * (1.0 if w.steady else SPREAD_WIDEN)
     return (rng.random() + rng.random() - 1.0) * half
 
 
@@ -160,7 +194,9 @@ ROSTER: dict[str, Weapon] = {
     # shot at a time - poor sustained fire (small mag, slow), but quiet enough
     # to drop an isolated guard without bringing the room
     "pistol": Weapon(
-        "pistol", "ballistic", 5, 7, 16, 1.6, 0.97, 8, 1.0,
+        # the trigger is as fast as the hand: a sidearm you can empty in three
+        # seconds, still one carefully-placed shot at a time
+        "pistol", "ballistic", 7, 10, 16, 2.6, 0.97, 8, 1.0,
         reserve=48, pen=2.0, sound_reach_m=50.0, weight=1.0, str_req=8, module_slots=1),
     # the generalist baseline: no weakness, no specialty, most customisable
     # (3 module slots); burst is the reliable mid-range answer, auto for panic
@@ -169,12 +205,17 @@ ROSTER: dict[str, Weapon] = {
         reserve=125, pen=2.2, burst=3, burst_cycle=0.50, auto_rof=6.0, auto_accuracy=0.83,
         sound_reach_m=105.0, weight=3.8, str_req=12.5, module_slots=3),
     "smg": Weapon(
-        "sub-machinegun", "ballistic", 2, 5, 16, 8.0, 0.87, 25, 2.0,
+        "sub-machinegun", "ballistic", 2, 4.5, 16, 8.0, 0.87, 25, 2.0,
         reserve=150, pen=1.8, auto_rof=13.0, auto_accuracy=0.70,
         sound_reach_m=100.0, weight=2.7, str_req=12.5, module_slots=2),
+    # the close-quarters answer: ten pellets, and what decides a fight is how
+    # many of them are still on the body. All ten kills anything but a Heavy
+    # outright; at 5 m - across a room, down a hallway - half of them land and
+    # it takes two shells; past 12 m the pattern is wider than a person and it
+    # is the wrong gun.
     "combat_shotgun": Weapon(
-        "combat shotgun", "ballistic", 5, 9, 26, 2.0, 0.92, 8, 3.0,
-        reserve=40, pen=1.6, pellets=5, spread_deg=9.0, shell_reload_s=1.0,
+        "combat shotgun", "ballistic", 5, 6.25, 20, 2.0, 0.92, 8, 3.0,
+        reserve=40, pen=1.6, pellets=10, spread_deg=9.0, shell_reload_s=1.0,
         sound_reach_m=115.0, weight=3.5, str_req=12.5, module_slots=1),
     # rail: anti-armour, shreds cover, feeble against shields. pistol = the
     # quick peek-and-wallbang sidearm (punches one wall), rifle = the heavy
@@ -182,10 +223,12 @@ ROSTER: dict[str, Weapon] = {
     "rail_pistol": Weapon(
         "rail pistol", "ballistic", 11, 16, 36, 1.6, 0.95, 8, 2.5,
         reserve=32, pen=2.5, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
+        steady=True, pen_charged=3.3,    # full charge only: through a blast door (3.2), not a wall (3.5)
         sound_reach_m=95.0, weight=1.4, str_req=8, module_slots=1),
     "rail_rifle": Weapon(
         "rail rifle", "ballistic", 20, 28, 40, 0.8, 0.97, 5, 3.2,
         reserve=20, pen=6.0, pierce_bodies=True, shield_mult=0.4, health_mult=1.0,
+        steady=True,
         sound_reach_m=110.0, weight=4.5, str_req=10, module_slots=2),
     # the reliable hard hitter: one big ballistic round, the longest dependable
     # ballistic range, best per-shot against a shielded target (normal mults)
@@ -195,9 +238,14 @@ ROSTER: dict[str, Weapon] = {
     # breacher: a 3-round burst of frag rounds, each a small blast in a tight
     # cone - clears a doorway, murders anything close, hazardous to fire point
     # blank (the shooter is in its own blast)
+    # a shell rather than a burst: it flies, and where it stops - a wall, a
+    # body, or the end of its run - it comes apart into a full circle of
+    # pellets. Point blank it is the shell that kills; across a doorway it is
+    # the ring, and the ring does not go through cover.
     "flak_cannon": Weapon(
-        "flak cannon", "heavy", 8, 12, 12, 1.0, 0.80, 5, 2.0,
-        reserve=15, pen=1.0, burst=3, spread_deg=7.0, blast_r=1.0,
+        "flak cannon", "heavy", 11, 16, 12, 1.0, 0.86, 5, 2.4,
+        reserve=15, pen=0.0, blast_r=1.4, projectile_speed=20.0,
+        burst_pellets=36, burst_range_m=5.0,
         sound_reach_m=120.0, weight=9.7, str_req=17, module_slots=1),
     # bible lists 2 shots before reload; overridden per request - reload every shot.
     # bible blast radius is "2-5 units"; 4 m radius = 8 m kill diameter.
@@ -206,6 +254,20 @@ ROSTER: dict[str, Weapon] = {
         reserve=2, backblast=True,          # 1 loaded + 2 spare = 3 rockets, ever
         pen=0.0, blast_r=4.0, projectile_speed=28.0, sound_reach_m=140.0,
         weight=15.2, str_req=15, module_slots=1),
+    # the Saboteur's blade: silent, and murderous from behind. Nothing about
+    # it works at a distance, which is the whole trade
+    "combat_knife": Weapon(
+        "combat knife", "melee", 14, 20, 1.6, 1.6, 1.0, 1, 0.0,
+        reserve=-1, melee_range=1.6, melee_arc_deg=50.0, backstab=4.5,
+        sound_reach_m=8.0, min_dev_m=0.0, weight=0.6, str_req=6,
+        module_slots=0),
+    # thrown on a three-second fuse that starts when you pull the pin, not
+    # when it lands. Hold to cook it: a cooked grenade gives the room no time,
+    # and one held too long goes off in your hand
+    "frag_grenade": Weapon(
+        "frag grenade", "heavy", 22, 34, 14, 1.0, 0.93, 1, 1.0,
+        reserve=2, pen=0.0, blast_r=3.5, projectile_speed=16.0, fuse_s=3.0,
+        sound_reach_m=130.0, weight=0.5, str_req=8, module_slots=0),
     # corridor denial: a short wide cone of fire, high flesh multiplier - no
     # one walks down this hallway and nothing stays in that doorway
     "flamethrower": Weapon(
@@ -227,9 +289,12 @@ ROSTER: dict[str, Weapon] = {
         sound_reach_m=45.0, weight=1.0, str_req=8, module_slots=1),
     # a slow-ish travelling plasma bolt (like the rocket, small splash) that
     # hits hard, especially against shields
+    # five bolts and no spare cells: the weapon makes its own, one every five
+    # seconds, so it is never empty for long and never fires for long either
     "laser_rifle": Weapon(
-        "plasma rifle", "plasma", 12, 18, 40, 1.6, 0.99, 24, 3.5,
-        reserve=96, pen=0.0, blast_r=1.2, projectile_speed=46.0, shield_mult=1.9,
+        "plasma rifle", "plasma", 12, 18, 40, 1.6, 0.99, 5, 3.5,
+        reserve=0, recharge_s=5.0,
+        pen=0.0, blast_r=1.2, projectile_speed=46.0, shield_mult=1.9,
         health_mult=1.0, sound_reach_m=75.0, weight=4.7, str_req=11,
         module_slots=2),
     # plasma family = travelling bolts w/ splash, balanced mults. pistol: a
@@ -260,3 +325,37 @@ DEFAULT_LOADOUT = [
     "pistol", "combat_rifle", "smg", "combat_shotgun",
     "rail_rifle", "laser_rifle", "rocket_launcher",
 ]
+
+
+def recharge_step(loadout, mags, charges, dt) -> bool:
+    """Weapons that make their own ammunition, one round at a time.
+
+    A plasma rifle carries no spare cells: the magazine puts a round back every
+    `recharge_s` seconds whether it is in your hands or slung, which is why it
+    has five of them rather than twenty-four. `charges` is one timer per slot,
+    the same length as `loadout`; both modes step it with this, so the bar on
+    the HUD is the same clock the shot comes out of. Returns True if a round
+    was added.
+    """
+    added = False
+    for i, key in enumerate(loadout):
+        w = ROSTER[key]
+        if w.recharge_s <= 0.0 or mags[i] >= w.mag:
+            charges[i] = 0.0
+            continue
+        charges[i] += dt
+        while charges[i] >= w.recharge_s and mags[i] < w.mag:
+            charges[i] -= w.recharge_s
+            mags[i] += 1
+            added = True
+        if mags[i] >= w.mag:
+            charges[i] = 0.0
+    return added
+
+
+def recharge_frac(key: str, mag_now: int, charge: float) -> float:
+    """How far along the next self-made round is, 0..1 (0 = not recharging)."""
+    w = ROSTER[key]
+    if w.recharge_s <= 0.0 or mag_now >= w.mag:
+        return 0.0
+    return max(0.0, min(1.0, charge / w.recharge_s))

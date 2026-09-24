@@ -72,6 +72,7 @@ from sim import mapfile, sprites, weapons
 from sim.tilemap import FLOOR_DARKEN, WALL_LIGHTEN, enclosed_mask
 from sim.doors import axis_from_solid
 from sim import pickups
+from net import maps as netmaps
 from sim.pickups import KINDS as PICKUP_KINDS
 from sim.tileset import load_tileset
 
@@ -92,6 +93,7 @@ PANEL_BG = (20, 20, 19)
 TEXT = (222, 220, 212)
 DIM = (140, 138, 132)
 SEL = (239, 159, 39)
+WARN = (240, 110, 90)          # a saved map that the lobby will not offer
 GRIDLN = (60, 60, 58)
 SPAWN_C = (29, 158, 117)
 GUARD_C = (216, 90, 48)
@@ -492,9 +494,11 @@ class Editor:
                 min(20.0, max(0.1, self.light_intensity + di)), 2)
             self._flash(f"next light  r{self.light_radius}  i{self.light_intensity}")
 
-    def _flash(self, text):
+    def _flash(self, text, ms=2000, colour=None):
         self.toast = text
         self.toast_t = pygame.time.get_ticks()
+        self.toast_ms = ms
+        self.toast_col = colour
 
     def _prompt_lines(self, label_prefix):
         """Blocking: text_prompt for successive lines until one comes back
@@ -613,6 +617,30 @@ class Editor:
         self.doc["name"] = self.path.stem
         mapfile.save(self.doc, self.path)
         self.dirty = False
+        self._check_playable()
+
+    def _check_playable(self):
+        """Run the saved map through the same check the lobby uses before it
+        lists a map, and say what it found.
+
+        The save always happens first — a problem never costs you your work. It
+        only decides whether the map shows up as something to host. A map that
+        is not playable stays marked in the status bar until it is saved clean."""
+        problems = netmaps.validate(self.path.stem, self.path.parent)
+        lobby_dir = (ROOT / "maps").resolve()
+        in_lobby = self.path.parent.resolve() == lobby_dir
+        self.save_problems = problems
+        if problems:
+            for p_ in problems:
+                print(f"[editor] {self.path.name}: {p_}")
+            more = f"  (+{len(problems) - 1} more, see console)" if len(problems) > 1 else ""
+            self._flash(f"saved, but NOT PLAYABLE - the lobby will not list it: "
+                        f"{problems[0]}{more}", ms=9000, colour=WARN)
+        elif in_lobby:
+            self._flash("saved - playable, and listed in the lobby")
+        else:
+            self._flash(f"saved - playable, but outside maps/ so the lobby "
+                        f"will not list it", ms=6000)
 
     def do_load(self):
         s = text_prompt(self.screen, self.font, "load (maps/....map):", "maps/")
@@ -657,14 +685,14 @@ class Editor:
             self.rows_hit.append((rect, kind, value))
             y += rh + 2
 
-        row("[ set player spawn ]  o", "mode", "spawn", active=self.mode == "spawn")
-        row("[ guard route ]  k", "mode", "guard", active=self.mode == "guard")
-        row(f"[ mp spawn ]  m   {self.spawn_team.upper() or 'ANY'} "
+        row("[ paint / erase ]  q", "mode", "erase", active=self.mode == "paint")
+        row("[ entity ]  e", "mode", "entity", active=self.mode == "entity")
+        row("[ light ]  r", "mode", "light", active=self.mode == "light")
+        row("[ guard route ]  t", "mode", "guard", active=self.mode == "guard")
+        row("[ set player spawn ]  y", "mode", "spawn", active=self.mode == "spawn")
+        row(f"[ mp spawn ]  u   {self.spawn_team.upper() or 'ANY'} "
             f"{self.spawn_facing:.0f}\u00b0", "mode", "mpspawn",
             active=self.mode == "mpspawn")
-        row("[ light ]  L", "mode", "light", active=self.mode == "light")
-        row("[ entity ]  e", "mode", "entity", active=self.mode == "entity")
-        row("[ paint / erase ]  p", "mode", "erase", active=self.mode == "paint")
         y += 4
 
         # Floor / Wall placement toggle  (w)
@@ -673,7 +701,7 @@ class Editor:
             active=self.place_role == "wall")
         y += 6
 
-        # tileset page switcher: < name (i/N) >  (Tab / click the arrows)
+        # tileset page switcher: < name (i/N) >  (p / Tab / click the arrows)
         if len(self.groups) > 1:
             gr = pygame.Rect(6, y, PANEL_W - 12, 24)
             half = gr.width // 2
@@ -885,6 +913,8 @@ class Editor:
         c, r = self.cell_at(mx, my)
         cell = f"{c},{r}" if self.in_grid(c, r) else "--"
         name = (self.path.name if self.path else "untitled") + ("*" if self.dirty else "")
+        if getattr(self, "save_problems", None):
+            name += "  NOT PLAYABLE"
         cur = {"paint": f"tile:{self.sel} [{self.tile_group}] as {self.place_role.upper()}",
                "spawn": "SET SPAWN (click a cell)",
                "guard": (f"GUARD  next [{self.guard_weapon} / {self.guard_skill}]  "
@@ -912,8 +942,10 @@ class Editor:
                f"  i grid{'' if self.show_grid else ':off'}"
                f"  o roof{'' if self.show_roof else ':off'}")
         self.screen.blit(self.font.render(msg, True, DIM), (8, h - STATUS_H + 6))
-        if self.toast and pygame.time.get_ticks() - self.toast_t < 2000:
-            t = self.small.render(self.toast, True, SEL)
+        if self.toast and (pygame.time.get_ticks() - self.toast_t
+                           < getattr(self, "toast_ms", 2000)):
+            t = self.small.render(self.toast, True,
+                                  getattr(self, "toast_col", None) or SEL)
             self.screen.blit(t, (w - t.get_width() - 10, h - STATUS_H + 7))
 
     # -- loop ----------------------------------------------------
@@ -1047,6 +1079,31 @@ class Editor:
                    or self.delete_mpspawn_near(mx, my)):
                 self.apply(mx, my, erase=True)
         return True
+
+    def on_mousedown(self, ev):
+        mx, my = ev.pos
+        if mx < PANEL_W:
+            if ev.button == 1:
+                self.panel_click(mx, my)
+            return
+        if ev.button == 1:
+            self.painting = True
+            self.apply(mx, my)
+        elif ev.button == 3:
+            if self.mode == "guard":
+                self.delete_guard_near(mx, my)   # RMB a route to remove it
+            elif self.mode == "light":
+                self.delete_light_near(mx, my)
+            elif self.mode == "entity":
+                self.delete_entity_near(mx, my)
+            elif self.mode == "mpspawn":
+                self.delete_mpspawn_near(mx, my)
+            else:
+                self.erasing = True
+                self.apply(mx, my, erase=True)
+        elif ev.button == 2:
+            self.panning = True
+            self.pan_from = ev.pos
 
     def on_motion(self, ev):
         mx, my = ev.pos

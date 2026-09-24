@@ -317,8 +317,20 @@ def init(seed: int = 1234) -> bool:
     return _ready
 
 
+# Per-clip playback trim, applied on top of whatever gain the caller asks for,
+# so a clip is quieter everywhere it plays - your own and other people's, in
+# single-player and multiplayer - without touching how far the sound carries
+# in the world (that is perception's reach, and it is what guards hear).
+CLIP_GAIN = {
+    "footstep": 0.75,
+    "door": 0.5,
+    "door_heavy": 0.375,   # 0.75, then halved with the quick door
+}
+
+
 def play(name: str, gain: float = 1.0, pan: float = 0.0) -> None:
     """Play a clip. `pan` is -1 (left) .. +1 (right); `gain` 0 .. 1."""
+    gain *= CLIP_GAIN.get(name, 1.0)
     if not _ready or gain <= 0.02:
         return
     variants = _bank.get(name)
@@ -365,6 +377,7 @@ def play_fire(weapon, gain: float = 1.0, pan: float = 0.0) -> None:
 def play_channel(name: str, gain: float = 1.0, pan: float = 0.0):
     """Like play() but returns the pygame Channel so the caller can stop /
     fade it (used for the hold-to-charge rail spool-up). None if no audio."""
+    gain *= CLIP_GAIN.get(name, 1.0)
     if not _ready or gain <= 0.02:
         return None
     variants = _bank.get(name)

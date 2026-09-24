@@ -22,6 +22,38 @@ SPEED_CRAWL, SPEED_WALK, SPEED_RUN = 0.9, 2.2, 6.0
 SPEEDS = {"crawl": SPEED_CRAWL, "walk": SPEED_WALK, "run": SPEED_RUN}
 
 
+# Sprint fuel, one definition for both modes. Six seconds of running empties
+# it; standing still refills it in five, walking in fourteen. Bottom it out
+# and you cannot sprint again until it has climbed back to STAMINA_UNLOCK,
+# which is what stops a player bunny-sprinting on fumes.
+STAMINA_DRAIN = 0.16
+STAMINA_REGEN_MOVE = 0.07
+STAMINA_REGEN_IDLE = 0.20
+STAMINA_UNLOCK = 0.25
+
+
+def step_stamina(stamina: float, locked: bool, stance: str, moving: bool,
+                 dt: float) -> tuple[float, bool]:
+    """One tick of sprint fuel. Returns (stamina, locked)."""
+    if stance == "run" and moving:
+        stamina = max(0.0, stamina - STAMINA_DRAIN * dt)
+        if stamina <= 0.0:
+            locked = True
+    else:
+        rate = STAMINA_REGEN_MOVE if moving else STAMINA_REGEN_IDLE
+        stamina = min(1.0, stamina + rate * dt)
+        if locked and stamina >= STAMINA_UNLOCK:
+            locked = False
+    return stamina, locked
+
+
+def allowed_stance(stance: str, stamina: float, locked: bool) -> str:
+    """The stance a player actually gets: no sprinting on an empty tank."""
+    if stance == "run" and (locked or stamina <= 0.0):
+        return "walk"
+    return stance
+
+
 def speed_of(stance: str) -> float:
     return SPEEDS.get(stance, SPEED_WALK)
 
@@ -58,10 +90,13 @@ def clamp_input(mx: float, my: float) -> tuple[float, float]:
 
 
 def step(m: TileMap, x: float, y: float, mx: float, my: float,
-         stance: str, dt: float, radius: float = BODY_R) -> tuple[float, float]:
-    """One movement tick: clamp the input, scale by stance speed, collide."""
+         stance: str, dt: float, radius: float = BODY_R,
+         speed_mult: float = 1.0) -> tuple[float, float]:
+    """One movement tick: clamp the input, scale by stance speed, collide.
+    `speed_mult` is the player's class (sim/classes.py): 1.0 for the Commando
+    the stance speeds were tuned on."""
     mx, my = clamp_input(mx, my)
     if mx == 0.0 and my == 0.0:
         return x, y
-    v = speed_of(stance) * dt
+    v = speed_of(stance) * speed_mult * dt
     return try_move(m, x, y, mx * v, my * v, radius)

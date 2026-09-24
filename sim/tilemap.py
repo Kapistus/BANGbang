@@ -296,6 +296,33 @@ def set_door(m: "TileMap", cost, r: int, c: int, is_open: bool) -> None:
         cost[y0:y1, x0:x1] = val
 
 
+def set_door_gap(m: "TileMap", r: int, c: int, gap: int, axis: str,
+                 bullets: bool = False) -> None:
+    """Write the slit between a door's panels into the map: `gap` fine cells
+    wide, centred, sight always and bullets when `bullets` — the rest of the
+    tile sealed. Movement and sound are never touched here; those stay the
+    door's until the panels are fully home.
+
+    The slit runs across the direction the panels travel: a door whose panels
+    slide left and right ("h") leaves a vertical slit down its middle."""
+    sub = m.subdiv
+    y0, x0 = r * sub, c * sub
+    t = m.tiles[m.chars[r, c]]
+    grids = [(m.blocks_sight, t.blocks_sight)]
+    if bullets:
+        grids.append((m.blocks_bullets, t.blocks_bullets))
+    for grid, sealed in grids:
+        grid[y0:y0 + sub, x0:x0 + sub] = sealed
+        if gap <= 0:
+            continue
+        g = min(gap, sub)
+        a = (sub - g) // 2
+        if axis == "h":
+            grid[y0:y0 + sub, x0 + a:x0 + a + g] = False
+        else:
+            grid[y0 + a:y0 + a + g, x0:x0 + sub] = False
+
+
 def break_glass_cells(m: "TileMap", fine_cells, cost: "np.ndarray | None" = None,
                       broken: "set | None" = None) -> list:
     """Turn every glass tile named by `fine_cells` into an open hole: bullets

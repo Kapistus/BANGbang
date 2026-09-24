@@ -197,6 +197,79 @@ def load_with_spawns(map_id: str, maps_dir: str | Path = DEFAULT_MAPS_DIR
     return m, spawn_points(map_id, m, maps_dir)
 
 
+MIN_SPAWNS = 2
+
+
+def validate(map_id: str, maps_dir: str | Path = DEFAULT_MAPS_DIR) -> list[str]:
+    """Why this map cannot be played, or [] if it can.
+
+    The one definition of a playable map, used by the lobby's map list, by the
+    server before it starts a match, and by the editor when it saves. A map is
+    playable when:
+
+      it loads — a char-grid map with a character the tile table does not
+        know raises, and a match started on it crashes every client
+
+      every tile it uses exists — a .map that names a tile the tileset does
+        not have still loads, but that cell comes out as bare floor, so a map
+        drawn with an old tileset plays with its walls missing
+
+      there are at least two places to spawn once unusable ones are dropped
+
+    Spawn WARNINGS — one authored spawn inside a wall, a map that tags only
+    one team — are deliberately not here. The server already drops an unusable
+    spawn and plays on with the rest, so those maps are playable; the editor
+    and main.py report them through validate_spawns instead.
+
+    Cheap enough to call every time the list is built: tens of milliseconds a
+    map.
+
+    Only a bare name for a map sitting directly in `maps_dir` can pass. The
+    resolver also takes file paths, which is how a crafted id like
+    "../tests/range" or "../somewhere" could otherwise get hosted — and
+    the test maps are for tests and trying things by hand, never the lobby."""
+    bare = Path(str(map_id))
+    if (not map_id or bare.name != str(map_id) or bare.suffix
+            or "/" in str(map_id) or "\\" in str(map_id)
+            or str(map_id) in (".", "..")):
+        return [f"{map_id!r} is not a map in {maps_dir}; only maps directly "
+                f"in that folder can be hosted"]
+    try:
+        m, spawns = load_with_spawns(map_id, maps_dir)
+    except Exception as e:                        # noqa: BLE001 — any failure
+        return [f"does not load: {e}"]
+    problems = []
+    ts = getattr(m, "tileset", None)
+    fids, oids = getattr(m, "floor_ids", None), getattr(m, "object_ids", None)
+    if ts is not None and fids is not None:
+        unknown: dict[str, int] = {}
+        for grid in (fids, oids):
+            if grid is None:
+                continue
+            for tid in grid.ravel().tolist():
+                if tid and tid not in ts:
+                    unknown[tid] = unknown.get(tid, 0) + 1
+        if unknown:
+            shown = ", ".join(sorted(unknown)[:6]) + ("…" if len(unknown) > 6 else "")
+            problems.append(f"{sum(unknown.values())} cells use tiles the tileset "
+                            f"does not have ({shown}); they would load as bare floor")
+    if len(spawns) < MIN_SPAWNS:
+        problems.append(f"only {len(spawns)} usable place(s) to spawn; "
+                        f"needs {MIN_SPAWNS}")
+    return problems
+
+
+def first_playable(maps_dir: str | Path = DEFAULT_MAPS_DIR,
+                   prefer: "str | None" = None) -> "str | None":
+    """`prefer` if it is playable, otherwise the first map id that is."""
+    if prefer and not validate(prefer, maps_dir):
+        return prefer
+    for mid in list_map_ids(maps_dir):
+        if not validate(mid, maps_dir):
+            return mid
+    return None
+
+
 def list_map_ids(maps_dir: str | Path = DEFAULT_MAPS_DIR) -> list[str]:
     """Map ids that actually load as maps. Unlike a bare *.toml glob this does
     not offer tiles.toml (a tile definition file) as something to play on."""
@@ -212,3 +285,88 @@ def list_map_ids(maps_dir: str | Path = DEFAULT_MAPS_DIR) -> list[str]:
             continue
         ids.append(stem)
     return ids
+
+
+# ------------------------------------------------------------------ transfer
+# A player who does not have the host's map - or has a different map under the
+# same name - gets a copy from the host. These say what "the map" is on disk,
+# and give it a fingerprint both sides can compare.
+
+import hashlib
+import re
+
+MAP_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+FILE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}\.(map|toml|grid)$")
+MAX_MAP_BYTES = 3 * 1024 * 1024     # one wire frame is capped at 4 MiB
+
+
+def map_files(map_id: str, maps_dir: str | Path = DEFAULT_MAPS_DIR) -> dict:
+    """Every file this map needs, name -> bytes. A .map is one file. A
+    char-grid map is its sidecar, the grid it names, and the tile table next
+    to them, because that table decides what each character is - a copy of a
+    grid read against a different table is a different map."""
+    path = resolve(map_id, maps_dir)
+    files = {path.name: path.read_bytes()}
+    if path.suffix == ".toml":
+        import tomllib
+        meta = tomllib.loads(files[path.name].decode("utf-8"))
+        grid = path.parent / str(meta["grid"])
+        files[grid.name] = grid.read_bytes()
+        tiles = path.parent / "tiles.toml"
+        if tiles.is_file():
+            files[tiles.name] = tiles.read_bytes()
+    return files
+
+
+def files_sha(files: dict) -> str:
+    """One fingerprint for a set of map files, independent of order."""
+    h = hashlib.sha256()
+    for name in sorted(files):
+        data = files[name]
+        h.update(name.encode("utf-8") + b"\0")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
+def map_sha(map_id: str, maps_dir: str | Path = DEFAULT_MAPS_DIR) -> "str | None":
+    """Fingerprint of this map as it is in maps_dir, or None if it is not."""
+    try:
+        return files_sha(map_files(map_id, maps_dir))
+    except Exception:                     # noqa: BLE001 - absent or unreadable
+        return None
+
+
+def save_download(map_id: str, sha: str, files: dict,
+                  download_dir: str | Path) -> Path:
+    """Write a map received from a host into its own folder under
+    download_dir, after checking it is what the host said it was and that
+    every name is a plain file name - nothing a host sends can land anywhere
+    else. Returns the folder. Raises ValueError on anything wrong."""
+    if not MAP_ID_RE.match(str(map_id)):
+        raise ValueError(f"refusing map id {map_id!r}")
+    if not files or not isinstance(files, dict):
+        raise ValueError("no files")
+    for name, data in files.items():
+        if not isinstance(name, str) or not FILE_NAME_RE.match(name):
+            raise ValueError(f"refusing file name {name!r}")
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError(f"{name}: not file data")
+    if sum(len(d) for d in files.values()) > MAX_MAP_BYTES:
+        raise ValueError("map is too large")
+    if files_sha(files) != sha:
+        raise ValueError("the files do not match the host's fingerprint")
+    stems = {Path(n).stem for n in files if not n.endswith((".grid",))} - {"tiles"}
+    if stems != {map_id}:
+        raise ValueError(f"files {sorted(files)} are not map {map_id!r}")
+    folder = Path(download_dir) / map_id
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.iterdir():            # a previous version of this map
+        if old.is_file() and FILE_NAME_RE.match(old.name):
+            old.unlink()
+    for name, data in files.items():
+        (folder / name).write_bytes(bytes(data))
+    problems = validate(map_id, folder)
+    if problems:
+        raise ValueError(f"the downloaded map is not playable: {problems[0]}")
+    return folder

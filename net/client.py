@@ -31,6 +31,12 @@ from dataclasses import dataclass, field
 from . import protocol as P
 from .protocol import GameMode, ServerState, Team
 
+# Where a client looks for the host's map, and where it keeps copies it had to
+# download. None = maps/ and maps/downloaded/ in the project. The tests point
+# both somewhere of their own, so a test run never writes into maps/.
+MAPS_DIR = None
+DOWNLOAD_DIR = None
+
 
 @dataclass
 class RemotePlayer:
@@ -41,6 +47,14 @@ class RemotePlayer:
     ready: bool = False
     is_host: bool = False
     playing: bool = False       # in the current match, as opposed to sitting out
+    has_map: bool = True        # False while their client fetches the map
+    cls: str = "commando"       # the class they have picked (lobby roster)
+    cls_now: str = "commando"   # the class they are playing (snapshots): what
+                                #   their speed and weapons come from
+    vanished: bool = False      # a Saboteur nobody can see past a few metres
+    stamina: float = 1.0        # sprint fuel, 0..1
+    ability_t: float = 0.0      # seconds of their class ability still running
+    ability_cd: float = 0.0     # (you only) seconds until you can use it again
     # match state (interpolation buffer)
     x: float = 0.0
     y: float = 0.0
@@ -54,6 +68,7 @@ class RemotePlayer:
     sh: float = 0.0             # shields, 0..1 of maximum
     wep: int = 0                # weapon index in their loadout
     mag: int = 0                # rounds left in it
+    recharge: float = 0.0       # 0..1 toward the next self-made round
     reload_t: float = 0.0       # seconds of reload remaining, 0 = not
     flashlight: bool = False    # their beam is lit
     charge: float = 0.0         # rail spool-up, seconds
@@ -97,6 +112,11 @@ class World:
     mode: GameMode = GameMode.FFA
     duration_s: int = 300
     map_id: str = "arena"
+    map_sha: str = ""           # fingerprint of the host's copy of the map
+    # where this machine has that exact map: its own maps folder, a copy
+    # downloaded from a host earlier, or None while it is still being fetched
+    map_dir: str | None = None
+    map_status: str = ""        # "", "downloading", "ready", "failed: why"
     host_id: int | None = None
     my_id: int | None = None
     is_host: bool = False
@@ -131,6 +151,14 @@ class GameClient:
         self._recv_thread: threading.Thread | None = None
         self.connected = False
         self.reject_reason: str | None = None
+        self._send_lock = threading.Lock()   # the receive thread sends too
+        self._map_key: tuple | None = None   # (map_id, sha) last looked for
+        self._join_pending = False
+        from . import maps as netmaps
+        from pathlib import Path
+        self.maps_dir = Path(MAPS_DIR or netmaps.DEFAULT_MAPS_DIR)
+        self.download_dir = Path(DOWNLOAD_DIR or (netmaps.DEFAULT_MAPS_DIR
+                                                  / "downloaded"))
 
     # ---------------------------------------------------------------- connect
 
@@ -176,7 +204,8 @@ class GameClient:
         if not self.sock:
             return
         try:
-            P.send_msg(self.sock, obj)
+            with self._send_lock:
+                P.send_msg(self.sock, obj)
         except OSError:
             self.connected = False
 
@@ -188,6 +217,15 @@ class GameClient:
 
     def set_team(self, team: Team) -> None:
         self._send({"t": P.C_SET_TEAM, "team": int(team)})
+
+    def set_class(self, cls: str) -> None:
+        """Pick a class (sim/classes.py key). It takes effect at your next
+        spawn: the start of the next match, or your next respawn."""
+        with self._lock:
+            me = self.world.players.get(self.world.my_id)
+            if me is not None:
+                me.cls = cls          # show it at once; the server confirms
+        self._send({"t": P.C_SET_CLASS, "cls": cls})
 
     def set_ready(self, ready: bool) -> None:
         self._send({"t": P.C_SET_READY, "ready": ready})
@@ -204,8 +242,27 @@ class GameClient:
         self._send(msg)
 
     def join_match(self) -> None:
-        """Ask to be dropped into the match already in progress."""
+        """Ask to be dropped into the match already in progress. Without the
+        map yet, the request waits and goes out the moment it arrives."""
+        with self._lock:
+            if self.world.map_dir is None:
+                self._join_pending = True
+                return
         self._send({"t": P.C_JOIN_MATCH})
+
+    def wait_for_map(self, timeout: float = 20.0) -> str | None:
+        """Block until this client has the selected map; its folder, or None
+        if it could not be had in time (see world.map_status for why)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                w = self.world
+                if w.map_dir is not None:
+                    return w.map_dir
+                if w.map_status.startswith("failed"):
+                    return None
+            time.sleep(0.02)
+        return None
 
     def leave_match(self) -> None:
         """Step out of the match but stay connected, so you can rejoin it."""
@@ -270,7 +327,93 @@ class GameClient:
         with self._lock:
             self._events.append({"t": "disconnected"})
 
+    # ---------------------------------------------------------------- the map
+
+    def _check_map(self, map_id: str, sha: str) -> None:
+        """Do we have the host's map, this exact version? Our own maps folder
+        first, then a copy downloaded earlier; if neither, ask the host.
+        Called from the receive thread, outside the world lock, because it
+        touches the disk."""
+        key = (map_id, sha)
+        if key == self._map_key:
+            return
+        self._map_key = key
+        from . import maps as netmaps
+        found = None
+        if not sha:
+            # a host that could not fingerprint its map: all we can do is use
+            # ours if we have one by that name
+            if netmaps.map_sha(map_id, self.maps_dir) is not None:
+                found = str(self.maps_dir)
+            with self._lock:
+                self.world.map_dir = found
+                self.world.map_status = "ready" if found else \
+                    "failed: the host did not offer this map for download"
+            return
+        for d in (self.maps_dir, self.download_dir / map_id):
+            if netmaps.map_sha(map_id, d) == sha:
+                found = str(d)
+                break
+        with self._lock:
+            w = self.world
+            w.map_dir = found
+            w.map_status = "ready" if found else "downloading"
+        if found:
+            self._have_map(map_id, sha)
+        else:
+            print(f"[client] no copy of map {map_id!r} matching the host's; "
+                  f"downloading it")
+            self._send({"t": P.C_MAP_REQ, "map_id": map_id})
+
+    def _have_map(self, map_id: str, sha: str) -> None:
+        self._send({"t": P.C_MAP_HAVE, "map_id": map_id, "sha": sha})
+        with self._lock:
+            self._events.append({"t": "map_ready", "map_id": map_id})
+            join = self._join_pending
+            self._join_pending = False
+        if join:
+            self._send({"t": P.C_JOIN_MATCH})
+
+    def _on_map_data(self, msg: dict) -> None:
+        from . import maps as netmaps
+        map_id = str(msg.get("map_id", ""))
+        with self._lock:
+            current = (self.world.map_id, self.world.map_sha)
+        if map_id != current[0] or msg.get("sha", current[1]) != current[1]:
+            return                      # the host has moved on since we asked
+        if "error" in msg:
+            why = f"failed: {msg['error']}"
+        else:
+            try:
+                folder = netmaps.save_download(map_id, current[1],
+                                               msg.get("files"),
+                                               self.download_dir)
+            except (ValueError, OSError) as e:
+                why = f"failed: {e}"
+            else:
+                with self._lock:
+                    self.world.map_dir = str(folder)
+                    self.world.map_status = "ready"
+                print(f"[client] map {map_id!r} downloaded to {folder}")
+                self._have_map(map_id, current[1])
+                return
+        print(f"[client] map {map_id!r}: {why}")
+        with self._lock:
+            self.world.map_status = why
+            self._events.append({"t": "map_failed", "map_id": map_id,
+                                 "reason": why})
+
     def _apply(self, msg: dict) -> None:
+        t = msg.get("t")
+        if t == P.S_MAP_DATA:
+            self._on_map_data(msg)
+            return
+        self._apply_world(msg)
+        if t in (P.S_LOBBY, P.S_MATCH_START):
+            self._check_map(str(msg.get("map_id", "")),
+                            str(msg.get("map_sha", "")))
+
+    def _apply_world(self, msg: dict) -> None:
         t = msg.get("t")
         now = time.monotonic()
         with self._lock:
@@ -288,6 +431,7 @@ class GameClient:
                 w.mode = GameMode(msg["mode"])
                 w.duration_s = msg["duration_s"]
                 w.map_id = msg["map_id"]
+                w.map_sha = msg.get("map_sha", "")
                 w.host_id = msg["host_id"]
                 seen = set()
                 for pd in msg["players"]:
@@ -300,6 +444,8 @@ class GameClient:
                     p.ready = pd["ready"]
                     p.is_host = pd["is_host"]
                     p.playing = pd.get("playing", False)
+                    p.has_map = pd.get("has_map", True)
+                    p.cls = pd.get("cls", p.cls)
                     if pid == w.my_id:
                         w.playing = p.playing
                     w.players[pid] = p
@@ -313,6 +459,7 @@ class GameClient:
                 w.mode = GameMode(msg["mode"])
                 w.duration_s = msg["duration_s"]
                 w.map_id = msg["map_id"]
+                w.map_sha = msg.get("map_sha", "")
                 w.my_spawn = (msg["spawn"]["x"], msg["spawn"]["y"])
                 w.my_spawn_aim = msg["spawn"].get("aim")
                 w.my_team = Team(msg["team"])
@@ -352,9 +499,26 @@ class GameClient:
                     p.wep = pd.get("wep", 0)
                     p.mag = pd.get("mag", 0)
                     p.reload_t = pd.get("rl", 0.0)
+                    p.recharge = pd.get("rc", 0.0)
                     p.flashlight = pd.get("fl", False)
+                    p.cls_now = pd.get("cl", p.cls_now)
+                    p.vanished = pd.get("vn", False)
+                    p.stamina = pd.get("st", 1.0)
+                    p.ability_t = pd.get("ab", 0.0)
+                    p.ability_cd = pd.get("acd", 0.0)
                     p.charge = pd.get("chg", 0.0)
                     p.snap_t = now
+
+            elif t == P.S_MELEE:
+                self._events.append({"t": "melee", "id": msg["id"],
+                                     "heading": msg.get("heading", 0.0),
+                                     "reach": msg.get("reach", 1.6),
+                                     "hit": msg.get("hit", 0)})
+
+            elif t == P.S_ABILITY:
+                self._events.append({"t": "ability", "id": msg["id"],
+                                     "ab": msg.get("ab", ""),
+                                     "dur": msg.get("dur", 0.0)})
 
             elif t == P.S_KILL:
                 killer = w.players.get(msg["killer"])
@@ -379,6 +543,9 @@ class GameClient:
                     "impact": tuple(msg.get("impact", (msg["x"], msg["y"]))),
                     "blast": msg.get("blast", 0.0),
                     "travel": msg.get("travel", 0.0),
+                    # a fused round lies where it lands until it goes off; the
+                    # drawing side runs the server's clock rather than guessing
+                    "fuse": msg.get("fuse", 0.0),
                     "at": now,
                 })
 

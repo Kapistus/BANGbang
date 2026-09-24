@@ -11,7 +11,13 @@ has no .grid sidecar is a definition file, not a map: tiles.toml is the one in
 this project, and offering it as something to play on would hand the server a
 map it cannot load.
 
-This module does NOT depend on sim/tilemap.py. It reads dimensions defensively
+Only PLAYABLE maps are listed. Every candidate is run through
+net.maps.validate — it has to load, every tile it uses has to exist, and it
+needs two places to stand. A map that fails is left out and the reason printed,
+because starting a match on it crashes every client that joins. The rejects are
+available from `rejected()` for anything that wants to say why a map is missing.
+
+The header reading below does not depend on sim/. It reads dimensions defensively
 because the exact TOML schema isn't fixed here: it tries, in order,
   1. explicit integer keys: width/height, cols/rows, w/h, size_x/size_y
   2. a [map] or [meta] subtable containing any of those
@@ -149,10 +155,21 @@ def _is_playable_toml(path: Path, data: dict) -> bool:
     return False
 
 
+_REJECTED: dict[str, list[str]] = {}
+
+
+def rejected() -> dict[str, list[str]]:
+    """Map id -> why it was left out, from the most recent load_catalog."""
+    return dict(_REJECTED)
+
+
 def load_catalog(maps_dir: str | Path = "maps") -> list[MapEntry]:
     """Return all playable maps in maps_dir, .map first then .toml, each sorted
-    by id. Unreadable or non-map files are skipped (logged to stdout) rather
-    than crashing the lobby — or worse, being picked for a match."""
+    by id. Unreadable, non-map and unplayable files are skipped (logged to
+    stdout) rather than crashing the lobby — or worse, being picked for a
+    match."""
+    from net import maps as netmaps            # validation needs the loader
+    _REJECTED.clear()
     d = Path(maps_dir)
     entries: list[MapEntry] = []
     if not d.is_dir():
@@ -186,6 +203,11 @@ def load_catalog(maps_dir: str | Path = "maps") -> list[MapEntry]:
             print(f"[mapcatalog] skipping {path.name}: {e}")
             continue
         seen.add(stem)
+        problems = netmaps.validate(stem, d)
+        if problems:
+            _REJECTED[stem] = problems
+            print(f"[mapcatalog] not listing {path.name}: {problems[0]}")
+            continue
         thumb = path.with_suffix(".png")
         entries.append(MapEntry(
             map_id=stem,
