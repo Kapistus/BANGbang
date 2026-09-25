@@ -263,6 +263,29 @@ def _dry(rng: random.Random) -> np.ndarray:
     return _norm(_lp(r.uniform(-1, 1, n), 2) * _decay(n, 0.004), 0.6)
 
 
+def _whoosh(rng: random.Random) -> np.ndarray:
+    """A blade through air: filtered noise that swells as the arm comes round
+    and cuts off at the end of the swing. No impact and no body - what you
+    hear is the blade missing, which is most of the time."""
+    n = int(rng.uniform(0.16, 0.22) * SR)
+    r = np.random.default_rng(rng.randrange(1 << 30))
+    t = np.linspace(0.0, 1.0, n)
+    swell = np.sin(np.pi * t ** 0.75) ** 2        # in and out, peak mid-swing
+    air = _lp(r.uniform(-1, 1, n), 9) * swell
+    edge = _lp(r.uniform(-1, 1, n), 3) * swell * (t ** 2)   # brighter as it
+    return _norm(air + edge * 0.4, 0.55)                    # passes you
+
+
+def _throw(rng: random.Random) -> np.ndarray:
+    """A grenade leaving a hand: cloth, and a short low rush of air. The bang
+    is three seconds away and is a different sound entirely."""
+    n = int(0.18 * SR)
+    r = np.random.default_rng(rng.randrange(1 << 30))
+    air = _lp(r.uniform(-1, 1, n), 14) * _decay(n, 0.06, attack_s=0.02)
+    cloth = _lp(r.uniform(-1, 1, n), 5) * _decay(n, 0.015)
+    return _norm(air + cloth * 0.5, 0.4)
+
+
 # name -> (generator, how many random variants to pre-render)
 _RECIPES = {
     "gunshot":       (lambda rng: _gunshot(rng, False), 4),
@@ -283,6 +306,8 @@ _RECIPES = {
     "door_heavy":    (_door_heavy, 1),
     "glass":         (_glass, 3),
     "dryfire":       (_dry, 2),
+    "whoosh":        (_whoosh, 3),
+    "throw":         (_throw, 2),
 }
 
 
@@ -322,6 +347,8 @@ def init(seed: int = 1234) -> bool:
 # single-player and multiplayer - without touching how far the sound carries
 # in the world (that is perception's reach, and it is what guards hear).
 CLIP_GAIN = {
+    "whoosh": 0.8,
+    "throw": 0.6,
     "footstep": 0.75,
     "door": 0.5,
     "door_heavy": 0.375,   # 0.75, then halved with the quick door
@@ -354,19 +381,31 @@ _FIRE_BY_NAME = {
     "rail rifle": "railgun",
     "rail pistol": "railgun_light",
     "combat shotgun": "shotgun",
+    "rocket launcher": "boom",      # the launch itself is the loud part
 }
 
 
 def fire_clip(weapon) -> str:
+    """What pulling this trigger sounds like - not what the round does later.
+
+    A weapon that puts something into the air is heard twice: once when it
+    fires and once when the round goes off, and those are different sounds. A
+    grenade leaving a hand is cloth and air; the bang belongs to the fuse.
+    """
     cat = getattr(weapon, "category", "")
-    # explosives launch with a boom - except energy/plasma/laser bolts, which
-    # keep their category zap (their detonation plays its own boom)
-    if getattr(weapon, "blast_r", 0.0) > 0.0 and cat not in (
-            "energy", "plasma", "laser"):
-        return "boom"
+    if getattr(weapon, "melee_range", 0.0) > 0.0:
+        return "whoosh"
+    if getattr(weapon, "fuse_s", 0.0) > 0.0:
+        return "throw"
     name = getattr(weapon, "name", "")
     if name in _FIRE_BY_NAME:
         return _FIRE_BY_NAME[name]
+    # an explosive that goes off at the muzzle booms as it fires; one that
+    # flies there fires with its own launch sound and booms on arrival
+    if (getattr(weapon, "blast_r", 0.0) > 0.0
+            and getattr(weapon, "projectile_speed", 0.0) <= 0.0
+            and cat not in ("energy", "plasma", "laser")):
+        return "boom"
     return _FIRE_BY_CATEGORY.get(cat, "gunshot")
 
 
@@ -393,7 +432,8 @@ def play_channel(name: str, gain: float = 1.0, pan: float = 0.0):
 
 
 # label prefix (from ActiveSound.label, e.g. "g1/fire") -> clip for enemy events
-_ENEMY_CLIP = {"fire": "gunshot", "step": "footstep", "reload": "magazine"}
+_ENEMY_CLIP = {"fire": "gunshot", "step": "footstep", "reload": "magazine",
+               "blast": "boom", "throw": "throw", "melee": "whoosh"}
 
 
 def enemy_clip(label: str) -> str:

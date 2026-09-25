@@ -8,7 +8,8 @@ does.
 Status: **prototype**. Single-player works. Multiplayer works: two or more
 machines on a LAN share a map and fight on it, with the server authoritative
 over movement, shooting and damage, and the sound-propagation model running on
-every client. Guards, doors and mid-match joining are not networked yet; see
+every client. Doors, pickups and joining a match already in progress are
+networked; guards are not, so multiplayer is player-versus-player only. See
 [Work in progress](#work-in-progress).
 
 ---
@@ -182,7 +183,7 @@ match carries on around you.
 
 ### Classes
 
-Every player picks a class. A new connection is asked first, with the four
+Every player picks a class. A new connection is asked first, with the five
 side by side; after that the class row in the lobby (under the player list)
 or the Esc menu changes it. A pick takes effect at your **next spawn**: the
 next match start, or your next respawn mid-match. Until then you play the
@@ -221,7 +222,9 @@ counted from the moment the last one ended:
   those cells stay remembered, like anywhere else you have seen.
 - **Saboteur — Vanish** (4 s): your feet make no sound, nobody draws you past
   three metres, and you move at double speed. Firing or swinging ends it on
-  the spot. It is for
+  the spot. On your own screen you are drawn blue and see-through for as long
+  as it runs — nobody else sees that, and it is the only cue on the body
+  itself that the ability is still on. It is for
   crossing ground and getting behind someone, not for winning a fight you are
   already in — and it is the answer to the Tech's ping.
 
@@ -270,8 +273,10 @@ them.
 ### The Saboteur's kit
 
 He carries no gun at all: a blade, three grenades, and the speed to get to
-where those are the right answer. Two things exist only on this class. The **combat knife** has no projectile:
-a 1.6 m reach and a 50° arc, and it will not swing through a wall. From the
+where those are the right answer. Two things exist only on this class.
+
+The **combat knife** has no projectile: a 1.6 m reach and a 50° arc, and it
+will not swing through a wall. From the
 front it takes two swings, three on a Heavy; from behind (more than 100° off
 the way they are facing) it does 4.5x damage, which kills any class outright.
 It carries no ammo and never runs out.
@@ -297,9 +302,14 @@ Three grenades, and no reload: the belt is the magazine. There is nothing to
 reload from and an ammo pack has nothing to give it, so the only question is
 whether this is worth one of the three.
 
+It is quiet going out, too: the throw carries about a sixth as far as the
+explosion, so what gives you away is the bang, not the arm.
+
 On everyone else's screen a thrown grenade is the round itself and nothing
-else: no tracer is sent for anything that travels, because a line drawn to
-where it will land both gives the throw away and reads as a gunshot. The throw
+else: no tracer is sent for anything that travels — a rocket, a flak shell or
+a grenade — because a line drawn to where it will land arrives before the
+round does, gives the throw away, and reads as a streak out of the barrel.
+`tests/weapons_test.py` checks each of them on the wire. The throw
 message carries the fuse, so every client draws the round lying there with a
 quickening blink on the same clock, and the blast arrives as its own message
 when the fuse ends — one explosion, from the server, not one per client.
@@ -337,17 +347,19 @@ a second in which the man you aimed at can be somewhere else. It goes off
 where it arrives, never where it left, and it is traced through cover like any
 other blast.
 
-The **flak cannon** fires a shell, not a burst. The shell travels at 20 m/s
-and comes apart where it stops — against a wall, against a body, or at the end
-of its four-metre run — into thirty-six pellets thrown outward through the
-full circle, each one an ordinary shot with no penetration at all, carrying
-two and a half metres. A wall, a door or a corner stops them dead.
+The **flak cannon** fires a shell, not a burst. It travels at 20 m/s and
+carries to whatever stops it — a wall, a door, a person — and only comes apart
+in mid-air if it has flown ten metres without finding anything. Where it stops
+it throws thirty-six pellets outward through the full circle, each one an
+ordinary shot with no penetration at all, carrying two and a half metres; a
+wall, a door or a corner stops them dead.
 
-It is a weapon for the length of a room and no further. Against a Commando,
-a shell that lands on somebody kills them; a metre away it takes half of what
-they have, at two metres a quarter, and by three there is nothing left of the
-ring. Fired at anything further than four metres it bursts in mid-air short
-of them and does nothing at all.
+It is a weapon for the length of a room and no further. Against a Commando, a
+shell that lands on somebody kills them; a metre from the burst takes half of
+what they have, two metres a quarter, and by three there is nothing left of
+the ring. The burst is drawn as short stubs of spark leaving the shell rather
+than as thirty-six full-length pellet tracers, which read as a weapon that
+fires lines.
 
 The **plasma rifle** carries five bolts and no spare cells, and makes itself a
 new one every five seconds whether it is in your hands or slung. There is
@@ -443,9 +455,9 @@ Each source keeps one reusable propagation field per kind of sound, so a weapon
 on full auto costs about one field solve rather than one per round — measured at
 56 shots per 2 solves — and a source that moves more than a metre gets a fresh
 one. What you hear of another player arrives as an arc at your own position,
-pointing the way the sound travelled. Arrivals from the same direction refresh one arc
-rather than stacking: a sprinter emits five footsteps a second, and one arc per
-step rings you completely and tells you nothing.
+pointing the way the sound travelled. Arrivals from the same direction refresh
+one arc rather than stacking: a sprinter emits five footsteps a second, and
+one arc per step rings you completely and tells you nothing.
 
 ### Testing on one machine
 
@@ -472,9 +484,11 @@ buffer: enough that one late packet is covered, and no more. Measured on a
 loopback match, a remote player's position lags the server's by a median of
 78 ms, worst 102 ms — down from 89/144 ms at 20 Hz and 100 ms of interpolation.
 Dropping the buffer below two snapshots measures faster still (70 ms) but
-freezes and snaps the moment a packet is late, so it is not the default. Every connection
-has an outbox drained by its own thread, so the tick loop never blocks on a
-socket: one player whose connection backs up costs themselves their backlog and
+freezes and snaps the moment a packet is late, so it is not the default.
+
+Every connection has an outbox drained by its own thread, so the tick loop
+never blocks on a socket: one player whose connection backs up costs
+themselves their backlog and
 nobody else their frame rate. Under pressure a queue sheds what is cheapest to
 lose — a snapshot is a whole picture of the world, so only the newest is ever
 queued, then tracers and sound events go, and state (lobby, kills, doors, glass)
@@ -603,11 +617,15 @@ py -m tests.map_download_test # a player without the host's map gets a copy
 py -m tests.classes_test      # classes: stats, kits, speed, the esc menu, respawn
 py -m tests.fog_window_test   # the camera-window veil matches a whole-map one
 py -m tests.lobby_layout_test # nothing is drawn off the lobby or off a card
-py -m tests.abilities_test    # the four class abilities, their cooldown, knocking
+py -m tests.abilities_test    # the class abilities, their cooldown, knocking
 py -m tests.balance_test      # time to kill, the shotgun's one shell, the spread
-py -m tests.saboteur_test     # the knife, the grenade's fuse, Vanish, class art
+py -m tests.saboteur_test     # the knife, the grenade's fuse, Vanish and how
+                              #   it looks, class art
 py -m tests.stamina_test      # sprint fuel over the wire, and a thrown round
-py -m tests.weapons_test      # the rocket's flight, the flak ring, plasma cells
+py -m tests.weapons_test      # the rocket's flight, the flak ring, plasma
+                              #   cells, one blast per round, what each is
+                              #   heard as, and that nothing thrown draws a
+                              #   line
 py -m tests.blast_cover_test  # what blasts and a charged rail shot get through
 py -m tests.sp_downed_test    # a downed player cannot move, aim, act or heal
 py -m tests.mp_smoke_test     # the real client, headless, for six seconds
@@ -688,9 +706,9 @@ mechanics/          legacy design docs, keybindings, older asset sets
 3. **No interactables beyond doors.** Single-player has traders, corpses, quest
    objects and an inventory behind the same key; multiplayer has doors only.
 4. **Missing feedback the single-player renderer has:** blood hit-reactions,
-   the weapon-swap animation frames, the rail spool-up sound while charging,
-   and the slung/raise weapon states. Muzzle flashes, recoil, the flashlight
-   and the shadow model are done.
+   the weapon-swap animation frames, and the slung/raise weapon states. Muzzle
+   flashes, recoil, the flashlight, the shadow model and the rail spool-up
+   while charging are done.
 5. **No ripple view.** Single-player can show the sound wavefront itself
    (F11 cycles arcs / full ripples / off, and ripples are its default);
    multiplayer draws the arrival arcs only.
@@ -716,10 +734,10 @@ centre, same up-facing orientation as the base art; the game only swaps which
 file it draws.
 
 Anything missing falls back to the base sprite, so a palette half-painted is
-fine and one file is enough to see it working. `python -m tests.mp_smoke_test` prints
-which coloured sets it found. `sprites.PALETTE` is also what the lobby swatches
-are built from, so adding a colour there adds it to the lobby — but a swatch
-with no art is a soldier in khaki wearing a coloured ring.
+fine and one file is enough to see it working. `python -m tests.mp_smoke_test`
+prints which coloured sets it found. `sprites.PALETTE` is also what the lobby
+swatches are built from, so adding a colour there adds it to the lobby — but
+a swatch with no art is a soldier in khaki wearing a coloured ring.
 
 ### Map picker
 
@@ -737,14 +755,24 @@ with no art is a soldier in khaki wearing a coloured ring.
     interpolation was assessed and deprioritized.
 12. Rocket backblast draws a flat placeholder cone; the three backblast sprites
     aren't blitted yet (`main.py`, TODO near line 2012).
-13. All sound effects are procedural placeholders in `sim/audio.py`.
+13. All sound effects are procedural placeholders in `sim/audio.py`. What a
+    weapon is heard as is decided by what it does rather than by its
+    category: a blade is a whoosh, a grenade leaving a hand is cloth and air
+    carrying about a sixth as far as the blast will, a shell or a rocket is a
+    launch, and the bang belongs to the round going off — which is its own
+    event, at the other end of the flight.
 
 ### Housekeeping
 
-14. `sim/` has no direct test coverage; the four headless tests cover the net
-    path and reach into `sim/` through it.
+14. `sim/` is covered mostly through the net path rather than directly.
+    `balance_test`, `blast_cover_test`, `movement_test` and `weapons_test` do
+    call into it on their own, but most of what `sim/` does is exercised by
+    driving a server and a client at it.
 15. `maps/` mixes formats and scratch files (`untitled.map`, `untitled2.map`,
-    `arena_1x.*`), and they all show up in the map picker.
+    `assault.map`, `demo.map`, `arena_1x.*`). The picker only lists the ones
+    that load against the current tileset — six of the eleven, as it stands —
+    and prints the reason for each of the rest to the console, so the scratch
+    files are noise in the folder rather than in the lobby.
 16. `mechanics/` is imported design material from an older project (some files
     dated 2018) kept as reference — the weapon roster and the
     shield/armor/accuracy model were ported from it into `sim/weapons.py` and

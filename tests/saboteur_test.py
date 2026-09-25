@@ -318,6 +318,66 @@ def grenade_test():
     print("\nGRENADE CHECKS PASSED")
 
 
+def ghost_test():
+    """What you look like to yourself while Vanish runs.
+
+    Nobody else sees this: everyone past three metres is not drawing you at
+    all. It is the only cue on the body itself that the ability is still on,
+    so it has to be obvious and it has to be see-through - a solid blue
+    soldier would just look like a different colour of soldier.
+    """
+    import pygame
+    import mp_client
+
+    m = Match(port=PORT + 4)
+    try:
+        pygame.init()
+        view = mp_client.MatchView(m.a, R.MAPS_DIR, window=(640, 480))
+        view.read_input = lambda: (0.0, 0.0, 0)
+        ppm = view.ppm
+        box = max(16, int(mp_client.VANISH_BOX_M * ppm))
+        canvas = pygame.Surface((box * 2, box), pygame.SRCALPHA)
+        view.surf = canvas
+        look = dict(cls="saboteur", wep_id="combat_knife", light=1.0,
+                    now=time.monotonic())
+        view._draw_body(box * 0.5 / ppm, box * 0.5 / ppm, 0.0,
+                        (220, 60, 60), "", **look)
+        view._draw_ghost(box * 1.5 / ppm, box * 0.5 / ppm, 0.0,
+                         (220, 60, 60), "", **look)
+
+        def ink(x0):
+            """(pixels drawn, average colour) over one half of the canvas."""
+            n, a_sum = 0, 0
+            r = g = b = 0
+            for px in range(x0, x0 + box, 2):
+                for py in range(0, box, 2):
+                    pr, pg, pb, pa = canvas.get_at((px, py))
+                    if pa == 0:
+                        continue
+                    n += 1
+                    a_sum += pa
+                    r += pr * pa; g += pg * pa; b += pb * pa
+            if not a_sum:
+                return 0, 0, (0, 0, 0)
+            return n, a_sum, (r / a_sum, g / a_sum, b / a_sum)
+
+        n_plain, a_plain, (pr, pg, pb) = ink(0)
+        n_ghost, a_ghost, (gr, gg, gb) = ink(box)
+        assert n_plain > 50, "the plain body did not draw at all"
+        assert n_ghost > 50, "the ghost did not draw at all"
+        print(f"  plain: {a_plain / n_plain:.0f} alpha, "
+              f"rgb({pr:.0f}, {pg:.0f}, {pb:.0f})")
+        print(f"  ghost: {a_ghost / n_ghost:.0f} alpha, "
+              f"rgb({gr:.0f}, {gg:.0f}, {gb:.0f})")
+        assert a_ghost / n_ghost < (a_plain / n_plain) * 0.7, \
+            "a vanished body should be see-through"
+        assert gb > gr * 1.3 and gb > gg * 1.3, \
+            "a vanished body should read blue, whatever colour you picked"
+        print("\nGHOST CHECKS PASSED")
+    finally:
+        m.close()
+
+
 def vanish_test():
     m = Match(port=PORT + 2)
     try:
@@ -393,6 +453,7 @@ if __name__ == "__main__":
     grenade_test()
     print()
     vanish_test()
+    ghost_test()
     print()
     art_test()
     print("\nALL SABOTEUR CHECKS PASSED")

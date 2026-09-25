@@ -1684,8 +1684,13 @@ def main(map_path: str = "maps/arena.toml") -> None:
                     continue
                 for sh in g.update(dt, now, m, cost, pen, m.blocks_sight,
                                    bbul, sounds, player, rng, _gemit):
-                    if sh.segments:
+                    # a round that travels IS the visual: drawing the line it
+                    # will fly down first is a tracer out of a rocket tube
+                    _trav = (g.weapon.blast_r > 0.0
+                             and g.weapon.projectile_speed > 0.0)
+                    if sh.segments and not _trav:
                         tracers.append((sh.segments, now))
+                    if sh.segments:
                         _o = sh.segments[0][0]
                         _mc, _mg, _mr = muzzle_light_spec(g.weapon)
                         muzzle_lights.append({"x": _o[0], "y": _o[1], "t0": now,

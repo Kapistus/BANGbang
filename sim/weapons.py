@@ -248,9 +248,12 @@ ROSTER: dict[str, Weapon] = {
     # a shell rather than a burst: it flies, and where it stops - a wall, a
     # body, or the end of its run - it comes apart into a full circle of
     # pellets. Point blank it is the shell that kills; across a doorway it is
-    # the ring, and the ring does not go through cover.
+    # the ring, and the ring does not go through cover. range_m here is how
+    # far the shell carries before it comes apart on its own: short enough
+    # that it is a room weapon, long enough that it crosses the room rather
+    # than going off in front of your face.
     "flak_cannon": Weapon(
-        "flak cannon", "heavy", 5.5, 8, 4, 1.0, 0.86, 5, 2.4,
+        "flak cannon", "heavy", 5.5, 8, 10, 1.0, 0.86, 5, 2.4,
         reserve=15, pen=0.0, blast_r=0.7, projectile_speed=20.0,
         burst_pellets=36, burst_range_m=2.5,
         sound_reach_m=120.0, weight=9.7, str_req=17, module_slots=1),

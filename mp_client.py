@@ -94,6 +94,14 @@ NAME_DY = -0.95           # name tag offset above a body, metres
 # the colour either way.
 SEEN_MIN = 0.02           # cone intensity at which a remote player registers
 ROCKET_R = 0.14           # drawn radius of a rocket in flight, metres
+# what you look like to yourself while Vanish is running. Nobody else sees
+# this - it is the only cue you have that the ability is still on you, since
+# the HUD timer is at the bottom of the screen and your eyes are on the room.
+VANISH_TINT = (105, 165, 255, 120)   # blue, and see-through: multiplied over
+                                     # the sprite, alpha and all
+VANISH_LIFT = (0, 24, 70, 0)         # then lifted, so it glows rather than
+                                     # going to a dark smudge in a dark room
+VANISH_BOX_M = 3.0        # the scratch square a ghosted body is drawn into
 
 # Light. Multiplayer runs the model single-player runs, out of sim/lighting.py:
 # what you can see is gated on what is lit, your flashlight and everyone else's
@@ -136,9 +144,10 @@ CLIP_BY_KIND = {
     "fire": "gunshot", "step": "footstep", "reload": "magazine",
     "dry": "dryfire", "glass": "glass", "knock": "knock", "door": "door",
     "door_heavy": "door_heavy",
-    # no blade sound of its own yet: the knock is the closest thing the
-    # procedural bank has to a short, dull impact
-    "melee": "knock", "ability": "knock",
+    # a blade is air, a thrown grenade is cloth, and a detonation is a blast -
+    # none of the three is a gunshot, wherever you are standing
+    "melee": "whoosh", "throw": "throw", "blast": "boom",
+    "ability": "knock",
 }
 
 
@@ -663,7 +672,11 @@ class MatchView:
             # your own gun is not something you work out from a sound field
             w = weapons.ROSTER.get(e.get("wep", ""))
             if w is not None and self.audio_on:
-                audio.play_fire(w, gain=min(1.0, 0.8 + 0.4 * e.get("charge", 0.0)))
+                if e.get("travel", 0.0) <= 0.0 and e.get("blast", 0.0) > 0.0:
+                    audio.play("boom")      # this message IS the detonation
+                else:
+                    audio.play_fire(
+                        w, gain=min(1.0, 0.8 + 0.4 * e.get("charge", 0.0)))
 
     def _on_sound(self, e, now):
         """Something audible happened somewhere.
@@ -674,14 +687,15 @@ class MatchView:
         the time it took to travel. That is the whole stealth model, and it is
         the same code single-player runs."""
         if e["id"] == self.cli.world.my_id:
-            if e["clip"] == "fire" or not self.audio_on:
-                return                    # the gunshot is played by _on_shot
+            if e["clip"] in ("fire", "blast") or not self.audio_on:
+                return                    # your own gun is played by _on_shot
             if e["clip"] == "footstep":
                 gain = OWN_STEP_GAIN.get(e.get("stance", "walk"), 0.09)
                 if gain > 0.0:
                     audio.play("footstep", gain=gain)
                 return
-            audio.play(e["clip"], gain=OWN_GAIN.get(e["clip"], 0.6))
+            audio.play(CLIP_BY_KIND.get(e["clip"], e["clip"]),
+                       gain=OWN_GAIN.get(e["clip"], 0.6))
             return
         kind = e["label"].rsplit("/", 1)[-1]
         cache = self._cache_for(e["id"], kind, now)
@@ -1014,6 +1028,27 @@ class MatchView:
         v = int(3 + 252 * k)
         return (v, v, v)
 
+    def _draw_ghost(self, x, y, *args, **kw) -> None:
+        """Yourself, while vanished: the same body, drawn blue and see-through.
+
+        The sprite goes onto a small scratch square first, because the tint
+        has to land on the finished body - art, weapon, lamp and ring - rather
+        than on each piece separately, and because multiplying it into the
+        world surface would tint the floor as well.
+        """
+        ppm = self.ppm
+        box = max(16, int(VANISH_BOX_M * ppm))
+        scratch = pygame.Surface((box, box), pygame.SRCALPHA)
+        real, self.surf = self.surf, scratch
+        try:
+            self._draw_body(box * 0.5 / ppm, box * 0.5 / ppm, *args, **kw)
+        finally:
+            self.surf = real
+        scratch.fill(VANISH_TINT, special_flags=pygame.BLEND_RGBA_MULT)
+        scratch.fill(VANISH_LIFT, special_flags=pygame.BLEND_RGBA_ADD)
+        self.surf.blit(scratch, (int(x * ppm - box * 0.5),
+                                 int(y * ppm - box * 0.5)))
+
     def _draw_body(self, x, y, facing, colour, name, wep_id=None,
                    reloading=False, dead=False, light=1.0, shot=None,
                    torch=False, now=0.0, torch_light=None, cls=None):
@@ -1201,21 +1236,6 @@ class MatchView:
         self.mlights.append({"x": x, "y": y, "t0": now, "col": col,
                              "gain": gain, "reach": reach, "life": life})
 
-    def _detonate(self, rk, now) -> None:
-        """A rocket reached its impact point. The server sends the round on its
-        way and its speed; when it arrives is arithmetic, so the client does
-        the fireball itself rather than waiting for a message.
-
-        A fused round is different: the server decides when it goes off and
-        says so, and drawing our own fireball as well as that one is how a
-        grenade came to explode twice."""
-        w = weapons.ROSTER.get(rk.get("wep", ""))
-        if w is None or w.blast_r <= 0.0 or rk.get("fuse", 0.0) > 0.0:
-            return
-        self.blasts.append({"x": rk["ix"], "y": rk["iy"], "r": w.blast_r,
-                            "t0": now})
-        self._blast_light(rk["ix"], rk["iy"], w, now)
-
     def _rail_sound(self) -> None:
         """The rail spool-up, for as long as the trigger is held.
 
@@ -1248,12 +1268,11 @@ class MatchView:
         self.shots = {i: sh for i, sh in self.shots.items()
                       if now - sh["t0"] < gone}
         live = []
-        for rk in self.rockets:
-            if now - rk["t0"] < rk["dur"]:
-                live.append(rk)
-            else:
-                self._detonate(rk, now)
-        self.rockets = live
+        # a round that has arrived simply stops being drawn: the server says
+        # when it goes off, and a fireball of our own on top of that one is
+        # how a rocket came to explode twice
+        self.rockets = [rk for rk in self.rockets
+                        if now - rk["t0"] < rk["dur"]]
 
     def _ping_into(self, ov_a, build):
         """Open the veil inside a live ping, and write those cells into fog
@@ -1595,14 +1614,16 @@ class MatchView:
         if alive:
             pcx, pcy = self.m.cell_of(self.rx, self.ry)
             mylight = self._illum_at(vf, pcx, pcy)
-            self._draw_body(self.rx, self.ry, self.facing,
-                            (me.colour if me else (220, 220, 220)), "",
-                            cls=self.cls_now,
-                            wep_id=self.loadout[self.wep],
-                            reloading=bool(me and me.reload_t > 0.0),
-                            light=mylight, shot=self.shots.get(w.my_id),
-                            torch=bool(me and me.flashlight), now=now,
-                            torch_light=renderer.FLASHLIGHT_SELF)
+            draw = (self._draw_ghost if (me and me.vanished)
+                    else self._draw_body)
+            draw(self.rx, self.ry, self.facing,
+                 (me.colour if me else (220, 220, 220)), "",
+                 cls=self.cls_now,
+                 wep_id=self.loadout[self.wep],
+                 reloading=bool(me and me.reload_t > 0.0),
+                 light=mylight, shot=self.shots.get(w.my_id),
+                 torch=bool(me and me.flashlight), now=now,
+                 torch_light=renderer.FLASHLIGHT_SELF)
         self._draw_effects(now, mine=True)
         self._draw_swings(now, mine=True)
         if self.mflash_rgb is not None:

@@ -282,6 +282,11 @@ def blast(center, radius_m, weapon, targets, rng, now, m=None):
     return hits
 
 
+BURST_DRAW_M = 0.7         # how much of each pellet's path is drawn. The
+                           # pellets themselves carry burst_range_m; drawing
+                           # all of it puts a two-and-a-half metre sunburst on
+                           # the screen, which reads as a weapon that fires
+                           # lines rather than one that comes apart
 FLAK_CORE_M = 0.1          # only a body sitting on the burst point is left
                            # out of the ring - any wider an exclusion and
                            # standing ON a flak shell hurts less than standing
@@ -299,7 +304,9 @@ def burst(center, weapon, targets, rng, now, m=None):
     the ring is dense, at the edge of `burst_range_m` you catch one if you are
     unlucky.
 
-    Returns the pellet segments, for drawing.
+    Returns short stubs along each pellet's path, for drawing: the burst is
+    over in an instant and what it should look like is sparks leaving the
+    shell, not thirty-six tracers.
     """
     cx, cy = center
     blast(center, weapon.blast_r, weapon, targets, rng, now, m=m)
@@ -320,5 +327,13 @@ def burst(center, weapon, targets, rng, now, m=None):
         hd = base + i * step
         sh = fire_shot(m, m.blocks_bullets, m.pen_cost, m.glass,
                        center, hd, pellet, out, rng, now)
-        segs.extend(sh.segments)
+        # a stub as long as the pellet got, up to BURST_DRAW_M - so a pellet
+        # that hit the wall it was fired at leaves barely a mark
+        reach = min(BURST_DRAW_M,
+                    math.hypot(sh.impact[0] - cx, sh.impact[1] - cy))
+        if reach <= 0.01:
+            continue
+        segs.append(((cx, cy),
+                     (cx + math.cos(hd) * reach, cy + math.sin(hd) * reach),
+                     "air"))
     return segs

@@ -28,7 +28,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 from net import GameServer, GameClient
 from net.protocol import BTN_FIRE, ServerState
-from sim import classes, weapons
+from sim import ballistics, classes, weapons
 from tests import range_spots as R
 
 PORT = 47985
@@ -204,6 +204,26 @@ def flak_test():
         # --- and the shooter is not in his own ring
         assert p.body.health == p.body.max_health, "he caught his own burst"
 
+        # --- it carries to what it hits, rather than coming apart in the air
+        # short of it: the wall lane has a wall in column 8
+        p.x, p.y = 2.5, 23.5
+        m.pb.x, m.pb.y = 30.5, 3.5           # out of it entirely
+        m.b.drain_events()
+        m.arm(FLAK)
+        m.shoot(FLAK)
+        time.sleep(1.0)
+        m.hold(m.a, 0.3, wep=FLAK)
+        bursts = [e for e in m.b.drain_events()
+                  if e["t"] == "shot" and e.get("wep") == "flak_cannon"
+                  and e.get("travel", 0.0) == 0.0]
+        assert bursts, "the shell never went off"
+        bx = bursts[-1]["impact"][0]
+        print(f"  fired at a wall 5.5 m away: burst at x={bx:.1f} "
+              f"(the wall is at 8.0, its range would carry it to "
+              f"{p.x + 1.1 + w.range_m:.1f})")
+        assert 7.0 < bx < 8.2, \
+            "it came apart in mid-air instead of on the wall it was fired at"
+
         # --- cover: the same distance, once in the open and once with a wall
         # in between, so the second half is not passing for want of range
         p.x, p.y = 5.5, 23.5                 # the wall lane, wall in column 8
@@ -238,6 +258,207 @@ def flak_test():
         m.close()
 
 
+def no_tracer_test():
+    """Nothing that travels draws a line when it is fired.
+
+    A bullet's visual is the tracer between the muzzle and the hole. A rocket,
+    a shell or a grenade is the round itself, and a line drawn to where it is
+    going arrives before the round does - it gives the shot away and reads as
+    a streak out of the barrel. The server decides this, so it is checked on
+    the wire rather than in the drawing code.
+    """
+    m = Match(port=PORT + 4)
+    try:
+        p = m.pa
+        p.x, p.y = 3.5, 10.5
+        m.pb.x, m.pb.y = 33.5, 10.5
+        for slot, key in ((ROCKET, "rocket_launcher"), (FLAK, "flak_cannon"),
+                          (0, "pistol")):
+            w = weapons.ROSTER[key]
+            travels = w.blast_r > 0.0 and w.projectile_speed > 0.0
+            m.b.drain_events()
+            m.arm(slot)
+            m.shoot(slot)
+            time.sleep(1.5)
+            m.hold(m.a, 0.3, wep=slot)
+            shots = [e for e in m.b.drain_events()
+                     if e["t"] == "shot" and e.get("wep") == key]
+            assert shots, f"{key}: nothing was broadcast at all"
+            fired = [e for e in shots if e.get("travel", 0.0) > 0.0] \
+                if travels else shots
+            assert fired, f"{key}: no firing message"
+            segs = len(fired[0].get("segs", []))
+            print(f"  {w.name:16} fired with {segs} tracer segment(s)")
+            if travels:
+                assert segs == 0, \
+                    f"{w.name} still draws a line to where it is going"
+            else:
+                assert segs > 0, "a bullet with no tracer: the test is wrong"
+            # the burst of a flak shell is its own message, and what it draws
+            # is stubs at the burst rather than the pellets' full reach
+            for e in shots:
+                if not travels or e.get("travel", 0.0) > 0.0 or not e.get("segs"):
+                    continue
+                longest = max(math.hypot(g[2] - g[0], g[3] - g[1])
+                              for g in e["segs"])
+                print(f"  {w.name:16} burst: {len(e['segs'])} stubs, "
+                      f"longest {longest:.2f} m")
+                assert longest <= ballistics.BURST_DRAW_M + 0.01, \
+                    "the burst is drawn as full-length pellet tracers"
+        print("\nTRACER CHECKS PASSED")
+    finally:
+        m.close()
+
+
+def one_blast_test():
+    """One round, one explosion.
+
+    The server decides when a round that travels goes off and says so. The
+    client used to work the arrival out for itself as well and draw its own
+    fireball, so a rocket or a flak shell went off twice - once on the
+    client's arithmetic, once when the message landed. Two blasts that close
+    together overlap, so the test watches how many are on screen at once.
+    """
+    import pygame
+    import mp_client
+
+    m = Match(port=PORT + 5, cls_a="commando", cls_b="heavy_support")
+    try:
+        watcher, shooter = m.pa, m.pb
+        # the watcher stands off the firing line: in front of a flak shell he
+        # is what it bursts on, and a rocket at two metres kills him, and a
+        # dead man's client is not what this is measuring
+        watcher.x, watcher.y = 6.5, 13.5
+        shooter.x, shooter.y = 6.5, 10.5
+        pygame.init()
+        view = mp_client.MatchView(m.a, R.MAPS_DIR, window=(640, 480))
+        view.read_input = lambda: (0.0, 0.0, 0)
+        view.audio_on = False
+        for slot, key in ((ROCKET, "rocket_launcher"), (FLAK, "flak_cannon")):
+            # the weapon has to be in hand AND out of its last recovery
+            # before the trigger means anything - a rocket launcher takes
+            # three seconds between shots
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 8.0:
+                m.b.send_input(0.0, 0.0, 0.0, 0, wep=slot, aim_dist=12.0)
+                view.frame(1 / 60)
+                time.sleep(1 / 60)
+                if (shooter.wi == slot and shooter.swap_t <= 0.0
+                        and shooter.fire_cd <= 0.0
+                        and time.monotonic() - t0 > 0.5):
+                    break
+            assert shooter.wi == slot and shooter.fire_cd <= 0.0, \
+                f"{key} never came up ready"
+            most = 0
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 2.5:
+                # held for a moment, not for a single command: one frame of
+                # trigger can be the one the tick does not get to
+                btn = BTN_FIRE if time.monotonic() - t0 < 0.2 else 0
+                m.b.send_input(0.0, 0.0, 0.0, btn, wep=slot, aim_dist=12.0)
+                view.frame(1 / 60)
+                most = max(most, len(view.blasts))
+                time.sleep(1 / 60)
+            print(f"  {weapons.ROSTER[key].name:16} {most} explosion(s) "
+                  f"on screen at once")
+            assert most == 1, \
+                f"{key} drew {most} explosions for one round"
+    finally:
+        m.close()
+    print("\nONE BLAST CHECKS PASSED")
+
+
+def sound_test():
+    """What each of these is heard as, which is not always a gunshot.
+
+    The sound a weapon makes is decided twice over: the server says what
+    happened and how far it carries, and the client turns that into a clip. A
+    grenade used to do both wrongly - it announced itself as a gunshot with
+    the blast's own reach, so throwing one sounded like the explosion it had
+    not had yet.
+    """
+    from sim import audio
+    import mp_client
+
+    assert audio.fire_clip(weapons.ROSTER["combat_knife"]) == "whoosh"
+    assert audio.fire_clip(weapons.ROSTER["frag_grenade"]) == "throw"
+    assert audio.fire_clip(weapons.ROSTER["flak_cannon"]) != "boom", \
+        "a cannon firing a shell is not an explosion"
+    assert mp_client.CLIP_BY_KIND["melee"] == "whoosh"
+    assert mp_client.CLIP_BY_KIND["blast"] == "boom"
+
+    m = Match(port=PORT + 6, cls_a="saboteur", cls_b="heavy_support")
+    try:
+        p = m.pa
+        nade = classes.get("saboteur").loadout.index("frag_grenade")
+        p.x, p.y = 10.5, 10.5
+        m.pb.x, m.pb.y = 25.5, 10.5
+
+        # --- the knife: a swing is a swing, not a shot
+        m.b.drain_events()
+        m.arm(0)
+        m.shoot(0, hold=0.2)
+        time.sleep(0.4)
+        m.hold(m.a, 0.2)
+        clips = [e.get("clip") for e in m.b.drain_events() if e["t"] == "sound"
+                 and e.get("id") == m.a.world.my_id]
+        print(f"  a knife swing is heard as: {sorted(set(clips))}")
+        assert "melee" in clips, "the swing made no sound at all"
+        assert "fire" not in clips, "a blade should not be heard as a gunshot"
+
+        # --- the grenade: quiet going out, loud going off
+        m.b.drain_events()
+        m.arm(nade)
+        # thrown the other way: a grenade that lands on the other player kills
+        # him, and a corpse cannot fire the rocket this test needs next
+        m.shoot(nade, aim=math.pi, hold=0.2)
+        throw = blast = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5.0:
+            for e in m.b.drain_events():
+                if e["t"] != "sound" or e.get("id") != m.a.world.my_id:
+                    continue
+                if e.get("clip") == "throw":
+                    throw = e
+                elif e.get("clip") == "blast":
+                    blast = e
+                elif e.get("clip") == "fire":
+                    raise AssertionError("a thrown grenade fired a gunshot")
+            m.hold(m.a, 0.1, wep=nade)
+        assert throw is not None, "the throw made no sound"
+        assert blast is not None, "the grenade going off made no sound"
+        print(f"  a grenade: throw carries {throw['energy']:.0f}, "
+              f"the blast {blast['energy']:.0f}")
+        assert throw["energy"] < blast["energy"] * 0.4, \
+            "the throw is nearly as loud as the explosion"
+
+        # --- and a rocket: a launch, then a blast
+        m.a.drain_events()
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 6.0:
+            m.b.send_input(0.0, 0.0, 0.0, 0, wep=ROCKET, aim_dist=12.0)
+            time.sleep(1 / 30)
+            if (m.pb.wi == ROCKET and m.pb.swap_t <= 0.0
+                    and m.pb.fire_cd <= 0.0 and time.monotonic() - t0 > 0.7):
+                break
+        assert m.pb.wi == ROCKET, "the launcher never came up"
+        loaded = m.pb.mags[ROCKET]
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 3.0:
+            btn = BTN_FIRE if time.monotonic() - t0 < 0.3 else 0
+            m.b.send_input(0.0, 0.0, 0.0, btn, wep=ROCKET, aim_dist=12.0)
+            time.sleep(1 / 30)
+        assert m.pb.mags[ROCKET] < loaded, "the launcher never fired"
+        heard = [e.get("clip") for e in m.a.drain_events()
+                 if e["t"] == "sound" and e.get("id") == m.b.world.my_id]
+        print(f"  a rocket is heard as: {sorted(set(heard))}")
+        assert "fire" in heard and "blast" in heard, \
+            f"a launch and a detonation, not {sorted(set(heard))}"
+        print("\nSOUND CHECKS PASSED")
+    finally:
+        m.close()
+
+
 def pistol_test():
     m = Match(port=PORT + 3, cls_a="commando")
     try:
@@ -265,5 +486,8 @@ if __name__ == "__main__":
     rocket_test()
     plasma_test()
     flak_test()
+    no_tracer_test()
+    one_blast_test()
+    sound_test()
     pistol_test()
     print("\nALL WEAPON TESTS PASSED")

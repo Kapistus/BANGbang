@@ -85,6 +85,9 @@ MUZZLE_M = weapons.MUZZLE_M                # shot origin ahead of the body
 INTERACT_RANGE = 1.6                       # mirrors main.py: how far you reach
 DOOR_SOUND_M = perception.KNOCK_REACH_M * 0.7
 ABILITY_SOUND_M = perception.KNOCK_REACH_M * 0.5   # a special is audible, quietly
+THROW_REACH_M = perception.KNOCK_REACH_M * 0.6     # a grenade leaving a hand:
+                                                   # cloth and air, nothing a
+                                                   # room away can act on
 
 
 @dataclass
@@ -1400,8 +1403,14 @@ class GameServer:
             # off; the client runs the same clock rather than guessing
             "fuse": round(thrown_fuse, 2) if thrown_fuse else 0.0,
         })
-        self._sound(ox, oy, w.sound_reach_m, "fire", p.id,
-                    label=f"{p.id}/fire")
+        if thrown_fuse:
+            # what carries is the throw itself, not the blast reach the
+            # grenade will have in three seconds
+            self._sound(ox, oy, THROW_REACH_M, "throw", p.id,
+                        label=f"{p.id}/throw")
+        else:
+            self._sound(ox, oy, w.sound_reach_m, "fire", p.id,
+                        label=f"{p.id}/fire")
 
     def _swing(self, p: NetPlayer, live: list, w, now: float) -> None:
         """A blade: no projectile, no spread. Whoever is inside the reach and
@@ -1460,8 +1469,8 @@ class GameServer:
                          "wep": p.loadout[p.wi], "charge": 0.0, "segs": [],
                          "impact": [round(p.x, 2), round(p.y, 2)],
                          "blast": w.blast_r, "travel": 0.0})
-        self._sound(p.x, p.y, w.sound_reach_m, "fire", p.id,
-                    label=f"{p.id}/fire")
+        self._sound(p.x, p.y, w.sound_reach_m, "blast", p.id,
+                    label=f"{p.id}/blast")
 
     def _muzzle(self, p: NetPlayer) -> tuple[float, float]:
         """Where the shot starts: the muzzle, a bit ahead of the body — unless
@@ -1561,8 +1570,10 @@ class GameServer:
                                       for a, b, _k in segs[:48]],
                              "impact": [round(pr["ix"], 2), round(pr["iy"], 2)],
                              "blast": pr["w"].blast_r, "travel": 0.0})
-            self._sound(pr["ix"], pr["iy"], pr["w"].sound_reach_m, "fire",
-                        pr["owner"], label=f"{pr['owner']}/fire")
+            # an explosion, not a gunshot: everyone who hears it hears a
+            # blast, and the man who fired it is not told twice
+            self._sound(pr["ix"], pr["iy"], pr["w"].sound_reach_m, "blast",
+                        pr["owner"], label=f"{pr['owner']}/blast")
         self._projectiles = still
 
     # ---------------------------------------------------------------- kill / respawn
